@@ -135,7 +135,7 @@ def main() -> None:
     )
 
     save_partition(
-        path=output_dir / "partiton.json",
+        path=output_dir / "partition.json",
         client_indices=client_indices,
         labels=np.asarray(train_dataset.targets),
         config=config,
@@ -198,7 +198,7 @@ def main() -> None:
     # 保存每轮测试指标，训练结束后报告最后一轮结果，
     # 并统计最后若干轮的均值和标准差。
     test_accuracy_history: list[float] = []
-    test_loss_history: list[float] = []
+    test_total_loss_history: list[float] = []
     summary_window = 10
 
     final_metrics: dict | None = None
@@ -213,6 +213,8 @@ def main() -> None:
             "mean_client_loss",
             "mean_client_accuracy",
             "test_total_loss",
+            "test_classification_loss",
+            "test_balance_loss",
             "test_accuracy",
             "route_distribution",
             "expert_participant_counts",
@@ -279,7 +281,7 @@ def main() -> None:
             test_accuracy_history.append(
                 float(test_metrics.accuracy)
             )
-            test_loss_history.append(
+            test_total_loss_history.append(
                 float(test_metrics.loss)
             )
 
@@ -316,7 +318,13 @@ def main() -> None:
                 "mean_client_accuracy": (
                     f"{mean_client_accuracy:.8f}"
                 ),
-                "test_loss": f"{test_metrics.loss:.8f}",
+                "test_total_loss": f"{test_metrics.loss:.8f}",
+                "test_classification_loss": (
+                    f"{test_metrics.classification_loss:.8f}"
+                ),
+                "test_balance_loss": (
+                    f"{test_metrics.balance_loss:.8f}"
+                ),
                 "test_accuracy": (
                     f"{test_metrics.accuracy:.8f}"
                 ),
@@ -337,7 +345,7 @@ def main() -> None:
                 "Round %03d/%03d | "
                 "mean_client_loss=%.6f | "
                 "mean_client_accuracy=%.4f | "
-                "test_loss=%.6f | "
+                "test_total_loss=%.6f | "
                 "test_accuracy=%.4f | "
                 "route_distribution=%s | "
                 "expert_participant_counts=%s",
@@ -378,12 +386,12 @@ def main() -> None:
     last_test_accuracies = test_accuracy_history[
         -num_summary_rounds:
     ]
-    last_test_losses = test_loss_history[
+    last_test_total_losses = test_total_loss_history[
         -num_summary_rounds:
     ]
 
     final_test_accuracy = test_accuracy_history[-1]
-    final_test_loss = test_loss_history[-1]
+    final_test_total_loss = test_total_loss_history[-1]
 
     # 这里的标准差表示同一次训练最后若干轮之间的波动，
     # 不等同于多个随机种子实验之间的标准差。
@@ -393,11 +401,11 @@ def main() -> None:
     last_rounds_std_accuracy = float(
         np.std(last_test_accuracies)
     )
-    last_rounds_mean_loss = float(
-        np.mean(last_test_losses)
+    last_rounds_mean_total_loss = float(
+        np.mean(last_test_total_losses)
     )
-    last_rounds_std_loss = float(
-        np.std(last_test_losses)
+    last_rounds_std_total_loss = float(
+        np.std(last_test_total_losses)
     )
 
     summary = {
@@ -405,7 +413,7 @@ def main() -> None:
         "seed": config.seed,
         "num_rounds": config.num_rounds,
         "final_test_accuracy": final_test_accuracy,
-        "final_test_loss": final_test_loss,
+        "final_test_total_loss": final_test_total_loss,
         "last_rounds_summary": {
             "num_rounds": num_summary_rounds,
             "mean_test_accuracy": (
@@ -414,8 +422,8 @@ def main() -> None:
             "std_test_accuracy": (
                 last_rounds_std_accuracy
             ),
-            "mean_test_loss": last_rounds_mean_loss,
-            "std_test_loss": last_rounds_std_loss,
+            "mean_test_total_loss": last_rounds_mean_total_loss,
+            "std_test_total_loss": last_rounds_std_total_loss,
         },
         "final_metrics": final_metrics,
         "elapsed_seconds": elapsed_seconds,
