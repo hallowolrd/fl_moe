@@ -211,7 +211,7 @@ class ClassificationExpert(nn.Module):
         """
         nn.init.kaiming_normal_(
             self.fc1.weight,
-            mode="fan_out",
+            mode="fan_in",
             nonlinearity="relu",
         )
         nn.init.zeros_(self.fc1.bias)

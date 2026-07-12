@@ -24,6 +24,7 @@ def build_expert_aggregator(
 
     当前支持:
         uniform
+        activation_weighted
 
     注意:
         聚合器名称严格匹配，不自动转换大小写，

@@ -51,7 +51,6 @@ class ExperimentConfig:
 
     dataset_name: str = "cifar10"
     backbone_name: str = "resnet18_gn"
-
     # uniform、activation_weighted
     expert_aggregation: str = "uniform"
 
@@ -195,8 +194,13 @@ def main() -> None:
     metrics_path = output_dir / "metrics.csv"
     start_time = time.perf_counter()
 
-    best_test_accuracy = float("-inf")
-    best_round = -1
+    # 不从多轮测试结果中选择最高值作为最终结果。
+    # 保存每轮测试指标，训练结束后报告最后一轮结果，
+    # 并统计最后若干轮的均值和标准差。
+    test_accuracy_history: list[float] = []
+    test_loss_history: list[float] = []
+    summary_window = 10
+
     final_metrics: dict | None = None
 
     with metrics_path.open(
@@ -208,7 +212,7 @@ def main() -> None:
             "round",
             "mean_client_loss",
             "mean_client_accuracy",
-            "test_loss",
+            "test_total_loss",
             "test_accuracy",
             "route_distribution",
             "expert_participant_counts",
@@ -270,6 +274,13 @@ def main() -> None:
                     config.balance_loss_weight
                 ),
                 use_amp=config.use_amp,
+            )
+
+            test_accuracy_history.append(
+                float(test_metrics.accuracy)
+            )
+            test_loss_history.append(
+                float(test_metrics.loss)
             )
 
             # 保持服务器全局模型位于 CPU，减少串行客户端训练时
@@ -340,10 +351,6 @@ def main() -> None:
                 expert_participant_counts,
             )
 
-            if test_metrics.accuracy > best_test_accuracy:
-                best_test_accuracy = test_metrics.accuracy
-                best_round = current_round
-
             final_metrics = {
                 "round": current_round,
                 "mean_client_loss": mean_client_loss,
@@ -363,12 +370,53 @@ def main() -> None:
             "Training ended without producing metrics."
         )
 
+    num_summary_rounds = min(
+        summary_window,
+        len(test_accuracy_history),
+    )
+
+    last_test_accuracies = test_accuracy_history[
+        -num_summary_rounds:
+    ]
+    last_test_losses = test_loss_history[
+        -num_summary_rounds:
+    ]
+
+    final_test_accuracy = test_accuracy_history[-1]
+    final_test_loss = test_loss_history[-1]
+
+    # 这里的标准差表示同一次训练最后若干轮之间的波动，
+    # 不等同于多个随机种子实验之间的标准差。
+    last_rounds_mean_accuracy = float(
+        np.mean(last_test_accuracies)
+    )
+    last_rounds_std_accuracy = float(
+        np.std(last_test_accuracies)
+    )
+    last_rounds_mean_loss = float(
+        np.mean(last_test_losses)
+    )
+    last_rounds_std_loss = float(
+        np.std(last_test_losses)
+    )
+
     summary = {
         "output_directory": str(output_dir),
         "seed": config.seed,
         "num_rounds": config.num_rounds,
-        "best_test_accuracy": best_test_accuracy,
-        "best_round": best_round,
+        "final_test_accuracy": final_test_accuracy,
+        "final_test_loss": final_test_loss,
+        "last_rounds_summary": {
+            "num_rounds": num_summary_rounds,
+            "mean_test_accuracy": (
+                last_rounds_mean_accuracy
+            ),
+            "std_test_accuracy": (
+                last_rounds_std_accuracy
+            ),
+            "mean_test_loss": last_rounds_mean_loss,
+            "std_test_loss": last_rounds_std_loss,
+        },
         "final_metrics": final_metrics,
         "elapsed_seconds": elapsed_seconds,
     }
@@ -379,10 +427,16 @@ def main() -> None:
     )
 
     logger.info(
-        "Finished | best_test_accuracy=%.4f at round=%d | "
+        "Finished | "
+        "final_test_accuracy=%.4f | "
+        "last_%d_rounds_mean_accuracy=%.4f | "
+        "last_%d_rounds_std_accuracy=%.4f | "
         "elapsed_seconds=%.2f",
-        best_test_accuracy,
-        best_round,
+        final_test_accuracy,
+        num_summary_rounds,
+        last_rounds_mean_accuracy,
+        num_summary_rounds,
+        last_rounds_std_accuracy,
         elapsed_seconds,
     )
 
