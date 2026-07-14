@@ -129,11 +129,18 @@ class ExpertAggregator(ABC):
         *,
         global_state: Mapping[str, Tensor],
         updates: Sequence[ExpertClientUpdate],
+        num_round_clients: int,
         expert_idx: int,
         round_idx: int,
     ) -> StateDict:
         """
         聚合某一个专家的客户端更新，并返回新的完整专家参数。
+
+        Args:
+            num_round_clients:
+                本轮实际完成本地训练并返回 ClientUpdate
+                的有效客户端总数。零更新聚合器可将未激活
+                当前专家的客户端隐式计入聚合分母。
         """
         raise NotImplementedError
 

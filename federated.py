@@ -12,7 +12,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
-
+# 该接口由后续 aggregation/base.py 提供。
 from aggregation.base import (
     ExpertAggregator,
     ExpertClientUpdate,
@@ -585,9 +585,15 @@ def aggregate_expert_parameters(
             new_state = expert_aggregator.aggregate(
                 global_state=global_expert_state,
                 updates=expert_client_updates,
+                num_round_clients=len(client_updates),
                 expert_idx=expert_idx,
                 round_idx=round_idx,
             )
+
+            num_round_clients 表示本轮实际完成本地训练并返回
+            ClientUpdate 的有效客户端总数。未激活当前专家的
+            客户端不会出现在 expert_client_updates 中，但零更新
+            聚合器仍会将其计入聚合分母。
 
             返回新的完整专家 state_dict。
 
@@ -665,6 +671,10 @@ def aggregate_expert_parameters(
             expert_aggregator.aggregate(
                 global_state=global_expert_state,
                 updates=valid_updates,
+                # 使用本轮全部有效客户端数量作为聚合上下文。
+                # 未激活当前专家的客户端仍可被零更新聚合器
+                # 隐式计入分母，无需显式构造零参数增量。
+                num_round_clients=len(client_updates),
                 expert_idx=expert_idx,
                 round_idx=round_idx,
             )

@@ -13,7 +13,6 @@ from .base import (
     validate_expert_updates,
 )
 
-
 __all__ = ["ActivationWeightedExpertAggregator"]
 
 
@@ -28,8 +27,8 @@ class ActivationWeightedExpertAggregator(ExpertAggregator):
     聚合后的完整专家参数为：
 
         new_global_state
-            = global_state
-            + sum_i(weight_i * delta_i)
+        = global_state
+        + sum_i(weight_i * delta_i)
 
     其中：
         - route_count_i 表示客户端 i 在本地训练期间，
@@ -50,6 +49,7 @@ class ActivationWeightedExpertAggregator(ExpertAggregator):
         *,
         global_state: Mapping[str, Tensor],
         updates: Sequence[ExpertClientUpdate],
+        num_round_clients: int,
         expert_idx: int,
         round_idx: int,
     ) -> StateDict:
@@ -59,13 +59,14 @@ class ActivationWeightedExpertAggregator(ExpertAggregator):
         Args:
             global_state:
                 当前通信轮开始时的全局专家完整状态。
-
             updates:
                 当前专家的有效客户端参数增量。
-
+            num_round_clients:
+                本轮实际完成本地训练并返回 ClientUpdate
+                的有效客户端总数。该参数仅用于统一聚合器
+                接口和检查输入，不参与激活权重计算。
             expert_idx:
                 当前专家编号。
-
             round_idx:
                 当前通信轮编号，从 0 开始。
 
@@ -80,9 +81,31 @@ class ActivationWeightedExpertAggregator(ExpertAggregator):
             allow_empty=True,
         )
 
+        if (
+            isinstance(num_round_clients, bool)
+            or not isinstance(num_round_clients, int)
+        ):
+            raise TypeError(
+                "num_round_clients must be an integer."
+            )
+
+        if num_round_clients <= 0:
+            raise ValueError(
+                "num_round_clients must be greater than 0."
+            )
+
+        if len(updates) > num_round_clients:
+            raise ValueError(
+                "The number of active expert updates cannot "
+                "exceed num_round_clients."
+            )
+
         if not updates:
             return clone_state_dict(global_state)
 
+        # num_round_clients 不参与下面的权重计算。
+        # 未激活客户端的 route_count 为 0，因此不会改变
+        # 按激活次数归一化后的聚合结果。
         total_route_count = sum(
             update.route_count
             for update in updates
@@ -116,14 +139,12 @@ class ActivationWeightedExpertAggregator(ExpertAggregator):
                     update.route_count
                     / total_route_count
                 )
-
                 client_delta = update.delta[
                     parameter_name
                 ].to(
                     device=global_tensor.device,
                     dtype=global_tensor.dtype,
                 )
-
                 weighted_delta.add_(
                     client_delta,
                     alpha=float(weight),
