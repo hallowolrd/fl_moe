@@ -60,7 +60,7 @@ class ExperimentConfig:
 
     num_clients: int = 10
     participation_rate: float = 1.0
-    num_rounds: int = 100
+    num_rounds: int = 200
     local_epochs: int = 1
 
     dirichlet_alpha: float = 0.1
