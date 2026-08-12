@@ -1346,7 +1346,7 @@ class ExperimentConfig:
     balance_loss_weight: float = 0.0
 
     # 本地优化
-    learning_rate: float = 0.01
+    learning_rate: float = 0.001
     momentum: float = 0.9
     weight_decay: float = 5e-4
     use_amp: bool = False
@@ -2525,7 +2525,7 @@ def detect_num_classes(dataset: Dataset) -> int:
 def partition_path(config: ExperimentConfig) -> Path:
     dataset_name = canonical_dataset_name(config.dataset_name)
     filename = (
-        f"balanced_dirichlet_label_clients{config.num_clients}"
+        f"feddyn_balanced_dirichlet_label_clients{config.num_clients}"
         f"_alpha{format_float(config.dirichlet_alpha)}"
         f"_seed{config.seed}.json"
     )
@@ -2539,64 +2539,126 @@ def make_dirichlet_partition(
     seed: int,
 ) -> list[list[int]]:
     """
-    构造等样本数的 label-Dirichlet 划分。
+    构造 FedDyn 风格的等样本数 label-Dirichlet 划分。
 
-    每个类别先采样一个跨客户端的 Dirichlet 分布，用它控制该类别
-    偏向哪些客户端；同时为每个客户端设置完全相同的容量。分配过程中
-    已满客户端不再接收样本，因此最终每个客户端样本数严格一致。
+    每个客户端先独立采样一个跨类别的对称 Dirichlet prior：
+        q_i ~ Dirichlet(alpha, ..., alpha)
+
+    然后为每个客户端分配完全相同数量的样本。分配某个样本时，
+    先从尚未填满的客户端中均匀选择一个客户端，再按照该客户端
+    的类别 prior 从仍有剩余样本的类别中采样。若某类别已经耗尽，
+    则等价地在剩余类别上对该客户端 prior 重新条件化。
+
+    该过程保持：
+    - 每个客户端样本数严格一致；
+    - 所有训练样本恰好使用一次；
+    - 客户端之间的标签分布由各自的 Dirichlet prior 控制。
     """
     labels = np.asarray(labels, dtype="<i8")
     dataset_size = len(labels)
 
     if dataset_size % num_clients != 0:
         raise ValueError(
-            "Balanced Dirichlet partition requires the training-set size "
-            "to be divisible by num_clients so every client has exactly "
-            "the same number of samples. "
+            "FedDyn-style balanced Dirichlet partition requires the "
+            "training-set size to be divisible by num_clients so every "
+            "client has exactly the same number of samples. "
             f"Got dataset_size={dataset_size}, num_clients={num_clients}."
         )
 
     rng = np.random.default_rng(seed)
     samples_per_client = dataset_size // num_clients
+
+    class_ids = np.unique(labels)
+    num_classes = len(class_ids)
+    if num_classes <= 1:
+        raise ValueError(
+            "FedDyn-style Dirichlet partition requires at least two classes."
+        )
+
+    # FedDyn-style client-wise label priors:
+    # one Dirichlet distribution over classes for each client.
+    client_class_priors = rng.dirichlet(
+        np.full(num_classes, alpha, dtype=np.float64),
+        size=num_clients,
+    )
+
+    # Build one shuffled sample pool per class.
+    class_pools: list[list[int]] = []
+    class_remaining = np.zeros(num_classes, dtype=np.int64)
+
+    for class_position, class_id in enumerate(class_ids):
+        class_indices = np.flatnonzero(labels == class_id)
+        rng.shuffle(class_indices)
+        class_pools.append([int(index) for index in class_indices])
+        class_remaining[class_position] = len(class_indices)
+
     result: list[list[int]] = [[] for _ in range(num_clients)]
-    remaining_capacity = np.full(
+    client_remaining = np.full(
         num_clients,
         samples_per_client,
         dtype=np.int64,
     )
 
-    class_ids = np.unique(labels).copy()
-    rng.shuffle(class_ids)
+    while int(client_remaining.sum()) > 0:
+        active_clients = np.flatnonzero(client_remaining > 0)
+        if active_clients.size == 0:
+            raise RuntimeError(
+                "FedDyn-style Dirichlet partition has unassigned samples "
+                "but no client has remaining capacity."
+            )
 
-    for class_id in class_ids:
-        class_indices = np.flatnonzero(labels == class_id)
-        rng.shuffle(class_indices)
-        proportions = rng.dirichlet(np.full(num_clients, alpha))
+        # FedDyn repeatedly samples a client and rejects already-full clients.
+        # Sampling uniformly from the active clients is the equivalent
+        # conditional distribution without rejection.
+        client_id = int(rng.choice(active_clients))
 
-        for sample_index in class_indices:
-            available = remaining_capacity > 0
-            probabilities = proportions * available
+        available_classes = class_remaining > 0
+        if not np.any(available_classes):
+            raise RuntimeError(
+                "FedDyn-style Dirichlet partition exhausted all class pools "
+                "before filling every client."
+            )
+
+        # FedDyn redraws the class whenever the sampled class is exhausted.
+        # Masking exhausted classes and renormalizing is the equivalent
+        # conditional distribution and avoids potentially long rejection loops.
+        probabilities = (
+            client_class_priors[client_id]
+            * available_classes.astype(np.float64)
+        )
+        probability_sum = float(probabilities.sum())
+
+        if probability_sum <= 0.0:
+            probabilities = available_classes.astype(np.float64)
             probability_sum = float(probabilities.sum())
 
-            if probability_sum <= 0.0:
-                probabilities = available.astype(np.float64)
-                probability_sum = float(probabilities.sum())
+        probabilities = probabilities / probability_sum
+        class_position = int(
+            rng.choice(num_classes, p=probabilities)
+        )
 
-            probabilities = probabilities / probability_sum
-            client_id = int(rng.choice(num_clients, p=probabilities))
-            result[client_id].append(int(sample_index))
-            remaining_capacity[client_id] -= 1
+        sample_index = class_pools[class_position].pop()
+        result[client_id].append(sample_index)
 
-    if np.any(remaining_capacity != 0):
+        client_remaining[client_id] -= 1
+        class_remaining[class_position] -= 1
+
+    if np.any(client_remaining != 0):
         raise RuntimeError(
-            "Balanced Dirichlet partition did not fill all client capacities."
+            "FedDyn-style Dirichlet partition did not fill all client "
+            "capacities."
+        )
+
+    if np.any(class_remaining != 0):
+        raise RuntimeError(
+            "FedDyn-style Dirichlet partition did not consume all training "
+            "samples."
         )
 
     for indices in result:
         rng.shuffle(indices)
 
     return result
-
 
 def validate_partition(indices: list[list[int]], dataset_size: int, num_clients: int) -> None:
     if len(indices) != num_clients:
@@ -2631,7 +2693,7 @@ def load_or_create_partition(
     train_dataset: Dataset,
     num_classes: int,
 ) -> tuple[list[list[int]], Path, bool]:
-    """Read a fixed balanced label-Dirichlet partition; existing files are never overwritten."""
+    """Read a fixed FedDyn-style balanced label-Dirichlet partition; existing files are never overwritten."""
     dataset_name = canonical_dataset_name(config.dataset_name)
     path = partition_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2647,7 +2709,7 @@ def load_or_create_partition(
             "format_version": PARTITION_FORMAT_VERSION,
             "dataset": dataset_name,
             "split": "train",
-            "partition_method": "balanced_dirichlet_label",
+            "partition_method": "feddyn_balanced_dirichlet_label",
             "seed": config.seed,
             "num_clients": config.num_clients,
             "num_classes": num_classes,
@@ -2724,7 +2786,7 @@ def load_or_create_partition(
             "format_version": PARTITION_FORMAT_VERSION,
             "dataset": dataset_name,
             "split": "train",
-            "partition_method": "balanced_dirichlet_label",
+            "partition_method": "feddyn_balanced_dirichlet_label",
             "alpha": config.dirichlet_alpha,
             "seed": config.seed,
             "num_clients": config.num_clients,

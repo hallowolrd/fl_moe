@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Expert-Equal Local Loss + Local-KFAC Whitened Layer Projection.
+Local-KFAC Whitened Layer Projection for Federated Sparse-MoE.
 
 This is the refactored method-only version of the original monolithic
 experiment. The common model, datasets, Dirichlet partition, reproducibility,
@@ -9,8 +9,9 @@ client training, evaluation, logging and federated round loop are provided by
 base.py.
 
 Method-specific behavior kept here:
-1. After normal local training, run one extra deterministic/no-augmentation,
-   FP32 forward/backward pass to collect per-expert, per-Linear KFAC factors.
+1. After standard local CE training, run one extra deterministic/no-augmentation,
+   FP32 forward/backward pass with standard sample-mean CE to collect per-expert,
+   per-Linear KFAC factors without updating parameters.
 2. Convert expert deltas to pseudo-gradients D = -Delta / eta.
 3. Whiten each client/layer pseudo-gradient with that client's damped local
    KFAC factors.
@@ -24,9 +25,9 @@ Method-specific behavior kept here:
 8. Shared/non-expert parameters remain uniformly averaged across valid
    clients via base.aggregate_shared_uniform().
 
-Run from the project root after saving the current shared base as
+Run from the project root with the current shared base saved as
 experiments/base.py:
-    python experiments/expert_equal_local_kfac_whiten_layer_projection.py
+    python experiments/expert_local_kfac_whiten_layer_projection.py
 """
 
 import argparse
@@ -45,11 +46,12 @@ import base
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Subset
 
 
-ALGORITHM_NAME = "expert_equal_local_kfac_whiten_layer_projection"
+ALGORITHM_NAME = "expert_local_kfac_whiten_layer_projection"
 StateDict = base.StateDict
 ClientUpdate = base.ClientUpdate
 
@@ -73,11 +75,10 @@ class KFACSettings:
 
 
 def validate_method_config(config: base.ExperimentConfig) -> None:
-    if config.top_k != 1:
-        raise ValueError(
-            "This expert-equal loss experiment requires top_k=1 so that "
-            "each sample belongs to exactly one expert."
-        )
+    # The Local-KFAC projection itself is valid for any top_k accepted by base.py.
+    # In the current shared base this includes both top_k=1 and top_k=2 when
+    # num_experts=4, so no additional method-specific restriction is required.
+    del config
 
 
 def validate_kfac_settings(settings: KFACSettings) -> None:
@@ -138,8 +139,8 @@ def parse_configs() -> tuple[base.ExperimentConfig, KFACSettings]:
         sys.argv = [original_argv[0], *remaining]
         config = base.parse_config(
             description=(
-                "Expert-equal local loss with post-training local KFAC "
-                "collection and layer-wise whitened conflict projection."
+                "Standard local CE with post-training local KFAC collection and "
+                "layer-wise whitened conflict projection."
             ),
             method_validator=validate_method_config,
         )
@@ -384,8 +385,10 @@ class ExpertKFACCollector:
                     "KFAC expects Linear grad_output [N, O], got "
                     f"{tuple(output_gradient.shape)}."
                 )
-            # Preserve the original method: remove only the full-batch reduction
-            # scale. Relative 1/n_e weighting induced by expert-equal loss remains.
+            # Standard cross-entropy uses a full-batch mean. Multiplying by the
+            # original batch size removes only that 1/B reduction so the
+            # collected output-gradient second moment is on a per-sample scale.
+            # Router/expert Jacobian factors from the actual model are preserved.
             output_gradient = output_gradient.float() * float(original_batch_size)
             self._output_gradient_sums[key].addmm_(
                 output_gradient.transpose(0, 1), output_gradient
@@ -471,13 +474,11 @@ def estimate_expert_kfac_factors(
             collector.set_batch_size(batch_size)
             with torch.autocast(device_type=device.type, enabled=False):
                 output = model(images.float())
-                expert_equal_loss, _, _ = base.compute_expert_equal_classification_loss(
-                    logits=output.logits.float(),
-                    targets=targets,
-                    topk_indices=output.topk_indices,
-                    num_experts=num_experts,
+                classification_loss = F.cross_entropy(
+                    output.logits.float(),
+                    targets,
                 )
-            expert_equal_loss.backward()
+            classification_loss.backward()
             route_counts.add_(
                 output.route_counts.detach().to(device=device, dtype=torch.long)
             )
@@ -1538,6 +1539,8 @@ def main() -> None:
             "kfac_eigendecomposition_dtype": "float64",
             "kfac_collection_data_augmentation": False,
             "kfac_collection_updates_parameters": False,
+            "kfac_collection_loss": "standard_sample_mean_cross_entropy",
+            "supports_top_k_1_and_2": True,
             "kfac_reference_includes_self": True,
             "kfac_reference_valid_clients_only": True,
             "kfac_invalid_policy": (
@@ -1558,7 +1561,7 @@ def main() -> None:
 
     logger.info(
         "Local KFAC: post_training_extra_pass=True | fp32=True | "
-        "loss=expert_equal_ce_only | fisher_batch_size=%s | "
+        "loss=standard_sample_mean_ce | fisher_batch_size=%s | "
         "minimum_samples=%d | relative_damping=%s | max_whitening_gain=%s | "
         "kfac_server_device=%s | eigendecomposition=cpu_float64",
         settings.fisher_batch_size,
@@ -1577,15 +1580,16 @@ def main() -> None:
             local_train_fn=local_train_fn,
             server_aggregate_fn=server_aggregate_fn,
             local_objective_description=(
-                "Local objective: equal mean over active experts; "
-                "each expert loss is the mean CE of samples routed to it; top_k=1"
+                "Local objective: standard sample-mean cross-entropy; "
+                "optional balance loss follows base.py configuration"
             ),
             aggregation_description=(
-                "Expert aggregation: post-training local KFAC; layer-wise "
-                "whitening; valid-KFAC-only self-included route-weighted "
-                "reference; strict negative projection; client-specific "
-                "unwhitening; invalid KFAC keeps original pseudo-gradient; "
-                "no replay; no correction cap"
+                "Expert aggregation: training-route-count-weighted local-KFAC "
+                "layer whitening; valid-KFAC-only self-included reference; "
+                "strict negative projection in whitened coordinates; "
+                "client-specific unwhitening with the same damped KFAC map; "
+                "invalid KFAC keeps original pseudo-gradient; final aggregation "
+                "uses training-stage route counts; no replay; no correction cap"
             ),
         )
     except Exception:
