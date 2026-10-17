@@ -5793,11 +5793,12 @@ class FLClient:
         # 可选：采集当前客户端本地模型的 expert usage。
         #
         # 统计含义：
-        #     本地训练结束后，local_model 在该客户端自己的 train_loader 上，
+        #     本地训练结束后，local_model 在该客户端训练数据上，
         #     每个 expert 被 top-k router 选中了多少次。
         #
         # 注意：
-        #     这里仍然使用 train_loader，保持原有日志诊断语义不变。
+        #     统计使用相同的数据集和训练变换，但用独立 DataLoader，
+        #     避免诊断遍历干扰后续训练的随机数状态。
         #     方法级 evidence 统计才使用 evidence_loader。
         #
         #     topk=2 时，一个样本会贡献 2 次 expert 激活。
