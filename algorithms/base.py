@@ -6117,6 +6117,10 @@ def collect_expert_usage(
                     return_router_info=True,
                 )
             except TypeError as exc:
+                # Only treat the missing keyword argument as a legacy-model
+                # compatibility case. Re-raise TypeErrors raised inside forward().
+                if "unexpected keyword argument 'return_router_info'" not in str(exc):
+                    raise
                 supported = False
                 unsupported_reason = (
                     "model does not support return_router_info=True: "
