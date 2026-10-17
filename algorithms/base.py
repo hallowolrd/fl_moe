@@ -5805,12 +5805,46 @@ class FLClient:
         # ------------------------------------------------------------
         expert_usage = None
         if bool(_cfg_get(self.cfg, "logging.collect_expert_usage", True)):
-            expert_usage = collect_expert_usage(
-                model=local_model,
-                train_loader=self.train_loader,
-                device=self.device,
-                cfg=self.cfg,
+            # Use a separate loader so logging cannot advance the training
+            # loader's sampler or persistent workers' augmentation RNG.
+            usage_loader = DataLoader(
+                self.train_loader.dataset,
+                batch_size=self.train_loader.batch_size,
+                shuffle=True,
+                num_workers=self.train_loader.num_workers,
+                pin_memory=self.train_loader.pin_memory,
+                drop_last=self.train_loader.drop_last,
+                collate_fn=self.train_loader.collate_fn,
+                worker_init_fn=self.train_loader.worker_init_fn,
+                generator=build_torch_generator(
+                    int(_cfg_get(self.cfg, "seed", 0))
+                    + 200000
+                    + self.client_id
+                    + 1000000 * int(round_id)
+                ),
+                persistent_workers=False,
             )
+
+            # With num_workers=0, random transforms run in the main process.
+            # Protect Python/NumPy/PyTorch RNG states even on failure.
+            python_rng_state = random.getstate()
+            numpy_rng_state = np.random.get_state()
+            try:
+                with torch.random.fork_rng(
+                    devices=(
+                        list(range(torch.cuda.device_count()))
+                        if torch.cuda.is_available() else []
+                    ),
+                ):
+                    expert_usage = collect_expert_usage(
+                        model=local_model,
+                        train_loader=usage_loader,
+                        device=self.device,
+                        cfg=self.cfg,
+                    )
+            finally:
+                random.setstate(python_rng_state)
+                np.random.set_state(numpy_rng_state)
 
         method_extra: Dict[str, Any] = {}
         if self.expert_evidence_collector is not None:
