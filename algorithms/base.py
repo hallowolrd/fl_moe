@@ -7004,17 +7004,14 @@ class FLServer:
 
         # 预估整个实验的客户端训练步数。
         # 进度条单位：完成一个客户端本地训练。
-        total_client_steps = sum(
-            len(
-                select_clients(
-                    clients=self.clients,
-                    frac=frac,
-                    round_id=progress_round_id,
-                    seed=seed,
-                )
+        total_client_steps = len(
+            select_clients(
+                clients=self.clients,
+                frac=frac,
+                round_id=1,
+                seed=seed,
             )
-            for progress_round_id in range(1, rounds + 1)
-        )
+        ) * rounds
 
         # 进度条只写到 Python 原始 stderr。
         # 这样即使 train.py 用 tee_output_to_file() 捕获 stdout / stderr，
