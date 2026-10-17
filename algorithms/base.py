@@ -134,7 +134,7 @@ def _read_top_level_scalar_from_yaml_like_file(
             raw_value = right.strip()
             value = _clean_simple_yaml_value(raw_value)
 
-            if name == "include":
+            if name == "include" and indent == 0:
                 # YAML 中重复的 include 键以最后一个为准。
                 include_paths = []
 
