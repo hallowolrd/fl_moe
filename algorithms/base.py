@@ -98,42 +98,76 @@ def _read_top_level_scalar_from_yaml_like_file(
     if not path.exists():
         return None
 
-    include_path: Path | None = None
+    include_paths: list[Path] = []
+    include_list_indent: int | None = None
     local_value: str | None = None
 
     with path.open("r", encoding="utf-8") as f:
         for raw_line in f:
             # 去掉行内注释。这里足够处理当前配置里的 seed / include。
-            line = raw_line.split("#", 1)[0].strip()
+            line = raw_line.split("#", 1)[0].rstrip()
+            stripped_line = line.strip()
 
-            if not line:
+            if not stripped_line:
                 continue
 
-            if ":" not in line:
+            indent = len(line) - len(line.lstrip())
+
+            # 支持 include: 后面的 YAML 块列表，包括无额外缩进的列表。
+            if include_list_indent is not None:
+                if stripped_line.startswith("-") and indent >= include_list_indent:
+                    include_value = _clean_simple_yaml_value(stripped_line[1:].strip())
+                    if include_value:
+                        include_paths.append((path.parent / include_value).resolve())
+                    continue
+
+                if indent <= include_list_indent:
+                    include_list_indent = None
+                else:
+                    continue
+
+            if ":" not in stripped_line:
                 continue
 
-            left, right = line.split(":", 1)
+            left, right = stripped_line.split(":", 1)
             name = left.strip()
-            value = _clean_simple_yaml_value(right)
+            raw_value = right.strip()
+            value = _clean_simple_yaml_value(raw_value)
 
             if name == "include":
-                include_path = (path.parent / value).resolve()
+                # YAML 中重复的 include 键以最后一个为准。
+                include_paths = []
+
+                if not raw_value:
+                    include_list_indent = indent
+                elif value.startswith("[") and value.endswith("]"):
+                    # 支持 include: [base.yaml, model/resnet.yaml]。
+                    for item in value[1:-1].split(","):
+                        item = _clean_simple_yaml_value(item)
+                        if item:
+                            include_paths.append((path.parent / item).resolve())
+                else:
+                    include_paths.append((path.parent / value).resolve())
+
                 continue
 
             if name == key:
                 local_value = value
                 continue
 
-    # 当前配置里的 seed 优先级高于 include 里的 seed。
+    # 当前配置里的 seed 优先级高于 include；多个 include 按正式加载器的
+    # 合并顺序处理，因此后面的 include 优先级更高。
     if local_value is not None:
         return local_value
 
-    if include_path is not None:
-        return _read_top_level_scalar_from_yaml_like_file(
+    for include_path in reversed(include_paths):
+        included_value = _read_top_level_scalar_from_yaml_like_file(
             path=include_path,
             key=key,
             visited=visited,
         )
+        if included_value is not None:
+            return included_value
 
     return None
 
