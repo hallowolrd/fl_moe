@@ -151,7 +151,7 @@ def _read_top_level_scalar_from_yaml_like_file(
 
                 continue
 
-            if name == key:
+            if name == key and indent == 0:
                 local_value = value
                 continue
 
