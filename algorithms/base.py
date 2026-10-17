@@ -1944,6 +1944,9 @@ def count_topk_correct(
     if len(topk) == 0:
         raise ValueError("topk 不能为空。")
 
+    if any(k <= 0 for k in topk):
+        raise ValueError("topk 中的每个值都必须是正整数。")
+
     if max_k is None:
         max_k = max(topk)
 
