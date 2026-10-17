@@ -2196,7 +2196,7 @@ def _load_femnist_split_storage(
                         f"FEMNIST 样本尺寸不是 784：user={user}, size={array.size}"
                     )
                 array = array.reshape(28, 28)
-                if float(array.max()) if array.size else 0.0 <= 1.0:
+                if (float(array.max()) if array.size else 0.0) <= 1.0:
                     array = array * 255.0
                 data[offset] = np.clip(array, 0.0, 255.0).astype(np.uint8)
                 targets[offset] = int(y)
