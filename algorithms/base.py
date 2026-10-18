@@ -1542,6 +1542,20 @@ def normalize_weights(weights: Mapping[int, float]) -> Dict[int, float]:
     if total <= 0:
         raise ValueError(f"weights 总和必须大于 0，当前总和：{total}")
 
+    # 多个有限非负权重的和仍可能溢出为 inf。
+    # 仅在溢出时缩放，保持正常权重的原有计算顺序及结果。
+    if not math.isfinite(total):
+        scale = max(float(weight) for weight in weights.values())
+        scaled_weights = {
+            int(client_id): float(weight) / scale
+            for client_id, weight in weights.items()
+        }
+        scaled_total = sum(scaled_weights.values())
+        return {
+            client_id: value / scaled_total
+            for client_id, value in scaled_weights.items()
+        }
+
     return {
         int(client_id): float(weight) / total
         for client_id, weight in weights.items()
