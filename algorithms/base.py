@@ -6646,32 +6646,6 @@ def build_uniform_weights(
     }
 
 
-def build_sample_weights(
-    client_updates: Sequence[ClientUpdate],
-) -> Dict[int, float]:
-    """
-    构建按样本数加权的权重。
-
-    注意：
-        这里返回的是未必严格归一化前的权重。
-        Aggregator.aggregate() 里会统一调用 normalize_weights。
-    """
-    if len(client_updates) == 0:
-        raise ValueError("client_updates 不能为空。")
-
-    weights: Dict[int, float] = {}
-
-    for update in client_updates:
-        if update.num_samples <= 0:
-            raise ValueError(
-                f"客户端 {update.client_id} 的 num_samples 必须大于 0，"
-                f"当前值：{update.num_samples}"
-            )
-
-        weights[int(update.client_id)] = float(update.num_samples)
-
-    return weights
-
 
 # Fixed non-expert aggregation and expert extension interface.
 @dataclass
