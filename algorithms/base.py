@@ -939,8 +939,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     lr = float(optimizer_cfg.get("lr"))
-    if lr <= 0:
-        raise ConfigError(f"optimizer.lr 必须大于 0，当前值：{lr}")
+    if not math.isfinite(lr) or lr <= 0:
+        raise ConfigError(
+            f"optimizer.lr 必须是有限的正数，当前值：{lr}"
+        )
 
     weight_decay = float(optimizer_cfg.get("weight_decay"))
     if weight_decay < 0:
