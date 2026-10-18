@@ -1855,61 +1855,6 @@ def count_correct(
     return int(correct)
 
 
-def count_topk_correct(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    topk: Iterable[int],
-    max_k: Optional[int] = None,
-) -> Dict[int, int]:
-    """
-    统计 Top-k 预测正确数量。
-
-    返回：
-        {
-            1: top1_correct,
-            5: top5_correct,
-            ...
-        }
-    """
-    topk = tuple(sorted(set(int(k) for k in topk)))
-
-    if len(topk) == 0:
-        raise ValueError("topk 不能为空。")
-
-    if any(k <= 0 for k in topk):
-        raise ValueError("topk 中的每个值都必须是正整数。")
-
-    if max_k is None:
-        max_k = max(topk)
-
-    max_k = int(max_k)
-
-    if max_k <= 0:
-        raise ValueError(f"max_k 必须大于 0，当前值：{max_k}")
-
-    if max_k > logits.size(1):
-        max_k = int(logits.size(1))
-
-    _, pred = logits.topk(
-        k=max_k,
-        dim=1,
-        largest=True,
-        sorted=True,
-    )
-
-    pred = pred.t()
-    correct = pred.eq(targets.reshape(1, -1).expand_as(pred))
-
-    result: Dict[int, int] = {}
-
-    for k in topk:
-        actual_k = min(k, logits.size(1))
-        correct_k = correct[:actual_k].reshape(-1).float().sum().item()
-        result[k] = int(correct_k)
-
-    return result
-
-
 # ============================================================================
 # Bundled from data/datasets.py
 # ============================================================================
