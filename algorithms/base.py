@@ -6535,6 +6535,11 @@ class Aggregator(ABC):
         raw_weights = self.compute_weights(client_updates)
         weights = normalize_weights(raw_weights)
 
+        # The same parameter names are reused for aggregation, validation,
+        # and diagnostics; materialize one-shot iterables only once.
+        if param_names is not None:
+            param_names = list(param_names)
+
         new_state_dict = apply_weighted_delta(
             global_state=global_state,
             client_updates=client_updates,
