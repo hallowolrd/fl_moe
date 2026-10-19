@@ -888,14 +888,22 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError("server_evidence 必须是 dict。")
 
     server_evidence_size = server_evidence_cfg.get("size", 0)
-    if not isinstance(server_evidence_size, int) or server_evidence_size < 0:
+    if (
+        isinstance(server_evidence_size, bool)
+        or not isinstance(server_evidence_size, int)
+        or server_evidence_size < 0
+    ):
         raise ConfigError(
             "server_evidence.size 必须是非负整数，"
             f"当前值：{server_evidence_size}"
         )
 
     server_evidence_batch_size = server_evidence_cfg.get("batch_size", 256)
-    if not isinstance(server_evidence_batch_size, int) or server_evidence_batch_size <= 0:
+    if (
+        isinstance(server_evidence_batch_size, bool)
+        or not isinstance(server_evidence_batch_size, int)
+        or server_evidence_batch_size <= 0
+    ):
         raise ConfigError(
             "server_evidence.batch_size 必须是正整数，"
             f"当前值：{server_evidence_batch_size}"
@@ -957,7 +965,7 @@ def _require_positive_int(cfg: Mapping[str, Any], key: str) -> None:
     """检查某个字段是否为正整数。"""
     value = cfg.get(key)
 
-    if not isinstance(value, int) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigError(f"{key} 必须是正整数，当前值：{value}")
 
 
@@ -965,7 +973,7 @@ def _require_non_negative_int(cfg: Mapping[str, Any], key: str) -> None:
     """检查某个字段是否为非负整数。"""
     value = cfg.get(key)
 
-    if not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(f"{key} 必须是非负整数，当前值：{value}")
 
 
