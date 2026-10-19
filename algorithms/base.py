@@ -912,8 +912,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(f"frac 必须在 (0, 1] 范围内，当前值：{frac}")
 
     alpha = float(cfg.get("alpha"))
-    if alpha <= 0:
-        raise ConfigError(f"alpha 必须大于 0，当前值：{alpha}")
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ConfigError(
+            f"alpha 必须是有限的正数，当前值：{alpha}"
+        )
 
     # 优化器参数必须统一写在 optimizer 下，避免同时存在两套配置入口。
     forbidden_top_level_optimizer_keys = {
@@ -2644,8 +2646,10 @@ def build_dirichlet_partition(
     """
     _validate_num_clients(num_clients)
 
-    if alpha <= 0:
-        raise ValueError(f"alpha 必须大于 0，当前值：{alpha}")
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError(
+            f"alpha 必须是有限的正数，当前值：{alpha}"
+        )
 
     if min_samples_per_client < 0:
         raise ValueError(
