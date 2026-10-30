@@ -309,6 +309,7 @@ def normalize_dataset_name(dataset_name: str) -> str:
 
 SUPPORTED_MODELS = {
     "sparse_moe_classifier",
+    "sparse_moe_orthogonal",
 }
 
 
