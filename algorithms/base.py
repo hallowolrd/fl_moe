@@ -4803,6 +4803,130 @@ class SparseMoEClassifier(nn.Module):
         )
 
 
+class OrthogonalSparseMoEClassifier(SparseMoEClassifier):
+    """
+    跨专家特征投影子空间正交的 Sparse MoE 分类模型。
+
+    将所有专家的 fc1.weight 按行拼接为 W_all，并约束：
+        W_all @ W_all.T = I
+
+    因此不同专家的 fc1 行空间两两正交。默认隐藏维度为 128，
+    对应 4 个专家、512 维 Backbone 特征。
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        num_experts: int = 4,
+        topk: int = 2,
+        in_channels: int = 3,
+        image_size: int = 32,
+        moe_hidden_dim: int = 128,
+        renormalize_topk_probs: bool = False,
+        backbone_name: str = DEFAULT_BACKBONE_NAME,
+    ) -> None:
+        num_experts = int(num_experts)
+        moe_hidden_dim = int(moe_hidden_dim)
+
+        if num_experts <= 0:
+            raise ValueError(
+                f"num_experts 必须大于 0，当前值：{num_experts}"
+            )
+        if moe_hidden_dim <= 0:
+            raise ValueError(
+                f"moe_hidden_dim 必须大于 0，当前值：{moe_hidden_dim}"
+            )
+
+        total_rows = num_experts * moe_hidden_dim
+        if total_rows > MOE_FEATURE_DIM:
+            raise ValueError(
+                "跨专家正交约束要求 "
+                "num_experts * moe_hidden_dim <= "
+                f"{MOE_FEATURE_DIM}，当前为 "
+                f"{num_experts} * {moe_hidden_dim} = {total_rows}。"
+            )
+
+        super().__init__(
+            num_classes=num_classes,
+            num_experts=num_experts,
+            topk=topk,
+            in_channels=in_channels,
+            image_size=image_size,
+            moe_hidden_dim=moe_hidden_dim,
+            renormalize_topk_probs=renormalize_topk_probs,
+            backbone_name=backbone_name,
+        )
+
+        # 父类完成 Xavier 初始化后，立即将专家投影权重映射到正交约束集合。
+        self.retract_expert_subspaces_()
+
+    @torch.no_grad()
+    def retract_expert_subspaces_(self) -> None:
+        """使用 QR 回缩，使所有专家的 fc1 权重行向量整体正交。"""
+        experts = self.moe_head.experts
+        weights = [expert.fc1.weight for expert in experts]
+        if not weights:
+            return
+
+        weight_all = torch.cat(weights, dim=0)
+        total_rows, input_dim = weight_all.shape
+
+        if total_rows > input_dim:
+            raise ValueError(
+                "跨专家正交回缩要求专家隐藏维度总和不超过输入特征维度，"
+                f"当前为 {total_rows} > {input_dim}。"
+            )
+
+        original_dtype = weight_all.dtype
+        qr_input = weight_all.transpose(0, 1)
+
+        # 部分设备不支持低精度 QR，低精度权重统一使用 FP32 计算。
+        if qr_input.dtype in (torch.float16, torch.bfloat16):
+            qr_input = qr_input.float()
+
+        q, r = torch.linalg.qr(qr_input, mode="reduced")
+
+        # 固定 QR 分解的符号约定，不改变正交性。
+        diagonal = torch.diagonal(r)
+        signs = torch.where(
+            diagonal < 0,
+            -torch.ones_like(diagonal),
+            torch.ones_like(diagonal),
+        )
+        weight_retracted = (q * signs.unsqueeze(0)).transpose(0, 1)
+        weight_retracted = weight_retracted.to(dtype=original_dtype)
+
+        offset = 0
+        for expert in experts:
+            rows = expert.fc1.weight.size(0)
+            expert.fc1.weight.copy_(
+                weight_retracted[offset:offset + rows]
+            )
+            offset += rows
+
+    @torch.no_grad()
+    def orthogonality_error(self) -> float:
+        """返回 ||W_all W_all.T - I||_F，供实验验证正交约束。"""
+        weight_all = torch.cat(
+            [expert.fc1.weight for expert in self.moe_head.experts],
+            dim=0,
+        )
+
+        if weight_all.dtype in (torch.float16, torch.bfloat16):
+            weight_all = weight_all.float()
+
+        identity = torch.eye(
+            weight_all.size(0),
+            device=weight_all.device,
+            dtype=weight_all.dtype,
+        )
+        error = torch.linalg.norm(
+            weight_all @ weight_all.transpose(0, 1) - identity,
+            ord="fro",
+        )
+        return float(error.item())
+
+
 def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
     """
     根据 cfg 构建 SparseMoEClassifier。
@@ -4886,6 +5010,78 @@ def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
     )
 
 
+def build_orthogonal_sparse_moe_classifier_from_cfg(
+    cfg: Any,
+) -> OrthogonalSparseMoEClassifier:
+    """
+    根据 cfg 构建跨专家正交 Sparse MoE。
+
+    配置示例：
+        model: sparse_moe_orthogonal
+        num_experts: 4
+        topk: 2
+        model_cfg:
+          moe_hidden_dim: 128
+
+    moe_hidden_dim 默认 128；所有专家隐藏维度之和必须不超过
+    Backbone 输出的 512 维特征维度。
+    """
+    model_cfg = _cfg_get(cfg, "model_cfg", {})
+
+    input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
+    if input_shape is None:
+        input_shape = (3, 32, 32)
+
+    default_in_channels = int(input_shape[0])
+    default_image_size = int(input_shape[1])
+    default_moe_hidden_dim = _cfg_get(
+        model_cfg,
+        "hidden_dim",
+        128,
+    )
+
+    return OrthogonalSparseMoEClassifier(
+        num_classes=int(_cfg_get(cfg, "num_classes")),
+        num_experts=int(_cfg_get(cfg, "num_experts", 4)),
+        topk=int(_cfg_get(cfg, "topk", 2)),
+        in_channels=int(
+            _cfg_get(
+                model_cfg,
+                "in_channels",
+                default_in_channels,
+            )
+        ),
+        image_size=int(
+            _cfg_get(
+                model_cfg,
+                "image_size",
+                default_image_size,
+            )
+        ),
+        moe_hidden_dim=int(
+            _cfg_get(
+                model_cfg,
+                "moe_hidden_dim",
+                default_moe_hidden_dim,
+            )
+        ),
+        renormalize_topk_probs=bool(
+            _cfg_get(
+                model_cfg,
+                "renormalize_topk_probs",
+                False,
+            )
+        ),
+        backbone_name=str(
+            _cfg_get(
+                model_cfg,
+                "backbone",
+                DEFAULT_BACKBONE_NAME,
+            )
+        ),
+    )
+
+
 # ============================================================================
 # Bundled from models/build.py
 # ============================================================================
@@ -4896,6 +5092,7 @@ ModelBuilder = Callable[[Any], nn.Module]
 
 MODEL_BUILDERS: Dict[str, ModelBuilder] = {
     "sparse_moe_classifier": build_sparse_moe_classifier_from_cfg,
+    "sparse_moe_orthogonal": build_orthogonal_sparse_moe_classifier_from_cfg,
 }
 
 
@@ -4908,6 +5105,7 @@ def build_model(cfg: Any) -> nn.Module:
 
     当前支持：
         sparse_moe_classifier
+        sparse_moe_orthogonal
 
     后续扩展其他模型时，只需要：
         1. 新增模型文件
@@ -5929,6 +6127,11 @@ def train_local_model(
                 )
 
             optimizer.step()
+
+            # 仅正交 MoE 模型实现该方法；旧模型不执行任何额外操作。
+            retract = getattr(model, "retract_expert_subspaces_", None)
+            if callable(retract):
+                retract()
 
             batch_size = int(targets.size(0))
 
@@ -7092,6 +7295,16 @@ class FLServer:
             new_state_dict,
             strict=True,
         )
+
+        # FedAvg 后的参数平均通常不再正交；仅正交 MoE 在服务器端回缩。
+        retract = getattr(
+            self.global_model,
+            "retract_expert_subspaces_",
+            None,
+        )
+        if callable(retract):
+            retract()
+
         self.global_model.to("cpu")
 
         return {
