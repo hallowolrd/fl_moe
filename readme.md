@@ -5,7 +5,7 @@ cd /home/cjq/Project/clean
 conda activate fl_moe
 
 单个实验运行命令
-CUDA_VISIBLE_DEVICES=0 python a/uniform.py \
+CUDA_VISIBLE_DEVICES=0 python algorithms/uniform.py \
   --dataset cifar10 \
   --backbone resnet_cifar \
   --output-dir outputs/cifar10_resnet18
