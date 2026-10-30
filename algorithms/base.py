@@ -8256,6 +8256,7 @@ MethodCliOverridesBuilder = Callable[[argparse.Namespace], Mapping[str, Any]]
 def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FL + MoE training entrypoint")
     parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
+    parser.add_argument("--model", type=str, choices=sorted(SUPPORTED_MODELS), default=None, help="模型名称；显式 CLI 参数优先于配置文件。")
     parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--num-clients", type=int, default=None)
@@ -8287,7 +8288,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
 def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     overrides: Dict[str, Any] = {}
     top_level={
-        "data_root":"data_root","num_clients":"num_clients","alpha":"alpha","frac":"frac",
+        "model":"model","data_root":"data_root","num_clients":"num_clients","alpha":"alpha","frac":"frac",
         "rounds":"rounds","local_epochs":"local_epochs","batch_size":"batch_size",
         "test_batch_size":"test_batch_size","num_workers":"num_workers","num_experts":"num_experts",
         "topk":"topk","seed":"seed","device":"device","output_dir":"output_dir","run_name":"run_name",
