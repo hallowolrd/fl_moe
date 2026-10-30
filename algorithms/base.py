@@ -8270,6 +8270,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--backbone", choices=list_supported_backbones(), default=None)
     parser.add_argument("--num-experts", type=int, default=None)
     parser.add_argument("--topk", type=int, default=None)
+    parser.add_argument("--moe-hidden-dim", type=int, default=None, help="MoE 专家隐藏层维度；覆盖配置文件中的 model_cfg.moe_hidden_dim。")
     parser.add_argument("--optimizer", dest="optimizer_type", choices=("sgd","adam","adamw"), default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--momentum", type=float, default=None)
@@ -8306,6 +8307,8 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
             overrides["input_shape"]=tuple(info["input_shape"])
     backbone=getattr(args,"backbone",None)
     if backbone is not None: overrides.setdefault("model_cfg",{})["backbone"]=backbone
+    moe_hidden_dim=getattr(args,"moe_hidden_dim",None)
+    if moe_hidden_dim is not None: overrides.setdefault("model_cfg",{})["moe_hidden_dim"]=moe_hidden_dim
     opt={}
     for an,ck in (("optimizer_type","type"),("lr","lr"),("momentum","momentum"),("weight_decay","weight_decay")):
         v=getattr(args,an,None)
