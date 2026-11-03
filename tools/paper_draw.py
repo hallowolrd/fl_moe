@@ -135,7 +135,7 @@ LEGEND_ORDER = [
 # 空集合表示全部绘制。
 # =========================
 HIDDEN_METHODS = {
-    "Uniform",
+    
 }
 
 

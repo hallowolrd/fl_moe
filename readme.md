@@ -8,7 +8,9 @@ conda activate fl_moe
 CUDA_VISIBLE_DEVICES=0 python algorithms/uniform.py \
   --dataset cifar10 \
   --backbone resnet_cifar \
-  --output-dir outputs/cifar10_resnet18
+  --model sparse_moe_orthogonal \
+  --moe-hidden-dim 128 \
+  --output-dir two_exp/new_moe_yes_fedavg
 
 折线图运行命令
 python tools/paper_draw.py \
