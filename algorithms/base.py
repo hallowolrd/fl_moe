@@ -5113,7 +5113,49 @@ class SparseMoEClassifier(nn.Module):
         )
 
 
-class OrthogonalSparseMoEClassifier(SparseMoEClassifier):
+@dataclass(frozen=True)
+class ManifoldParameterSpec:
+    """描述一个由多个 PyTorch 参数共同表示的流形变量。"""
+
+    name: str
+    manifold: str
+    parameter_names: Tuple[str, ...]
+    shape: Tuple[int, ...]
+
+
+class ManifoldParameterProvider(ABC):
+    """
+    模型几何接口。
+
+    流形变量可能由多个 Parameter 共同组成，因此不强制将其注册成单个
+    nn.Parameter。算法通过 get/set/retract 三个接口访问模型几何变量。
+    """
+
+    @abstractmethod
+    def manifold_parameter_specs(self) -> Mapping[str, ManifoldParameterSpec]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_manifold_parameter(self, name: str) -> torch.Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_manifold_parameter_(
+        self,
+        name: str,
+        value: torch.Tensor,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def retract_manifold_parameters_(
+        self,
+        names: Optional[Iterable[str]] = None,
+    ) -> None:
+        raise NotImplementedError
+
+
+class OrthogonalSparseMoEClassifier(SparseMoEClassifier, ManifoldParameterProvider):
     """
     跨专家特征投影子空间正交的 Sparse MoE 分类模型。
 
@@ -5169,6 +5211,97 @@ class OrthogonalSparseMoEClassifier(SparseMoEClassifier):
 
         # 父类完成 Xavier 初始化后，立即将专家投影权重映射到正交约束集合。
         self.retract_expert_subspaces_()
+
+    def manifold_parameter_specs(self) -> Mapping[str, ManifoldParameterSpec]:
+        """声明跨专家 fc1 投影矩阵是一个整体 Stiefel 变量。"""
+        expert_weight_ids = {
+            id(expert.fc1.weight)
+            for expert in self.moe_head.experts
+        }
+        parameter_names = tuple(
+            name
+            for name, parameter in self.named_parameters()
+            if id(parameter) in expert_weight_ids
+        )
+        matrix = self.get_manifold_parameter("expert_projection")
+        return {
+            "expert_projection": ManifoldParameterSpec(
+                name="expert_projection",
+                manifold="stiefel",
+                parameter_names=parameter_names,
+                shape=tuple(matrix.shape),
+            )
+        }
+
+    @torch.no_grad()
+    def get_manifold_parameter(self, name: str) -> torch.Tensor:
+        """取得 X=W_all.T，形状为 [feature_dim, total_expert_hidden_dim]。"""
+        if name != "expert_projection":
+            raise KeyError(f"未知流形变量：{name}")
+
+        weights = [
+            expert.fc1.weight
+            for expert in self.moe_head.experts
+        ]
+        if not weights:
+            raise ValueError("模型中没有 expert fc1.weight。")
+
+        return torch.cat(weights, dim=0).transpose(0, 1).detach().clone()
+
+    @torch.no_grad()
+    def set_manifold_parameter_(
+        self,
+        name: str,
+        value: torch.Tensor,
+    ) -> None:
+        """将整体 Stiefel 矩阵写回各 expert 的 fc1.weight。"""
+        if name != "expert_projection":
+            raise KeyError(f"未知流形变量：{name}")
+        if not torch.is_tensor(value) or value.dim() != 2:
+            raise TypeError("expert_projection 必须是二维 Tensor。")
+
+        weights = [
+            expert.fc1.weight
+            for expert in self.moe_head.experts
+        ]
+        if not weights:
+            raise ValueError("模型中没有 expert fc1.weight。")
+
+        expected_shape = (
+            int(weights[0].size(1)),
+            int(sum(weight.size(0) for weight in weights)),
+        )
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                "expert_projection shape 不匹配："
+                f"expected={expected_shape}, actual={tuple(value.shape)}"
+            )
+        if not bool(torch.isfinite(value).all().item()):
+            raise ValueError("expert_projection 包含 NaN 或 Inf。")
+
+        weight_all = value.detach().transpose(0, 1).to(
+            device=weights[0].device,
+            dtype=weights[0].dtype,
+        )
+        offset = 0
+        for weight in weights:
+            rows = int(weight.size(0))
+            weight.copy_(weight_all[offset:offset + rows])
+            offset += rows
+
+    @torch.no_grad()
+    def retract_manifold_parameters_(
+        self,
+        names: Optional[Iterable[str]] = None,
+    ) -> None:
+        """对指定流形变量执行回缩；当前模型只有整体 expert_projection。"""
+        requested = None if names is None else set(names)
+        if requested is not None:
+            unknown = requested - {"expert_projection"}
+            if unknown:
+                raise KeyError(f"未知流形变量：{sorted(unknown)}")
+        if requested is None or "expert_projection" in requested:
+            self.retract_expert_subspaces_()
 
     @torch.no_grad()
     def retract_expert_subspaces_(self) -> None:
@@ -5765,6 +5898,179 @@ def validate_param_groups(
             )
 
 
+@dataclass(frozen=True)
+class FederatedOptimizationGroups:
+    """
+    面向优化算法的参数分组，与 ParamGroups 的专家/非专家语义分离。
+
+    non_expert_parameters:
+        继续使用普通本地优化器更新的 Backbone / Router 等参数。
+    expert_euclidean_parameters:
+        交由专家算法处理的欧氏专家参数。
+    expert_manifold:
+        交由专家算法处理的流形变量定义；一个变量可以由多个 Parameter 组成。
+    *_state_names:
+        对应 state_dict 分组，包含需要处理的浮点 buffer。
+    """
+
+    non_expert_state_names: List[str]
+    expert_state_names: List[str]
+    non_expert_parameters: List[str]
+    expert_euclidean_parameters: List[str]
+    expert_manifold: Dict[str, ManifoldParameterSpec] = field(default_factory=dict)
+    buffers: List[str] = field(default_factory=list)
+    frozen_parameters: List[str] = field(default_factory=list)
+
+    @property
+    def expert_parameter_names(self) -> List[str]:
+        names = list(self.expert_euclidean_parameters)
+        for spec in self.expert_manifold.values():
+            names.extend(spec.parameter_names)
+        return names
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "num_non_expert_parameters": len(self.non_expert_parameters),
+            "num_expert_euclidean_parameters": len(self.expert_euclidean_parameters),
+            "expert_manifold": {
+                name: {
+                    "manifold": spec.manifold,
+                    "parameter_names": list(spec.parameter_names),
+                    "shape": list(spec.shape),
+                }
+                for name, spec in self.expert_manifold.items()
+            },
+            "num_buffers": len(self.buffers),
+            "num_frozen_parameters": len(self.frozen_parameters),
+        }
+
+
+def build_federated_optimization_groups(
+    model: nn.Module,
+    param_groups: Optional[ParamGroups] = None,
+    expected_num_experts: Optional[int] = None,
+    strict: bool = True,
+) -> FederatedOptimizationGroups:
+    """
+    按联邦优化职责拆分参数。
+
+    当前默认职责：
+      - non_expert 参数由普通本地优化器训练，并由固定 uniform 聚合器聚合；
+      - expert 参数交由注入的专家训练策略和专家聚合器处理；
+      - Stiefel 等流形变量由模型的 ManifoldParameterProvider 显式声明。
+
+    不实现任何具体黎曼优化算法。
+    """
+    if param_groups is None:
+        param_groups = build_param_groups(
+            model=model,
+            expected_num_experts=expected_num_experts,
+            strict=strict,
+        )
+
+    state_dict = model.state_dict()
+    named_parameters = dict(model.named_parameters())
+    parameter_names = set(named_parameters)
+    trainable_names = {
+        name
+        for name, parameter in named_parameters.items()
+        if parameter.requires_grad
+    }
+    frozen_names = [
+        name
+        for name, parameter in named_parameters.items()
+        if not parameter.requires_grad
+    ]
+
+    expert_state_names = set(param_groups.expert)
+    non_expert_state_names = set(param_groups.non_expert)
+
+    manifold_specs: Dict[str, ManifoldParameterSpec] = {}
+    if isinstance(model, ManifoldParameterProvider):
+        manifold_specs = dict(model.manifold_parameter_specs())
+
+    manifold_parameter_names = set()
+    for spec_name, spec in manifold_specs.items():
+        if not isinstance(spec, ManifoldParameterSpec):
+            raise TypeError(
+                "manifold_parameter_specs() 的值必须是 ManifoldParameterSpec，"
+                f"当前 {spec_name!r} 的类型为 {type(spec).__name__}。"
+            )
+        if spec_name != spec.name:
+            raise ValueError(
+                f"流形变量 key 与 spec.name 不一致：{spec_name!r} != {spec.name!r}"
+            )
+        if not spec.parameter_names:
+            raise ValueError(f"流形变量 {spec_name!r} 没有关联 Parameter。")
+
+        names = set(spec.parameter_names)
+        overlap = manifold_parameter_names & names
+        if overlap:
+            raise ValueError(
+                f"多个流形变量重复包含 Parameter：{sorted(overlap)}"
+            )
+
+        missing = names - parameter_names
+        if missing:
+            raise KeyError(
+                f"流形变量 {spec_name!r} 引用了模型中不存在的 Parameter："
+                f"{sorted(missing)}"
+            )
+
+        non_expert_names = names - expert_state_names
+        if non_expert_names:
+            raise ValueError(
+                f"当前专家优化接口只允许把 expert 参数声明为流形变量，"
+                f"变量 {spec_name!r} 包含非 expert 参数：{sorted(non_expert_names)}"
+            )
+
+        frozen_manifold_names = names - trainable_names
+        if frozen_manifold_names:
+            raise ValueError(
+                f"流形变量 {spec_name!r} 包含被冻结的 Parameter："
+                f"{sorted(frozen_manifold_names)}"
+            )
+
+        actual_value = model.get_manifold_parameter(spec_name)
+        if tuple(actual_value.shape) != tuple(spec.shape):
+            raise ValueError(
+                f"流形变量 {spec_name!r} 声明 shape={spec.shape}，"
+                f"实际 shape={tuple(actual_value.shape)}。"
+            )
+
+        manifold_parameter_names.update(names)
+
+    non_expert_parameters = [
+        name
+        for name, parameter in named_parameters.items()
+        if name in non_expert_state_names and parameter.requires_grad
+    ]
+    expert_euclidean_parameters = [
+        name
+        for name, parameter in named_parameters.items()
+        if (
+            name in expert_state_names
+            and parameter.requires_grad
+            and name not in manifold_parameter_names
+        )
+    ]
+    buffers = [
+        name
+        for name in state_dict
+        if name not in parameter_names
+    ]
+
+    return FederatedOptimizationGroups(
+        non_expert_state_names=list(param_groups.non_expert),
+        expert_state_names=list(param_groups.expert),
+        non_expert_parameters=non_expert_parameters,
+        expert_euclidean_parameters=expert_euclidean_parameters,
+        expert_manifold=manifold_specs,
+        buffers=buffers,
+        frozen_parameters=frozen_names,
+    )
+
+
 def count_tensors_by_group(groups: ParamGroups) -> Dict[str, int]:
     """
     统计每个参数组包含多少个 tensor。
@@ -5923,6 +6229,10 @@ class ClientUpdate:
     # router_stats
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    # 专家算法专属载荷，例如 Gradient Stream；不与轻量诊断 extra 混用。
+    # model_delta 仍保留，用于 non_expert 的 FedAvg 更新。
+    algorithm_payload: Dict[str, Any] = field(default_factory=dict)
+
     def summary(self) -> Dict[str, Any]:
         """
         返回适合写日志的轻量摘要。
@@ -5936,6 +6246,7 @@ class ClientUpdate:
             "num_samples": int(self.num_samples),
             "metrics": dict(self.metrics),
             "extra_keys": sorted(self.extra.keys()),
+            "algorithm_payload_keys": sorted(self.algorithm_payload.keys()),
         }
 
 
@@ -6168,6 +6479,99 @@ ExpertEvidenceCollector = Callable[..., Mapping[str, Any]]
 MethodClientDiagnosticsBuilder = Callable[[ClientUpdate], Mapping[str, Any]]
 
 
+@dataclass
+class ExpertClientTrainContext:
+    """专家客户端训练策略在一轮本地训练中可访问的公共上下文。"""
+
+    client_id: int
+    round_id: int
+    cfg: Any
+    device: torch.device
+    model: nn.Module
+    global_state: Mapping[str, torch.Tensor]
+    train_loader: DataLoader
+    criterion: nn.Module
+    optimizer: optim.Optimizer
+    optimization_groups: FederatedOptimizationGroups
+    local_epochs: int
+    grad_clip: Optional[float]
+
+    @property
+    def expert_parameters(self) -> Dict[str, nn.Parameter]:
+        parameter_map = dict(self.model.named_parameters())
+        return {
+            name: parameter_map[name]
+            for name in self.optimization_groups.expert_parameter_names
+        }
+
+
+@dataclass
+class ExpertClientBatchContext:
+    """一次本地 batch 反向传播后的专家策略上下文。"""
+
+    train_context: ExpertClientTrainContext
+    epoch: int
+    batch_index: int
+    local_step: int
+    images: torch.Tensor
+    targets: torch.Tensor
+    logits: torch.Tensor
+    loss: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ExpertClientTrainResult:
+    stats: ClientTrainStats
+    algorithm_payload: Dict[str, Any]
+
+
+class ExpertClientTrainingStrategy(ABC):
+    """
+    专家本地训练策略接口。
+
+    框架先执行 forward/backward；step() 在反向传播后、non_expert
+    optimizer.step() 前调用。策略只负责 expert 参数，并可在结束时上传
+    algorithm_payload。non_expert 参数仍由框架的普通优化器更新。
+    """
+
+    @property
+    def strategy_name(self) -> str:
+        return self.__class__.__name__
+
+    def on_train_start(self, context: ExpertClientTrainContext) -> None:
+        """每个客户端每轮训练开始时调用，可用于初始化本轮状态。"""
+
+    def local_step_limit(
+        self,
+        context: ExpertClientTrainContext,
+    ) -> Optional[int]:
+        """
+        返回固定本地 batch 更新步数；返回 None 时沿用 local_epochs。
+
+        固定 K 步算法可以覆盖此方法。达到 K 步后 DataLoader 会从头循环，
+        保证每个客户端恰好执行 K 次本地更新。
+        """
+        return None
+
+    @abstractmethod
+    def step(self, context: ExpertClientBatchContext) -> None:
+        """读取 expert 梯度并执行算法定义的专家本地更新。"""
+        raise NotImplementedError
+
+    def on_train_end(
+        self,
+        context: ExpertClientTrainContext,
+    ) -> Mapping[str, Any]:
+        """返回本轮需要上传的专家算法载荷。"""
+        return {}
+
+
+ExpertClientTrainingStrategyBuilder = Callable[
+    [Any, int],
+    ExpertClientTrainingStrategy,
+]
+
+
 class FLClient:
     """
     联邦学习客户端。
@@ -6193,6 +6597,7 @@ class FLClient:
         device: torch.device | str,
         evidence_loader: Optional[DataLoader] = None,
         expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
+        expert_client_training_strategy: Optional[ExpertClientTrainingStrategy] = None,
     ) -> None:
         self.client_id = int(client_id)
         self.train_loader = train_loader
@@ -6212,6 +6617,7 @@ class FLClient:
         self.cfg = cfg
         self.device = torch.device(device)
         self.expert_evidence_collector = expert_evidence_collector
+        self.expert_client_training_strategy = expert_client_training_strategy
 
         if len(self.train_loader.dataset) <= 0:
             raise ValueError(f"客户端 {self.client_id} 的数据集为空。")
@@ -6259,23 +6665,55 @@ class FLClient:
         local_model.train()
 
         criterion = build_criterion(self.cfg)
-        optimizer = build_optimizer(
-            model=local_model,
-            cfg=self.cfg,
-        )
-
         local_epochs = int(_cfg_get(self.cfg, "local_epochs", 5))
         grad_clip = _get_grad_clip(self.cfg)
+        algorithm_payload: Dict[str, Any] = {}
+        optimization_groups: Optional[FederatedOptimizationGroups] = None
 
-        stats = train_local_model(
-            model=local_model,
-            train_loader=self.train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=self.device,
-            local_epochs=local_epochs,
-            grad_clip=grad_clip,
-        )
+        if self.expert_client_training_strategy is None:
+            # 旧算法路径保持不变：普通优化器更新整个模型。
+            optimizer = build_optimizer(
+                model=local_model,
+                cfg=self.cfg,
+            )
+            stats = train_local_model(
+                model=local_model,
+                train_loader=self.train_loader,
+                criterion=criterion,
+                optimizer=optimizer,
+                device=self.device,
+                local_epochs=local_epochs,
+                grad_clip=grad_clip,
+            )
+        else:
+            # 专家算法路径：non_expert 使用原优化器，expert 交给注入策略。
+            optimization_groups = build_federated_optimization_groups(
+                model=local_model,
+                expected_num_experts=int(_cfg_get(self.cfg, "num_experts", 0)),
+                strict=True,
+            )
+            optimizer = build_optimizer(
+                model=local_model,
+                cfg=self.cfg,
+                param_names=optimization_groups.non_expert_parameters,
+            )
+            train_result = train_local_model_with_expert_strategy(
+                model=local_model,
+                train_loader=self.train_loader,
+                criterion=criterion,
+                optimizer=optimizer,
+                device=self.device,
+                local_epochs=local_epochs,
+                grad_clip=grad_clip,
+                client_id=self.client_id,
+                round_id=int(round_id),
+                cfg=self.cfg,
+                global_state=global_state_cpu,
+                optimization_groups=optimization_groups,
+                strategy=self.expert_client_training_strategy,
+            )
+            stats = train_result.stats
+            algorithm_payload = train_result.algorithm_payload
 
         # ------------------------------------------------------------
         # 可选：采集当前客户端本地模型的 expert usage。
@@ -6358,6 +6796,11 @@ class FLClient:
         model_delta = subtract_state_dict(
             local_state=local_state_cpu,
             global_state=global_state_cpu,
+            param_names=(
+                optimization_groups.non_expert_state_names
+                if optimization_groups is not None
+                else None
+            ),
             strict=True,
         )
 
@@ -6373,9 +6816,15 @@ class FLClient:
                 "optimizer": get_optimizer_type(self.cfg),
                 "local_epochs": int(local_epochs),
                 "grad_clip": float(grad_clip) if grad_clip is not None else None,
+                "expert_training_strategy": (
+                    self.expert_client_training_strategy.strategy_name
+                    if self.expert_client_training_strategy is not None
+                    else None
+                ),
                 "expert_usage": expert_usage,
                 **method_extra,
             },
+            algorithm_payload=algorithm_payload,
         )
 
         del local_model
@@ -6468,6 +6917,207 @@ def train_local_model(
         train_acc=train_acc,
         num_samples=total_samples,
         num_batches=total_batches,
+    )
+
+
+def _detach_algorithm_payload_to_cpu(value: Any) -> Any:
+    """递归 detach 算法载荷中的 Tensor，并移至 CPU。"""
+    if torch.is_tensor(value):
+        return value.detach().to("cpu").clone()
+    if isinstance(value, Mapping):
+        return {
+            key: _detach_algorithm_payload_to_cpu(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_detach_algorithm_payload_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_algorithm_payload_to_cpu(item) for item in value)
+    return value
+
+
+def train_local_model_with_expert_strategy(
+    model: nn.Module,
+    train_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    local_epochs: int,
+    grad_clip: Optional[float],
+    client_id: int,
+    round_id: int,
+    cfg: Any,
+    global_state: Mapping[str, torch.Tensor],
+    optimization_groups: FederatedOptimizationGroups,
+    strategy: ExpertClientTrainingStrategy,
+) -> ExpertClientTrainResult:
+    """
+    使用专家训练策略更新 expert，同时用普通 optimizer 更新 non_expert。
+
+    策略 step() 在 loss.backward() 之后调用；传入的 optimizer 只包含
+    non_expert 可训练参数，因此策略不会与普通 optimizer 重复更新 expert。
+    """
+    if local_epochs <= 0:
+        raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
+    if not isinstance(strategy, ExpertClientTrainingStrategy):
+        raise TypeError(
+            "strategy 必须是 ExpertClientTrainingStrategy，"
+            f"当前类型：{type(strategy).__name__}"
+        )
+
+    parameter_map = dict(model.named_parameters())
+    expert_parameter_names = optimization_groups.expert_parameter_names
+    if not expert_parameter_names:
+        raise ValueError("专家训练策略已启用，但模型没有可训练 expert 参数。")
+
+    expert_parameters = [
+        parameter_map[name]
+        for name in expert_parameter_names
+    ]
+    non_expert_parameters = [
+        parameter_map[name]
+        for name in optimization_groups.non_expert_parameters
+    ]
+    if not non_expert_parameters:
+        raise ValueError("模型没有可供普通本地优化器更新的 non_expert 参数。")
+
+    context = ExpertClientTrainContext(
+        client_id=int(client_id),
+        round_id=int(round_id),
+        cfg=cfg,
+        device=torch.device(device),
+        model=model,
+        global_state=global_state,
+        train_loader=train_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        optimization_groups=optimization_groups,
+        local_epochs=int(local_epochs),
+        grad_clip=grad_clip,
+    )
+
+    model.train()
+    strategy.on_train_start(context)
+    step_limit = strategy.local_step_limit(context)
+    if step_limit is not None:
+        if (
+            isinstance(step_limit, bool)
+            or not isinstance(step_limit, int)
+            or step_limit <= 0
+        ):
+            raise ValueError(
+                "strategy.local_step_limit() 必须返回正整数或 None，"
+                f"当前值：{step_limit!r}"
+            )
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    total_batches = 0
+
+    def run_batch(
+        batch: Any,
+        epoch: int,
+        batch_index: int,
+    ) -> None:
+        nonlocal total_loss, total_correct, total_samples, total_batches
+
+        images, targets = unpack_batch(batch)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        # 清空全部参数梯度；optimizer 本身只管理 non_expert 参数。
+        model.zero_grad(set_to_none=True)
+
+        outputs = model(images)
+        logits = extract_logits(outputs)
+        loss = criterion(logits, targets)
+        loss.backward()
+
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                non_expert_parameters,
+                max_norm=float(grad_clip),
+            )
+
+        strategy.step(
+            ExpertClientBatchContext(
+                train_context=context,
+                epoch=int(epoch),
+                batch_index=int(batch_index),
+                local_step=int(total_batches + 1),
+                images=images,
+                targets=targets,
+                logits=logits,
+                loss=loss,
+            )
+        )
+
+        # 防止专家梯度跨 batch 意外累积；策略需要保留时应自行 detach/clone。
+        for parameter in expert_parameters:
+            parameter.grad = None
+
+        optimizer.step()
+
+        batch_size = int(targets.size(0))
+        total_loss += float(loss.item()) * batch_size
+        total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
+        total_samples += batch_size
+        total_batches += 1
+
+    if step_limit is not None:
+        batches_per_epoch = len(train_loader)
+        if batches_per_epoch <= 0:
+            raise ValueError("客户端 DataLoader 没有可训练 batch。")
+
+        iterator = iter(train_loader)
+        for step_index in range(step_limit):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(train_loader)
+                try:
+                    batch = next(iterator)
+                except StopIteration as exc:
+                    raise ValueError(
+                        "客户端 DataLoader 为空，无法执行固定本地步数。"
+                    ) from exc
+
+            run_batch(
+                batch=batch,
+                epoch=step_index // batches_per_epoch,
+                batch_index=step_index % batches_per_epoch,
+            )
+    else:
+        for epoch in range(local_epochs):
+            for batch_index, batch in enumerate(train_loader):
+                run_batch(
+                    batch=batch,
+                    epoch=epoch,
+                    batch_index=batch_index,
+                )
+
+    if total_samples <= 0:
+        raise ValueError("专家策略本地训练没有处理任何样本。")
+
+    payload = strategy.on_train_end(context)
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, Mapping):
+        raise TypeError(
+            "strategy.on_train_end() 必须返回 Mapping 或 None，"
+            f"当前类型：{type(payload).__name__}"
+        )
+
+    stats = ClientTrainStats(
+        avg_loss=total_loss / total_samples,
+        train_acc=100.0 * total_correct / total_samples,
+        num_samples=total_samples,
+        num_batches=total_batches,
+    )
+    return ExpertClientTrainResult(
+        stats=stats,
+        algorithm_payload=_detach_algorithm_payload_to_cpu(dict(payload)),
     )
 
 
@@ -6703,6 +7353,7 @@ def build_criterion(cfg: Any) -> nn.Module:
 def build_optimizer(
     model: nn.Module,
     cfg: Any,
+    param_names: Optional[Iterable[str]] = None,
 ) -> optim.Optimizer:
     """
     根据 cfg.optimizer 构建优化器。
@@ -6718,11 +7369,32 @@ def build_optimizer(
     lr = float(_cfg_get(optimizer_cfg, "lr", 0.01))
     weight_decay = float(_cfg_get(optimizer_cfg, "weight_decay", 0.0005))
 
-    params = [
-        param
-        for param in model.parameters()
-        if param.requires_grad
-    ]
+    if param_names is None:
+        params = [
+            param
+            for param in model.parameters()
+            if param.requires_grad
+        ]
+    else:
+        named_parameters = dict(model.named_parameters())
+        selected_names = list(param_names)
+        if len(selected_names) != len(set(selected_names)):
+            raise ValueError("build_optimizer 的 param_names 不能包含重复名称。")
+
+        missing_names = [
+            name for name in selected_names
+            if name not in named_parameters
+        ]
+        if missing_names:
+            raise KeyError(
+                f"build_optimizer 找不到指定 Parameter：{missing_names}"
+            )
+
+        params = [
+            named_parameters[name]
+            for name in selected_names
+            if named_parameters[name].requires_grad
+        ]
 
     if len(params) == 0:
         raise ValueError("模型没有可训练参数。")
@@ -6785,6 +7457,9 @@ def build_clients(
     device: torch.device | str,
     client_evidence_loaders: Optional[Sequence[DataLoader]] = None,
     expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
+    expert_client_training_strategy_builder: Optional[
+        ExpertClientTrainingStrategyBuilder
+    ] = None,
 ) -> List[FLClient]:
     """
     根据客户端 DataLoader 列表创建 FLClient 列表。
@@ -6818,6 +7493,22 @@ def build_clients(
         else:
             evidence_loader = client_evidence_loaders[client_id]
 
+        expert_client_training_strategy = None
+        if expert_client_training_strategy_builder is not None:
+            expert_client_training_strategy = expert_client_training_strategy_builder(
+                cfg,
+                int(client_id),
+            )
+            if not isinstance(
+                expert_client_training_strategy,
+                ExpertClientTrainingStrategy,
+            ):
+                raise TypeError(
+                    "expert_client_training_strategy_builder 必须返回 "
+                    "ExpertClientTrainingStrategy，"
+                    f"当前类型：{type(expert_client_training_strategy).__name__}"
+                )
+
         clients.append(
             FLClient(
                 client_id=client_id,
@@ -6826,6 +7517,7 @@ def build_clients(
                 cfg=cfg,
                 device=device,
                 expert_evidence_collector=expert_evidence_collector,
+                expert_client_training_strategy=expert_client_training_strategy,
             )
         )
 
@@ -6953,6 +7645,9 @@ class MethodContext:
     dataset_name: str
     server_evidence_loader: Optional[DataLoader] = None
     model_builder: Optional[Callable[[Any], nn.Module]] = None
+    global_model: Optional[nn.Module] = None
+    param_groups: Optional[ParamGroups] = None
+    optimization_groups: Optional[FederatedOptimizationGroups] = None
     extra: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -7010,6 +7705,16 @@ class Aggregator(ABC):
         """
         raise NotImplementedError
 
+    @property
+    def handles_manifold_retraction(self) -> bool:
+        """
+        是否由该专家聚合器负责服务器端流形回缩。
+
+        默认 False：沿用 FLServer 的模型级自动回缩。
+        RFedAGS 等自行完成 Stiefel 更新与 Retraction 的专家聚合器应覆盖为 True。
+        """
+        return False
+
     @abstractmethod
     def compute_weights(
         self,
@@ -7035,7 +7740,10 @@ class Aggregator(ABC):
         """
         执行参数聚合。
 
-        这是所有普通加权 delta 聚合方法的公共流程：
+        这是所有普通加权 delta 聚合方法的公共流程。
+
+        专家聚合插件可以覆盖本方法，直接读取 ClientUpdate.algorithm_payload
+        并返回新的 AggregationResult；non_expert 聚合仍由固定 uniform 聚合器负责。
 
             1. 检查客户端更新
             2. 计算客户端权重
@@ -7325,6 +8033,9 @@ class FLServer:
         method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
         method_context: Optional[MethodContext] = None,
         global_model: Optional[nn.Module] = None,
+        expert_client_training_strategy_builder: Optional[
+            ExpertClientTrainingStrategyBuilder
+        ] = None,
     ) -> None:
         self.cfg = cfg
         self.device = torch.device(device)
@@ -7339,6 +8050,17 @@ class FLServer:
 
         self.global_model.to("cpu")
 
+        self.param_groups = build_param_groups(
+            model=self.global_model,
+            expected_num_experts=int(_cfg_get(cfg, "num_experts", 0)),
+            strict=True,
+        )
+        self.optimization_groups = build_federated_optimization_groups(
+            model=self.global_model,
+            param_groups=self.param_groups,
+            strict=True,
+        )
+
         self.clients = build_clients(
             cfg=cfg,
             client_loaders=client_loaders,
@@ -7348,22 +8070,30 @@ class FLServer:
             client_evidence_loaders=client_evidence_loaders,
             device=self.device,
             expert_evidence_collector=expert_evidence_collector,
+            expert_client_training_strategy_builder=expert_client_training_strategy_builder,
         )
 
         self.test_loader = test_loader
         self.method_client_diagnostics_builder = method_client_diagnostics_builder
-        self.method_context = method_context
+        if method_context is None:
+            self.method_context = None
+        else:
+            self.method_context = MethodContext(
+                cfg=method_context.cfg,
+                device=method_context.device,
+                dataset_name=method_context.dataset_name,
+                server_evidence_loader=method_context.server_evidence_loader,
+                model_builder=method_context.model_builder,
+                global_model=self.global_model,
+                param_groups=self.param_groups,
+                optimization_groups=self.optimization_groups,
+                extra=method_context.extra,
+            )
 
         self.aggregators = build_aggregators(
             cfg=cfg,
             expert_aggregator_builder=expert_aggregator_builder,
-            method_context=method_context,
-        )
-
-        self.param_groups = build_param_groups(
-            model=self.global_model,
-            expected_num_experts=int(_cfg_get(cfg, "num_experts", 0)),
-            strict=True,
+            method_context=self.method_context,
         )
 
         self.train_state = TrainState(
@@ -7623,7 +8353,10 @@ class FLServer:
             "retract_expert_subspaces_",
             None,
         )
-        if callable(retract):
+        if (
+            callable(retract)
+            and not self.aggregators.expert.handles_manifold_retraction
+        ):
             retract()
 
         self.global_model.to("cpu")
@@ -8474,6 +9207,9 @@ def build_server(
     expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
     method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
     method_context: Optional[MethodContext] = None,
+    expert_client_training_strategy_builder: Optional[
+        ExpertClientTrainingStrategyBuilder
+    ] = None,
 ) -> FLServer:
     """
     构建 FLServer。
@@ -8494,6 +9230,7 @@ def build_server(
         expert_evidence_collector=expert_evidence_collector,
         method_client_diagnostics_builder=method_client_diagnostics_builder,
         method_context=method_context,
+        expert_client_training_strategy_builder=expert_client_training_strategy_builder,
     )
 
 
@@ -8694,6 +9431,9 @@ def main(
     method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
     method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None,
     method_cli_overrides_builder: Optional[MethodCliOverridesBuilder] = None,
+    expert_client_training_strategy_builder: Optional[
+        ExpertClientTrainingStrategyBuilder
+    ] = None,
 ) -> int:
     """
     训练入口。
@@ -8761,6 +9501,7 @@ def main(
                 expert_method_name=expert_method_name,
                 expert_evidence_collector=expert_evidence_collector,
                 method_client_diagnostics_builder=method_client_diagnostics_builder,
+                expert_client_training_strategy_builder=expert_client_training_strategy_builder,
             )
         except Exception:
             print()
@@ -8779,6 +9520,9 @@ def run_training(
     expert_method_name: str,
     expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
     method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
+    expert_client_training_strategy_builder: Optional[
+        ExpertClientTrainingStrategyBuilder
+    ] = None,
 ) -> int:
     """
     实际训练流程。
@@ -8884,6 +9628,7 @@ def run_training(
         expert_evidence_collector=expert_evidence_collector,
         method_client_diagnostics_builder=method_client_diagnostics_builder,
         method_context=method_context,
+        expert_client_training_strategy_builder=expert_client_training_strategy_builder,
     )
 
     train_result = server.train()
