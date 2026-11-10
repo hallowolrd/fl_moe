@@ -7645,10 +7645,10 @@ class MethodContext:
     dataset_name: str
     server_evidence_loader: Optional[DataLoader] = None
     model_builder: Optional[Callable[[Any], nn.Module]] = None
+    extra: Mapping[str, Any] = field(default_factory=dict)
     global_model: Optional[nn.Module] = None
     param_groups: Optional[ParamGroups] = None
     optimization_groups: Optional[FederatedOptimizationGroups] = None
-    extra: Mapping[str, Any] = field(default_factory=dict)
 
 
 class Aggregator(ABC):
@@ -7704,6 +7704,16 @@ class Aggregator(ABC):
         子类返回自己启动文件对应的方法名称。
         """
         raise NotImplementedError
+
+    @property
+    def consumes_algorithm_payload(self) -> bool:
+        """
+        是否消费 ClientUpdate.algorithm_payload。
+
+        默认 False。使用专家自定义训练策略时，客户端 model_delta 只包含
+        non_expert 状态，因此对应专家聚合器必须覆盖 aggregate() 并声明 True。
+        """
+        return False
 
     @property
     def handles_manifold_retraction(self) -> bool:
@@ -7866,6 +7876,12 @@ class Aggregator(ABC):
             if len(update.model_delta) == 0:
                 raise ValueError(
                     f"客户端 {update.client_id} 的 model_delta 为空。"
+                )
+
+            if not isinstance(update.algorithm_payload, Mapping):
+                raise TypeError(
+                    f"客户端 {update.client_id} 的 algorithm_payload 必须是 Mapping，"
+                    f"当前类型：{type(update.algorithm_payload).__name__}"
                 )
 
 
@@ -8095,6 +8111,15 @@ class FLServer:
             expert_aggregator_builder=expert_aggregator_builder,
             method_context=self.method_context,
         )
+        if (
+            expert_client_training_strategy_builder is not None
+            and not self.aggregators.expert.consumes_algorithm_payload
+        ):
+            raise ValueError(
+                "启用 expert_client_training_strategy_builder 后，"
+                "专家聚合器必须覆盖 aggregate() 并声明 "
+                "consumes_algorithm_payload=True。"
+            )
 
         self.train_state = TrainState(
             round_id=0,
