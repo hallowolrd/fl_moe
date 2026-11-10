@@ -412,7 +412,13 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "dataset": "cifar10",
     "data_root": "./datasets",
     "num_clients": 5,
-    "alpha": 0.1,
+    "partition": {
+        "method": "dirichlet",
+        "dirichlet": {
+            "alpha": 0.1,
+            "sample_balance": "balanced",
+        },
+    },
     "frac": 1.0,
     "rounds": 50,
     "local_epochs": 5,
@@ -678,8 +684,64 @@ def _apply_config_overrides(
 
 
 def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Use EMBEDDED_BASE_CONFIG as the single shared default source."""
-    cfg = _deep_merge(base=EMBEDDED_BASE_CONFIG, override=cfg)
+    """Apply shared defaults and normalize partition settings to the nested schema."""
+    explicit_cfg = copy.deepcopy(dict(cfg))
+    cfg = _deep_merge(base=EMBEDDED_BASE_CONFIG, override=explicit_cfg)
+
+    # Canonical schema:
+    #   partition.method
+    #   partition.dirichlet.alpha
+    #   partition.dirichlet.sample_balance
+    # Legacy top-level partition_method / alpha remain accepted as input aliases.
+    explicit_partition = explicit_cfg.get("partition", {})
+    if explicit_partition is None:
+        explicit_partition = {}
+    if not isinstance(explicit_partition, Mapping):
+        raise ConfigError("partition 必须是 dict。")
+
+    explicit_dirichlet = explicit_partition.get("dirichlet", {})
+    if explicit_dirichlet is None:
+        explicit_dirichlet = {}
+    if not isinstance(explicit_dirichlet, Mapping):
+        raise ConfigError("partition.dirichlet 必须是 dict。")
+
+    default_partition = copy.deepcopy(EMBEDDED_BASE_CONFIG["partition"])
+    default_dirichlet = default_partition.get("dirichlet", {})
+
+    partition_method = explicit_partition.get(
+        "method",
+        explicit_cfg.get(
+            "partition_method",
+            default_partition.get("method", "dirichlet"),
+        ),
+    )
+    dirichlet_alpha = explicit_dirichlet.get(
+        "alpha",
+        explicit_cfg.get("alpha", default_dirichlet.get("alpha", 0.1)),
+    )
+    sample_balance = explicit_dirichlet.get(
+        "sample_balance",
+        default_dirichlet.get("sample_balance", "balanced"),
+    )
+
+    normalized_partition = _deep_merge(
+        base=default_partition,
+        override=explicit_partition,
+    )
+    normalized_partition["method"] = str(partition_method).strip().lower()
+    normalized_partition["dirichlet"] = _deep_merge(
+        base=default_dirichlet,
+        override=explicit_dirichlet,
+    )
+    normalized_partition["dirichlet"]["alpha"] = dirichlet_alpha
+    normalized_partition["dirichlet"]["sample_balance"] = str(
+        sample_balance
+    ).strip().lower()
+    cfg["partition"] = normalized_partition
+
+    # Legacy keys are input-only; save and expose only the canonical nested form.
+    cfg.pop("partition_method", None)
+    cfg.pop("alpha", None)
 
     dataset_name = normalize_dataset_name(cfg["dataset"])
     cfg["dataset"] = dataset_name
@@ -748,7 +810,21 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     """
     dataset = _safe_name(cfg.get("dataset", "dataset"))
     num_clients = _safe_name(cfg.get("num_clients", "c"))
-    alpha = _safe_name(cfg.get("alpha", "iid"))
+    partition_cfg = cfg.get("partition", {})
+    partition_method = str(partition_cfg.get("method", "dirichlet")).lower()
+    dirichlet_cfg = partition_cfg.get("dirichlet", {})
+    sample_balance = (
+        dirichlet_cfg.get("sample_balance", "balanced")
+        if partition_method == "dirichlet"
+        else "na"
+    )
+    alpha = _safe_name(
+        dirichlet_cfg.get("alpha", "na")
+        if partition_method == "dirichlet"
+        else "na"
+    )
+    partition_method = _safe_name(partition_method)
+    sample_balance = _safe_name(sample_balance)
     model = _safe_name(cfg.get("model", "model"))
     model_cfg = cfg.get("model_cfg", {})
     backbone = _safe_name(
@@ -773,6 +849,7 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     return (
         f"{dataset}"
         f"_c{num_clients}"
+        f"_p{partition_method}_{sample_balance}"
         f"_a{alpha}"
         f"_{model}"
         f"_bb{backbone}"
@@ -925,11 +1002,38 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     if not (0.0 < frac <= 1.0):
         raise ConfigError(f"frac 必须在 (0, 1] 范围内，当前值：{frac}")
 
-    alpha = float(cfg.get("alpha"))
-    if not math.isfinite(alpha) or alpha <= 0:
+    partition_cfg = cfg.get("partition", {})
+    if not isinstance(partition_cfg, Mapping):
+        raise ConfigError("partition 必须是 dict。")
+
+    partition_method = str(
+        partition_cfg.get("method", "dirichlet")
+    ).strip().lower()
+    if partition_method not in {"iid", "dirichlet"}:
         raise ConfigError(
-            f"alpha 必须是有限的正数，当前值：{alpha}"
+            f"不支持的数据划分方法：{partition_method}。当前支持：iid, dirichlet"
         )
+
+    dirichlet_cfg = partition_cfg.get("dirichlet", {})
+    if not isinstance(dirichlet_cfg, Mapping):
+        raise ConfigError("partition.dirichlet 必须是 dict。")
+
+    if partition_method == "dirichlet":
+        alpha = float(dirichlet_cfg.get("alpha"))
+        if not math.isfinite(alpha) or alpha <= 0:
+            raise ConfigError(
+                "partition.dirichlet.alpha 必须是有限的正数，"
+                f"当前值：{alpha}"
+            )
+
+        sample_balance = str(
+            dirichlet_cfg.get("sample_balance", "balanced")
+        ).strip().lower()
+        if sample_balance not in {"balanced", "unbalanced"}:
+            raise ConfigError(
+                "partition.dirichlet.sample_balance 只能是 balanced 或 unbalanced，"
+                f"当前值：{sample_balance!r}"
+            )
 
     # 优化器参数必须统一写在 optimizer 下，避免同时存在两套配置入口。
     forbidden_top_level_optimizer_keys = {
@@ -2499,7 +2603,7 @@ def get_normalization_stats(dataset_name: str) -> Tuple[Tuple[float, ...], Tuple
 
 # ============================================================================
 # 6. 客户端数据划分（Data Partition）
-# 包含 IID、Dirichlet 划分及划分结果验证。
+# 包含 IID、普通/均衡 Dirichlet 划分及划分结果验证。
 # Bundled from data/partition.py
 # ============================================================================
 
@@ -2529,6 +2633,12 @@ class PartitionResult:
 
     partition_method:
         数据划分方法，例如 iid / dirichlet。
+
+    sample_balance:
+        Dirichlet 客户端样本数策略：balanced / unbalanced；IID 时为 none。
+
+    dirichlet_alpha:
+        Dirichlet 集中参数；IID 时为 None。
     """
 
     client_indices: List[List[int]]
@@ -2536,35 +2646,27 @@ class PartitionResult:
     client_class_counts: Dict[int, Dict[int, int]]
     num_classes: int
     partition_method: str
+    sample_balance: str = "none"
+    dirichlet_alpha: Optional[float] = None
 
 
 def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
-    """
-    根据配置划分训练集。
-
-    第一版支持：
-        1. iid
-        2. dirichlet
-
-    默认使用 dirichlet，因为你的 FL 实验主要是 non-IID 场景。
-
-    需要的配置字段：
-        cfg.num_clients
-        cfg.alpha
-        cfg.seed
-
-    可选配置字段：
-        cfg.partition_method，默认 dirichlet
-        cfg.min_samples_per_client，默认 1
-        cfg.partition_max_retries，默认 100
-    """
+    """根据嵌套 partition 配置划分训练集。"""
     num_clients = int(cfg.num_clients)
     seed = int(cfg.seed)
 
-    partition_method = str(_cfg_get(cfg, "partition_method", "dirichlet")).lower()
+    partition_cfg = _cfg_get(cfg, "partition", {})
+    partition_method = str(
+        _cfg_get(partition_cfg, "method", "dirichlet")
+    ).strip().lower()
+    dirichlet_cfg = _cfg_get(partition_cfg, "dirichlet", {})
+    sample_balance = str(
+        _cfg_get(dirichlet_cfg, "sample_balance", "balanced")
+    ).strip().lower()
 
     targets = get_dataset_targets(dataset)
     num_classes = infer_num_classes(targets)
+    dirichlet_alpha: Optional[float] = None
 
     if partition_method == "iid":
         client_indices = build_iid_partition(
@@ -2572,20 +2674,35 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
             num_clients=num_clients,
             seed=seed,
         )
+        sample_balance = "none"
 
     elif partition_method == "dirichlet":
-        alpha = float(cfg.alpha)
+        dirichlet_alpha = float(_cfg_get(dirichlet_cfg, "alpha", 0.1))
         min_samples_per_client = int(_cfg_get(cfg, "min_samples_per_client", 1))
-        max_retries = int(_cfg_get(cfg, "partition_max_retries", 100))
 
-        client_indices = build_dirichlet_partition(
-            targets=targets,
-            num_clients=num_clients,
-            alpha=alpha,
-            seed=seed,
-            min_samples_per_client=min_samples_per_client,
-            max_retries=max_retries,
-        )
+        if sample_balance == "balanced":
+            client_indices = build_balanced_dirichlet_partition(
+                targets=targets,
+                num_clients=num_clients,
+                alpha=dirichlet_alpha,
+                seed=seed,
+                min_samples_per_client=min_samples_per_client,
+            )
+        elif sample_balance == "unbalanced":
+            max_retries = int(_cfg_get(cfg, "partition_max_retries", 100))
+            client_indices = build_dirichlet_partition(
+                targets=targets,
+                num_clients=num_clients,
+                alpha=dirichlet_alpha,
+                seed=seed,
+                min_samples_per_client=min_samples_per_client,
+                max_retries=max_retries,
+            )
+        else:
+            raise ValueError(
+                "partition.dirichlet.sample_balance 只能是 balanced 或 unbalanced，"
+                f"当前值：{sample_balance!r}"
+            )
 
     else:
         raise ValueError(
@@ -2612,6 +2729,8 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
         client_class_counts=client_class_counts,
         num_classes=num_classes,
         partition_method=partition_method,
+        sample_balance=sample_balance,
+        dirichlet_alpha=dirichlet_alpha,
     )
 
 
@@ -2643,6 +2762,168 @@ def build_iid_partition(
         split.astype(int).tolist()
         for split in split_indices
     ]
+
+
+def _allocate_class_samples_with_capacity(
+    num_samples: int,
+    class_proportions: np.ndarray,
+    remaining_capacity: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """在客户端容量约束下分配一个类别的样本。"""
+    allocation = np.zeros_like(remaining_capacity, dtype=np.int64)
+    pending = int(num_samples)
+
+    while pending > 0:
+        active_clients = np.flatnonzero(remaining_capacity > 0)
+        if active_clients.size == 0:
+            raise RuntimeError(
+                "balanced Dirichlet 分配失败：样本仍未分配，但所有客户端容量已用尽。"
+            )
+
+        # Dirichlet 概率决定类别偏好；剩余容量用于避免客户端超额。
+        weights = (
+            class_proportions[active_clients]
+            * remaining_capacity[active_clients].astype(np.float64)
+        )
+        weight_sum = float(weights.sum())
+        if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+            weights = remaining_capacity[active_clients].astype(np.float64)
+            weight_sum = float(weights.sum())
+
+        probabilities = weights / weight_sum
+        proposed = rng.multinomial(pending, probabilities)
+        accepted = np.minimum(
+            proposed,
+            remaining_capacity[active_clients],
+        )
+
+        allocation[active_clients] += accepted
+        remaining_capacity[active_clients] -= accepted
+        assigned = int(accepted.sum())
+        if assigned <= 0:
+            raise RuntimeError(
+                "balanced Dirichlet 分配停滞：本轮没有样本能够写入剩余客户端容量。"
+            )
+        pending -= assigned
+
+    return allocation
+
+
+def build_balanced_dirichlet_partition(
+    targets: Sequence[int],
+    num_clients: int,
+    alpha: float,
+    seed: int,
+    min_samples_per_client: int = 1,
+) -> List[List[int]]:
+    """
+    容量约束的 balanced Dirichlet Non-IID 划分。
+
+    对每个类别独立采样 Dirichlet(alpha) 客户端偏好，再在客户端剩余容量
+    约束下分配该类别样本。所有样本都会被分配；若数据集大小不能被客户端数
+    整除，各客户端样本数只会相差 1。
+
+    这是一种带容量约束的 Dirichlet 分配：类别比例受均衡容量约束，
+    不等同于不受约束的逐类独立 multinomial 划分。
+    """
+    _validate_num_clients(num_clients)
+
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError(
+            f"alpha 必须是有限的正数，当前值：{alpha}"
+        )
+    if min_samples_per_client < 0:
+        raise ValueError(
+            "min_samples_per_client 不能小于 0，"
+            f"当前值：{min_samples_per_client}"
+        )
+
+    targets_array = np.asarray(targets, dtype=np.int64)
+    dataset_size = int(targets_array.size)
+    if dataset_size < num_clients:
+        raise ValueError(
+            "balanced Dirichlet 要求训练样本数不少于客户端数量，"
+            f"当前样本数={dataset_size}，客户端数={num_clients}。"
+        )
+
+    rng = np.random.default_rng(seed)
+
+    # 将总样本数精确分成 floor(N/M) 或 ceil(N/M)。
+    base_capacity, remainder = divmod(dataset_size, num_clients)
+    client_capacities = np.full(
+        num_clients,
+        base_capacity,
+        dtype=np.int64,
+    )
+    if remainder > 0:
+        extra_clients = rng.choice(
+            num_clients,
+            size=remainder,
+            replace=False,
+        )
+        client_capacities[extra_clients] += 1
+
+    min_capacity = int(client_capacities.min())
+    if min_capacity < min_samples_per_client:
+        raise ValueError(
+            "balanced Dirichlet 的目标客户端容量低于 min_samples_per_client："
+            f"最小容量={min_capacity}，要求至少={min_samples_per_client}。"
+        )
+
+    remaining_capacity = client_capacities.copy()
+    client_indices: List[List[int]] = [
+        [] for _ in range(num_clients)
+    ]
+
+    # 随机化类别处理顺序，避免固定类别总是优先占用容量。
+    class_ids = np.unique(targets_array)
+    for class_id in rng.permutation(class_ids):
+        class_indices = np.flatnonzero(targets_array == class_id)
+        rng.shuffle(class_indices)
+
+        class_proportions = rng.dirichlet(
+            alpha=np.full(num_clients, alpha, dtype=np.float64)
+        )
+        class_allocation = _allocate_class_samples_with_capacity(
+            num_samples=len(class_indices),
+            class_proportions=class_proportions,
+            remaining_capacity=remaining_capacity,
+            rng=rng,
+        )
+
+        cursor = 0
+        for client_id, count in enumerate(class_allocation):
+            count = int(count)
+            if count > 0:
+                client_indices[client_id].extend(
+                    class_indices[cursor:cursor + count].astype(int).tolist()
+                )
+            cursor += count
+
+        if cursor != len(class_indices):
+            raise RuntimeError(
+                f"类别 {int(class_id)} 的样本分配数量不正确："
+                f"已分配={cursor}，实际={len(class_indices)}。"
+            )
+
+    if np.any(remaining_capacity != 0):
+        raise RuntimeError(
+            "balanced Dirichlet 分配结束后仍有未填满的客户端容量："
+            f"{remaining_capacity.tolist()}"
+        )
+
+    for indices in client_indices:
+        rng.shuffle(indices)
+
+    sample_counts = [len(indices) for indices in client_indices]
+    if max(sample_counts) - min(sample_counts) > 1:
+        raise RuntimeError(
+            "balanced Dirichlet 未能满足客户端样本数最多相差 1 的约束："
+            f"{sample_counts}"
+        )
+
+    return client_indices
 
 
 def build_dirichlet_partition(
@@ -2873,11 +3154,19 @@ def partition_summary_to_dict(partition: PartitionResult) -> Dict[str, Any]:
     注意：
         不保存完整 client_indices，避免日志文件太大。
     """
+    sample_counts = list(partition.client_sample_counts.values())
     return {
         "partition_method": partition.partition_method,
+        "sample_balance": partition.sample_balance,
+        "dirichlet_alpha": partition.dirichlet_alpha,
         "num_classes": partition.num_classes,
         "num_clients": len(partition.client_indices),
         "client_sample_counts": partition.client_sample_counts,
+        "client_sample_count_min": min(sample_counts) if sample_counts else 0,
+        "client_sample_count_max": max(sample_counts) if sample_counts else 0,
+        "client_sample_count_spread": (
+            max(sample_counts) - min(sample_counts) if sample_counts else 0
+        ),
         "client_class_counts": partition.client_class_counts,
     }
 
@@ -8293,7 +8582,24 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--num-clients", type=int, default=None)
-    parser.add_argument("--alpha", type=float, default=None)
+    parser.add_argument(
+        "--partition-method",
+        choices=("iid", "dirichlet"),
+        default=None,
+        help="数据划分方法；覆盖 partition.method。",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Dirichlet alpha；覆盖 partition.dirichlet.alpha。",
+    )
+    parser.add_argument(
+        "--dirichlet-sample-balance",
+        choices=("balanced", "unbalanced"),
+        default=None,
+        help="Dirichlet 客户端样本数均衡策略；默认 balanced。",
+    )
     parser.add_argument("--frac", type=float, default=None)
     parser.add_argument("--rounds", type=int, default=None)
     parser.add_argument("--local-epochs", type=int, default=None)
@@ -8322,7 +8628,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
 def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     overrides: Dict[str, Any] = {}
     top_level={
-        "model":"model","data_root":"data_root","num_clients":"num_clients","alpha":"alpha","frac":"frac",
+        "model":"model","data_root":"data_root","num_clients":"num_clients","frac":"frac",
         "rounds":"rounds","local_epochs":"local_epochs","batch_size":"batch_size",
         "test_batch_size":"test_batch_size","num_workers":"num_workers","num_experts":"num_experts",
         "topk":"topk","seed":"seed","device":"device","output_dir":"output_dir","run_name":"run_name",
@@ -8330,6 +8636,23 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     for arg_name,config_key in top_level.items():
         value=getattr(args,arg_name,None)
         if value is not None: overrides[config_key]=value
+
+    partition_method = getattr(args, "partition_method", None)
+    if partition_method is not None:
+        overrides.setdefault("partition", {})["method"] = partition_method
+
+    alpha = getattr(args, "alpha", None)
+    if alpha is not None:
+        overrides.setdefault("partition", {}).setdefault("dirichlet", {})[
+            "alpha"
+        ] = alpha
+
+    sample_balance = getattr(args, "dirichlet_sample_balance", None)
+    if sample_balance is not None:
+        overrides.setdefault("partition", {}).setdefault("dirichlet", {})[
+            "sample_balance"
+        ] = sample_balance
+
     dataset=getattr(args,"dataset",None)
     if dataset is not None:
         dataset = normalize_dataset_name(dataset)
