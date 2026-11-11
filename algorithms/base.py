@@ -959,7 +959,9 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_positive_int(cfg, "num_classes")
     _require_positive_int(cfg, "num_clients")
     _require_positive_int(cfg, "rounds")
-    _require_positive_int(cfg, "local_epochs")
+    # 0 is valid only for expert strategies that provide a fixed local step limit.
+    # main() enforces that condition; the selected training path validates it again.
+    _require_non_negative_int(cfg, "local_epochs")
     _require_positive_int(cfg, "batch_size")
     _require_positive_int(cfg, "test_batch_size")
     _require_non_negative_int(cfg, "num_workers")
@@ -6207,9 +6209,9 @@ class ClientUpdate:
     # 当前客户端本地训练样本数
     num_samples: int
 
-    # 本地模型相对全局模型的参数变化量
-    # 公式：
-    # model_delta = local_model - global_model
+    # 本地模型相对全局模型的参数变化量。
+    # 普通训练路径包含完整 state_dict；启用专家训练策略时只包含 non_expert
+    # state_dict（包括对应 buffer），专家算法数据通过 algorithm_payload 上传。
     model_delta: TensorDict
 
     # 客户端本地训练指标
@@ -6491,10 +6493,47 @@ class ExpertClientTrainContext:
     global_state: Mapping[str, torch.Tensor]
     train_loader: DataLoader
     criterion: nn.Module
-    optimizer: optim.Optimizer
+    non_expert_optimizer: optim.Optimizer
     optimization_groups: FederatedOptimizationGroups
     local_epochs: int
-    grad_clip: Optional[float]
+    non_expert_grad_clip: Optional[float]
+
+    def retract_manifold_parameters_(
+        self,
+        names: Optional[Iterable[str]] = None,
+    ) -> None:
+        """
+        对当前客户端模型的专家流形变量执行回缩。
+
+        专家训练策略在更新 Stiefel 等流形变量后，应显式调用此方法。
+        框架不会在 strategy.step() 后自动回缩，以免覆盖算法自身的
+        向量传输、组合更新或回缩时序。
+        """
+        available_names = set(self.optimization_groups.expert_manifold)
+        if names is None:
+            requested_names = available_names
+        elif isinstance(names, str):
+            requested_names = {names}
+        else:
+            requested_names = set(names)
+
+        unknown_names = requested_names - available_names
+        if unknown_names:
+            raise KeyError(
+                "请求回缩的流形变量未在 expert_manifold 中声明："
+                f"{sorted(str(name) for name in unknown_names)}"
+            )
+
+        if not requested_names:
+            return
+
+        if not isinstance(self.model, ManifoldParameterProvider):
+            raise TypeError(
+                "当前模型声明了专家流形变量，但没有实现 "
+                "ManifoldParameterProvider。"
+            )
+
+        self.model.retract_manifold_parameters_(requested_names)
 
     @property
     def expert_parameters(self) -> Dict[str, nn.Parameter]:
@@ -6532,6 +6571,10 @@ class ExpertClientTrainingStrategy(ABC):
     框架先执行 forward/backward；step() 在反向传播后、non_expert
     optimizer.step() 前调用。策略只负责 expert 参数，并可在结束时上传
     algorithm_payload。non_expert 参数仍由框架的普通优化器更新。
+
+    grad_clip 仅由框架应用于 non_expert 梯度；expert 梯度的裁剪由策略
+    自行负责。策略若更新了 Stiefel 等流形变量，也必须按算法要求显式调用
+    context.train_context.retract_manifold_parameters_() 执行回缩。
     """
 
     @property
@@ -6894,10 +6937,14 @@ def train_local_model(
 
             optimizer.step()
 
-            # 仅正交 MoE 模型实现该方法；旧模型不执行任何额外操作。
-            retract = getattr(model, "retract_expert_subspaces_", None)
-            if callable(retract):
-                retract()
+            # 模型若声明流形变量，则使用通用几何接口执行回缩；
+            # 普通模型仍不执行任何额外操作。
+            if isinstance(model, ManifoldParameterProvider):
+                model.retract_manifold_parameters_()
+            else:
+                retract = getattr(model, "retract_expert_subspaces_", None)
+                if callable(retract):
+                    retract()
 
             batch_size = int(targets.size(0))
 
@@ -6936,6 +6983,61 @@ def _detach_algorithm_payload_to_cpu(value: Any) -> Any:
     return value
 
 
+def _validate_algorithm_payload_finite(
+    value: Any,
+    *,
+    client_id: int,
+    path: str = "algorithm_payload",
+) -> None:
+    """递归检查算法载荷中的浮点 Tensor / 数组 / 标量是否包含 NaN 或 Inf。"""
+    if torch.is_tensor(value):
+        if value.is_floating_point() or value.is_complex():
+            tensor_values = (
+                value.coalesce().values()
+                if value.layout == torch.sparse_coo
+                else value
+            )
+            if not bool(torch.isfinite(tensor_values).all().item()):
+                raise ValueError(
+                    f"客户端 {client_id} 的算法载荷 {path} 包含 NaN 或 Inf。"
+                )
+        return
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_algorithm_payload_finite(
+                item,
+                client_id=client_id,
+                path=f"{path}[{key!r}]",
+            )
+        return
+
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_algorithm_payload_finite(
+                item,
+                client_id=client_id,
+                path=f"{path}[{index}]",
+            )
+        return
+
+    if isinstance(value, (float, np.floating)):
+        if not math.isfinite(float(value)):
+            raise ValueError(
+                f"客户端 {client_id} 的算法载荷 {path} 包含 NaN 或 Inf。"
+            )
+        return
+
+    if isinstance(value, np.ndarray):
+        if (
+            np.issubdtype(value.dtype, np.floating)
+            or np.issubdtype(value.dtype, np.complexfloating)
+        ) and not bool(np.isfinite(value).all()):
+            raise ValueError(
+                f"客户端 {client_id} 的算法载荷 {path} 包含 NaN 或 Inf。"
+            )
+
+
 def train_local_model_with_expert_strategy(
     model: nn.Module,
     train_loader: DataLoader,
@@ -6957,8 +7059,15 @@ def train_local_model_with_expert_strategy(
     策略 step() 在 loss.backward() 之后调用；传入的 optimizer 只包含
     non_expert 可训练参数，因此策略不会与普通 optimizer 重复更新 expert。
     """
-    if local_epochs <= 0:
-        raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
+    if (
+        isinstance(local_epochs, bool)
+        or not isinstance(local_epochs, int)
+        or local_epochs < 0
+    ):
+        raise ValueError(
+            "local_epochs 必须是非负整数，"
+            f"当前值：{local_epochs!r}"
+        )
     if not isinstance(strategy, ExpertClientTrainingStrategy):
         raise TypeError(
             "strategy 必须是 ExpertClientTrainingStrategy，"
@@ -6990,10 +7099,10 @@ def train_local_model_with_expert_strategy(
         global_state=global_state,
         train_loader=train_loader,
         criterion=criterion,
-        optimizer=optimizer,
+        non_expert_optimizer=optimizer,
         optimization_groups=optimization_groups,
         local_epochs=int(local_epochs),
-        grad_clip=grad_clip,
+        non_expert_grad_clip=grad_clip,
     )
 
     model.train()
@@ -7009,6 +7118,11 @@ def train_local_model_with_expert_strategy(
                 "strategy.local_step_limit() 必须返回正整数或 None，"
                 f"当前值：{step_limit!r}"
             )
+    elif local_epochs <= 0:
+        raise ValueError(
+            "策略未提供固定 local_step_limit() 时，local_epochs 必须大于 0；"
+            f"当前值：{local_epochs}"
+        )
 
     total_loss = 0.0
     total_correct = 0
@@ -7034,6 +7148,7 @@ def train_local_model_with_expert_strategy(
         loss = criterion(logits, targets)
         loss.backward()
 
+        # 通用 grad_clip 只裁剪 non_expert 梯度；expert 梯度由策略自行处理。
         if grad_clip is not None and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 non_expert_parameters,
@@ -7884,6 +7999,11 @@ class Aggregator(ABC):
                     f"当前类型：{type(update.algorithm_payload).__name__}"
                 )
 
+            _validate_algorithm_payload_finite(
+                update.algorithm_payload,
+                client_id=int(update.client_id),
+            )
+
 
 def build_uniform_weights(
     client_updates: Sequence[ClientUpdate],
@@ -8111,14 +8231,46 @@ class FLServer:
             expert_aggregator_builder=expert_aggregator_builder,
             method_context=self.method_context,
         )
-        if (
-            expert_client_training_strategy_builder is not None
-            and not self.aggregators.expert.consumes_algorithm_payload
-        ):
+        expert_aggregator = self.aggregators.expert
+        strategy_enabled = expert_client_training_strategy_builder is not None
+        consumes_algorithm_payload = expert_aggregator.consumes_algorithm_payload
+        handles_manifold_retraction = expert_aggregator.handles_manifold_retraction
+
+        if not isinstance(consumes_algorithm_payload, bool):
+            raise TypeError(
+                "Aggregator.consumes_algorithm_payload 必须返回 bool。"
+            )
+        if not isinstance(handles_manifold_retraction, bool):
+            raise TypeError(
+                "Aggregator.handles_manifold_retraction 必须返回 bool。"
+            )
+
+        if strategy_enabled and not consumes_algorithm_payload:
             raise ValueError(
                 "启用 expert_client_training_strategy_builder 后，"
-                "专家聚合器必须覆盖 aggregate() 并声明 "
-                "consumes_algorithm_payload=True。"
+                "专家聚合器必须声明 consumes_algorithm_payload=True。"
+            )
+        if consumes_algorithm_payload and not strategy_enabled:
+            raise ValueError(
+                "专家聚合器声明 consumes_algorithm_payload=True，"
+                "但没有启用 expert_client_training_strategy_builder；"
+                "客户端不会生成对应算法载荷。"
+            )
+        if (
+            consumes_algorithm_payload
+            and type(expert_aggregator).aggregate is Aggregator.aggregate
+        ):
+            raise TypeError(
+                "声明 consumes_algorithm_payload=True 的专家聚合器必须"
+                "真正覆盖 aggregate()，不能使用 Aggregator 的默认 Delta 聚合实现。"
+            )
+        if handles_manifold_retraction and (
+            not isinstance(self.global_model, ManifoldParameterProvider)
+            or not self.optimization_groups.expert_manifold
+        ):
+            raise ValueError(
+                "专家聚合器声明 handles_manifold_retraction=True，"
+                "但当前模型没有可用的 expert_manifold 几何变量。"
             )
 
         self.train_state = TrainState(
@@ -8372,17 +8524,25 @@ class FLServer:
             strict=True,
         )
 
-        # FedAvg 后的参数平均通常不再正交；仅正交 MoE 在服务器端回缩。
-        retract = getattr(
-            self.global_model,
-            "retract_expert_subspaces_",
-            None,
-        )
-        if (
-            callable(retract)
-            and not self.aggregators.expert.handles_manifold_retraction
-        ):
-            retract()
+        # 默认由模型几何接口执行服务端回缩；若聚合器已自行处理，则跳过。
+        if not self.aggregators.expert.handles_manifold_retraction:
+            manifold_names = tuple(self.optimization_groups.expert_manifold)
+            if manifold_names:
+                if not isinstance(self.global_model, ManifoldParameterProvider):
+                    raise TypeError(
+                        "optimization_groups 声明了流形变量，"
+                        "但 global_model 未实现 ManifoldParameterProvider。"
+                    )
+                self.global_model.retract_manifold_parameters_(manifold_names)
+            else:
+                # 兼容尚未迁移到 ManifoldParameterProvider 的旧模型。
+                retract = getattr(
+                    self.global_model,
+                    "retract_expert_subspaces_",
+                    None,
+                )
+                if callable(retract):
+                    retract()
 
         self.global_model.to("cpu")
 
@@ -9483,6 +9643,15 @@ def main(
         if args.config is not None
         else load_embedded_config(embedded_method_config, method_defaults=method_config_defaults, method_validator=method_config_validator, config_overrides=config_overrides)
     )
+
+    if (
+        int(_cfg_get(cfg, "local_epochs", 5)) == 0
+        and expert_client_training_strategy_builder is None
+    ):
+        raise ConfigError(
+            "local_epochs=0 仅适用于提供固定 local_step_limit() 的专家训练策略；"
+            "普通训练路径必须设置 local_epochs > 0。"
+        )
 
     configured_non_expert_method = str(
         cfg.get("agg.non_expert.method", "uniform")
