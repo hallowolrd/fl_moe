@@ -142,17 +142,8 @@ class FedAvgOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
         if self._optimizer is None:
             raise RuntimeError("FedAvgOrthogonalClientStrategy 尚未初始化。")
 
-        expert_parameters = [
-            self._parameter_map[name]
-            for name in context.train_context.optimization_groups.expert_parameter_names
-        ]
-        grad_clip = context.train_context.non_expert_grad_clip
-        if grad_clip is not None and grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                expert_parameters,
-                max_norm=float(grad_clip),
-            )
-
+        # The base training loop clips all model gradients together before
+        # this strategy step, preserving the ordinary optimizer path's semantics.
         # The framework's optimizer updates non-expert parameters separately.
         self._optimizer.step()
 
