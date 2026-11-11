@@ -485,8 +485,10 @@ def load_embedded_config(
     if method_overrides is not None:
         raw_cfg = copy.deepcopy(dict(method_overrides))
 
-    raw_cfg = _apply_defaults(raw_cfg)
+    # Apply algorithm-specific defaults before shared framework defaults.
+    # Explicit embedded settings remain higher priority than both default layers.
     raw_cfg = _apply_method_defaults(raw_cfg, method_defaults)
+    raw_cfg = _apply_defaults(raw_cfg)
     raw_cfg = _apply_config_overrides(raw_cfg, config_overrides)
     raw_cfg = _finalize_run_info(raw_cfg)
     _validate_config(raw_cfg)
@@ -515,8 +517,11 @@ def load_config(
     config_path = Path(config_path).expanduser().resolve()
 
     raw_cfg = _load_yaml_with_include(config_path)
-    raw_cfg = _apply_defaults(raw_cfg)
+
+    # Apply algorithm-specific defaults before shared framework defaults.
+    # Explicit YAML settings remain higher priority than both default layers.
     raw_cfg = _apply_method_defaults(raw_cfg, method_defaults)
+    raw_cfg = _apply_defaults(raw_cfg)
     raw_cfg = _apply_config_overrides(raw_cfg, config_overrides)
     raw_cfg = _finalize_run_info(raw_cfg)
     _validate_config(raw_cfg)
