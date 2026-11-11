@@ -415,7 +415,7 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "method": "dirichlet",
         "dirichlet": {
             "alpha": 0.1,
-            "sample_balance": "balanced",
+            "sample_balance": "unbalanced",
         },
     },
     "frac": 1.0,
