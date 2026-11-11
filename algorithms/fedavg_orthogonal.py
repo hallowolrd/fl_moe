@@ -1,45 +1,44 @@
 from __future__ import annotations
 
-"""Client-uniform FedAvg with QR-based cross-expert orthogonality.
+"""Client-uniform FedAvg with algorithm-owned Stiefel orthogonality.
 
-Compatibility target:
-    algorithms/base.py at commit
-    8eab05f485f72a00412e9db4f9b845097452175d
-
-This file implements the expert-parameter aggregation policy:
-    w_i = 1 / K
-
-The QR retraction lifecycle in this specific base.py revision is owned by
-OrthogonalSparseMoEClassifier and is invoked by base.py:
-    1. once during orthogonal model construction;
-    2. after every local optimizer.step();
-    3. after server-side aggregation.
-
-Consequently, this version requires model="sparse_moe_orthogonal".
-The later architecture in which the selected expert aggregation method itself
-controls QR requires lifecycle hooks to be added to base.py first.
+The model name selects only the MoE architecture. This algorithm selects the
+expert parameter blocks to constrain, retracts them after local optimizer
+steps, and retracts them again after server aggregation.
 """
 
-# Import base before importing torch so base.py can prepare the deterministic
-# CUDA environment before PyTorch initializes CUDA/cuBLAS.
+# Import base first so deterministic CUDA environment setup happens before
+# importing PyTorch in this entrypoint.
 import base
 
-from typing import Any, Dict, Mapping, Sequence
+from collections.abc import Mapping
+from typing import Any, Dict, Sequence
+
+import torch
+
+from expert_geometry import (
+    StiefelParameterBlock,
+    build_stiefel_parameter_blocks,
+    stiefel_orthogonality_error,
+)
 
 
 ALGORITHM_NAME = "fedavg_orthogonal"
 
-Aggregator = base.Aggregator
-ClientUpdate = base.ClientUpdate
+DEFAULT_STIEFEL_BLOCKS = {
+    "expert_fc1": {
+        "parameter_patterns": ["moe_head.experts.*.fc1.weight"],
+    }
+}
 
-
-# These defaults are applied both when using the embedded configuration and
-# when a user supplies a YAML file. Explicit YAML / CLI values take priority.
 METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
-    "model": "sparse_moe_orthogonal",
+    "model": "sparse_moe_classifier",
     "model_cfg": {
         "backbone": "resnet_cifar",
         "moe_hidden_dim": 128,
+    },
+    "orthogonal": {
+        "stiefel_blocks": DEFAULT_STIEFEL_BLOCKS,
     },
     "agg": {
         "non_expert": {"method": "uniform"},
@@ -50,122 +49,216 @@ METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
 EMBEDDED_METHOD_CONFIG = METHOD_CONFIG_DEFAULTS
 
 
-def _get_nested(
-    cfg: Mapping[str, Any],
-    dotted_key: str,
-    default: Any = None,
-) -> Any:
-    """Read a dotted key from a nested mapping."""
-    current: Any = cfg
-    for part in dotted_key.split("."):
-        if not isinstance(current, Mapping) or part not in current:
-            return default
-        current = current[part]
-    return current
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    return base._cfg_get(cfg, key, default)
+
+
+def _resolve_blocks(
+    model: torch.nn.Module,
+    expert_parameter_names: Sequence[str],
+    cfg: Any,
+) -> Dict[str, StiefelParameterBlock]:
+    block_cfg = _cfg_get(
+        cfg,
+        "orthogonal.stiefel_blocks",
+        DEFAULT_STIEFEL_BLOCKS,
+    )
+    blocks = build_stiefel_parameter_blocks(
+        model=model,
+        expert_parameter_names=expert_parameter_names,
+        block_config=block_cfg,
+    )
+    if not blocks:
+        raise ValueError(
+            "fedavg_orthogonal 至少需要配置一个 orthogonal.stiefel_blocks。"
+        )
+    return blocks
 
 
 def validate_method_config(cfg: Mapping[str, Any]) -> None:
-    """Validate that the selected model actually enables this revision's QR hooks."""
-    model_name = str(cfg.get("model", "")).strip().lower()
-    if model_name != "sparse_moe_orthogonal":
-        raise ValueError(
-            "fedavg_orthogonal requires model='sparse_moe_orthogonal' "
-            "with the current base.py revision. In this revision, QR is "
-            "triggered by OrthogonalSparseMoEClassifier methods, not by the "
-            "expert Aggregator lifecycle."
-        )
-
-    model_cfg = cfg.get("model_cfg", {})
+    """Validate algorithm-level orthogonality configuration."""
+    model_cfg = _cfg_get(cfg, "model_cfg", {})
     if not isinstance(model_cfg, Mapping):
-        raise ValueError("model_cfg must be a mapping.")
+        raise ValueError("model_cfg 必须是 mapping。")
 
-    # Match build_orthogonal_sparse_moe_classifier_from_cfg() precedence:
-    # moe_hidden_dim overrides hidden_dim; otherwise hidden_dim defaults to 128.
-    hidden_dim_value = model_cfg.get(
-        "moe_hidden_dim",
-        model_cfg.get("hidden_dim", 128),
+    block_cfg = _cfg_get(
+        cfg,
+        "orthogonal.stiefel_blocks",
+        DEFAULT_STIEFEL_BLOCKS,
     )
-    num_experts_value = cfg.get("num_experts", 4)
-
-    if isinstance(hidden_dim_value, bool) or isinstance(num_experts_value, bool):
-        raise ValueError("num_experts and moe_hidden_dim must be positive integers.")
-
-    try:
-        hidden_dim = int(hidden_dim_value)
-        num_experts = int(num_experts_value)
-    except (TypeError, ValueError) as exc:
+    if not isinstance(block_cfg, Mapping) or not block_cfg:
         raise ValueError(
-            "num_experts and model_cfg.moe_hidden_dim must be integers."
-        ) from exc
-
-    if hidden_dim <= 0:
-        raise ValueError(
-            f"model_cfg.moe_hidden_dim must be positive; got {hidden_dim}."
-        )
-    if num_experts <= 0:
-        raise ValueError(f"num_experts must be positive; got {num_experts}.")
-
-    feature_dim = int(getattr(base, "MOE_FEATURE_DIM", 512))
-    total_rows = num_experts * hidden_dim
-    if total_rows > feature_dim:
-        raise ValueError(
-            "The cross-expert QR constraint requires "
-            "num_experts * moe_hidden_dim <= backbone feature dimension; "
-            f"got {num_experts} * {hidden_dim} = {total_rows}, "
-            f"but feature dimension is {feature_dim}. "
-            "Reduce num_experts or moe_hidden_dim."
+            "fedavg_orthogonal 要求 orthogonal.stiefel_blocks 是非空 mapping。"
         )
 
 
-class FedAvgOrthogonalExpertAggregator(Aggregator):
-    """Client-uniform expert Delta aggregation for the orthogonal Sparse MoE."""
+class FedAvgOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
+    """Use the configured optimizer for all expert parameters, then retract."""
+
+    @property
+    def includes_expert_parameters_in_model_delta(self) -> bool:
+        # The strategy updates expert parameters locally; the server still
+        # aggregates their ordinary model deltas with the FedAvg aggregator.
+        return True
+
+    def __init__(self, cfg: Any, client_id: int) -> None:
+        self.cfg = cfg
+        self.client_id = int(client_id)
+        self._optimizer: torch.optim.Optimizer | None = None
+        self._parameter_map: Dict[str, torch.nn.Parameter] = {}
+        self._blocks: Dict[str, StiefelParameterBlock] = {}
+
+    def on_train_start(self, context: base.ExpertClientTrainContext) -> None:
+        groups = context.optimization_groups
+        self._parameter_map = dict(context.model.named_parameters())
+        self._blocks = _resolve_blocks(
+            model=context.model,
+            expert_parameter_names=groups.expert_parameter_names,
+            cfg=self.cfg,
+        )
+        self._optimizer = base.build_optimizer(
+            model=context.model,
+            cfg=self.cfg,
+            param_names=groups.expert_parameter_names,
+        )
+
+        # The server initializes the global model before broadcasting it.
+        # Fail early if a client somehow receives a non-Stiefel starting point.
+        for name, block in self._blocks.items():
+            error = stiefel_orthogonality_error(
+                block.get_point(self._parameter_map)
+            )
+            if error > 5e-4:
+                raise ValueError(
+                    f"客户端初始 Stiefel block {name!r} 不满足正交约束："
+                    f"error={error:.6e}"
+                )
+
+    def step(self, context: base.ExpertClientBatchContext) -> None:
+        if self._optimizer is None:
+            raise RuntimeError("FedAvgOrthogonalClientStrategy 尚未初始化。")
+
+        expert_parameters = [
+            self._parameter_map[name]
+            for name in context.train_context.optimization_groups.expert_parameter_names
+        ]
+        grad_clip = context.train_context.non_expert_grad_clip
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                expert_parameters,
+                max_norm=float(grad_clip),
+            )
+
+        # The framework's optimizer updates non-expert parameters separately.
+        self._optimizer.step()
+
+        # Orthogonality is an algorithm policy, not a model side effect.
+        with torch.no_grad():
+            for block in self._blocks.values():
+                block.retract_(self._parameter_map)
+
+    def on_train_end(
+        self,
+        context: base.ExpertClientTrainContext,
+    ) -> Mapping[str, Any]:
+        return {}
+
+
+class FedAvgOrthogonalExpertAggregator(base.Aggregator):
+    """Client-uniform FedAvg for experts with algorithm-owned QR retraction."""
 
     @property
     def method_name(self) -> str:
         return ALGORITHM_NAME
 
+    @property
+    def handles_manifold_retraction(self) -> bool:
+        return True
+
     def compute_weights(
         self,
-        client_updates: Sequence[ClientUpdate],
+        client_updates: Sequence[base.ClientUpdate],
     ) -> Dict[int, float]:
-        """Assign every participating client the same aggregation weight."""
         return base.build_uniform_weights(client_updates)
+
+    def _blocks_for_model(
+        self,
+        model: torch.nn.Module,
+    ) -> Dict[str, StiefelParameterBlock]:
+        if self.method_context is not None and self.method_context.optimization_groups is not None:
+            expert_names = self.method_context.optimization_groups.expert_parameter_names
+        else:
+            groups = base.build_federated_optimization_groups(model)
+            expert_names = groups.expert_parameter_names
+        return _resolve_blocks(model, expert_names, self.cfg)
+
+    @torch.no_grad()
+    def initialize_model(self, model: torch.nn.Module) -> None:
+        parameter_map = dict(model.named_parameters())
+        for block in self._blocks_for_model(model).values():
+            block.retract_(parameter_map)
+
+    @torch.no_grad()
+    def after_aggregate(self, model: torch.nn.Module) -> None:
+        parameter_map = dict(model.named_parameters())
+        for block in self._blocks_for_model(model).values():
+            block.retract_(parameter_map)
 
     def build_diagnostics(
         self,
-        client_updates: Sequence[ClientUpdate],
+        client_updates: Sequence[base.ClientUpdate],
         weights: Mapping[int, float],
         param_names: Sequence[str] | None = None,
     ) -> Dict[str, Any]:
-        """Add method metadata to the common Aggregator diagnostics."""
         diagnostics = super().build_diagnostics(
             client_updates=client_updates,
             weights=weights,
             param_names=param_names,
         )
+        block_info: Dict[str, Any] = {}
+        if self.method_context is not None and self.method_context.global_model is not None:
+            model = self.method_context.global_model
+            parameter_map = dict(model.named_parameters())
+            for name, block in self._blocks_for_model(model).items():
+                block_info[name] = {
+                    "parameter_names": list(block.parameter_names),
+                    "shape": list(block.shape),
+                    "orthogonality_error": stiefel_orthogonality_error(
+                        block.get_point(parameter_map)
+                    ),
+                }
+
         diagnostics.update(
             {
                 "aggregation_rule": "client_uniform",
-                "orthogonal_constraint": "cross_expert_fc1_row_orthogonality",
+                "orthogonal_constraint": "algorithm_selected_stiefel_parameter_blocks",
                 "orthogonal_projection": "QR",
-                "orthogonal_projection_owner": (
-                    "base.OrthogonalSparseMoEClassifier"
-                ),
+                "orthogonal_projection_owner": ALGORITHM_NAME,
                 "orthogonal_projection_stages": [
-                    "model_initialization",
-                    "after_each_local_optimizer_step",
-                    "after_server_aggregation",
+                    "global_model_initialization",
+                    "after_each_client_expert_optimizer_step",
+                    "after_server_expert_aggregation",
                 ],
+                "stiefel_blocks": block_info,
             }
         )
         return diagnostics
 
 
 def build_expert_aggregator(cfg: Any) -> base.Aggregator:
-    """Build the expert-only FedAvg-orthogonal aggregator injected into base.py."""
     return FedAvgOrthogonalExpertAggregator(
         cfg=cfg,
         param_group_name="expert",
+    )
+
+
+def build_expert_client_training_strategy(
+    cfg: Any,
+    client_id: int,
+) -> base.ExpertClientTrainingStrategy:
+    return FedAvgOrthogonalClientStrategy(
+        cfg=cfg,
+        client_id=client_id,
     )
 
 
@@ -176,6 +269,9 @@ def main() -> int:
         expert_method_name=ALGORITHM_NAME,
         method_config_defaults=METHOD_CONFIG_DEFAULTS,
         method_config_validator=validate_method_config,
+        expert_client_training_strategy_builder=(
+            build_expert_client_training_strategy
+        ),
     )
 
 
