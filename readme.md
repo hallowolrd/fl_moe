@@ -42,3 +42,19 @@ vit_tiny
 swin_tiny
 
 kill $(cat outputs/fashionmnist_vit_tiny/launcher_logs/*.pid)
+
+模型与专家聚合算法的职责约定：
+- \`model\` 只选择网络结构；当前统一使用 \`sparse_moe_classifier\`。
+- 是否对专家参数施加正交约束，由专家聚合算法决定，不再提供 \`sparse_moe_orthogonal\` 模型。
+- \`fedavg_orthogonal.py\` 与 \`rfedags_orthogonal.py\` 默认约束所有专家的 \`fc1.weight\` 行空间。
+- 正交约束对象可在算法配置的 \`orthogonal.stiefel_blocks\` 中通过参数名模式调整。
+
+正交 FedAvg：
+\`\`\`bash
+python algorithms/fedavg_orthogonal.py --dataset cifar10 --backbone resnet_cifar
+\`\`\`
+
+RFedAGS 正交专家聚合：
+\`\`\`bash
+python algorithms/rfedags_orthogonal.py --dataset cifar10 --backbone resnet_cifar --rfedags-local-steps 5
+\`\`\`
