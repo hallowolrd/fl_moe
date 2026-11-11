@@ -5142,6 +5142,17 @@ class ManifoldParameterProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_manifold_parameter_gradient(self, name: str) -> torch.Tensor:
+        """
+        将底层 PyTorch Parameter 的欧氏梯度映射到流形变量坐标。
+
+        返回 Tensor 的形状必须与 get_manifold_parameter(name) 一致。
+        对由多个 Parameter 共同表示的流形变量，模型负责完成梯度拼接、
+        转置或其他必要的链式映射；优化算法不应猜测模型内部参数布局。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def set_manifold_parameter_(
         self,
         name: str,
@@ -5249,6 +5260,33 @@ class OrthogonalSparseMoEClassifier(SparseMoEClassifier, ManifoldParameterProvid
             raise ValueError("模型中没有 expert fc1.weight。")
 
         return torch.cat(weights, dim=0).transpose(0, 1).detach().clone()
+
+    @torch.no_grad()
+    def get_manifold_parameter_gradient(self, name: str) -> torch.Tensor:
+        """
+        将各 expert.fc1.weight.grad 映射到 X=W_all.T 的欧氏梯度。
+
+        未被当前 batch 激活的专家梯度按零处理；随后 RFedAGS 会在整体
+        Stiefel 流形上执行切空间投影，因此跨专家正交约束仍然完整生效。
+        """
+        if name != "expert_projection":
+            raise KeyError(f"未知流形变量：{name}")
+
+        weights = [
+            expert.fc1.weight
+            for expert in self.moe_head.experts
+        ]
+        if not weights:
+            raise ValueError("模型中没有 expert fc1.weight。")
+
+        gradients = []
+        for weight in weights:
+            gradient = weight.grad
+            if gradient is None:
+                gradient = torch.zeros_like(weight)
+            gradients.append(gradient.detach())
+
+        return torch.cat(gradients, dim=0).transpose(0, 1).clone()
 
     @torch.no_grad()
     def set_manifold_parameter_(
