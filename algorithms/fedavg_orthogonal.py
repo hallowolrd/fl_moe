@@ -222,7 +222,6 @@ class FedAvgOrthogonalExpertAggregator(base.Aggregator):
         block_info: Dict[str, Any] = {}
         if self.method_context is not None and self.method_context.global_model is not None:
             model = self.method_context.global_model
-            parameter_map = dict(model.named_parameters())
             for name, block in self._blocks_for_model(model).items():
                 block_info[name] = {
                     "parameter_names": list(block.parameter_names),
