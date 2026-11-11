@@ -6386,8 +6386,9 @@ def average_client_metric(
         default: 如果没有任何客户端包含该指标，则返回 default。
 
     注意：
-        weighted=True 时，返回的是按 num_samples 加权平均，
-        不是客户端等权平均。
+        weighted=True 时优先按 metrics["num_processed_samples"]（本地实际处理的
+        样本次数）加权；旧版 ClientUpdate 没有该字段时回退到 num_samples。
+        这与聚合器使用的 num_samples（客户端数据集规模）是两个不同概念。
     """
     values = []
 
@@ -6396,7 +6397,30 @@ def average_client_metric(
             continue
 
         value = float(update.metrics[metric_name])
-        weight = int(update.num_samples) if weighted else 1
+        if weighted:
+            weight_value = update.metrics.get(
+                "num_processed_samples",
+                update.num_samples,
+            )
+            try:
+                weight_float = float(weight_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"客户端 {update.client_id} 的 num_processed_samples "
+                    f"不是有效数值：{weight_value!r}"
+                ) from exc
+            if (
+                not math.isfinite(weight_float)
+                or weight_float <= 0
+                or not weight_float.is_integer()
+            ):
+                raise ValueError(
+                    f"客户端 {update.client_id} 的 num_processed_samples "
+                    f"必须是正整数，当前值：{weight_value!r}"
+                )
+            weight = int(weight_float)
+        else:
+            weight = 1
 
         values.append((value, weight))
 
@@ -6474,6 +6498,7 @@ class ClientTrainStats:
             "train_loss": float(self.avg_loss),
             "train_acc": float(self.train_acc),
             "num_batches": float(self.num_batches),
+            "num_processed_samples": float(self.num_samples),
         }
 
 
@@ -7023,6 +7048,17 @@ def _validate_algorithm_payload_finite(
 
     if isinstance(value, (float, np.floating)):
         if not math.isfinite(float(value)):
+            raise ValueError(
+                f"客户端 {client_id} 的算法载荷 {path} 包含 NaN 或 Inf。"
+            )
+        return
+
+    if isinstance(value, (complex, np.complexfloating)):
+        numeric_value = complex(value)
+        if not (
+            math.isfinite(numeric_value.real)
+            and math.isfinite(numeric_value.imag)
+        ):
             raise ValueError(
                 f"客户端 {client_id} 的算法载荷 {path} 包含 NaN 或 Inf。"
             )
