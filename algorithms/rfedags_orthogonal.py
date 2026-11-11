@@ -283,13 +283,12 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
     def on_train_start(self, context: base.ExpertClientTrainContext) -> None:
         model = context.model
         groups = context.optimization_groups
-        if not isinstance(model, base.ManifoldParameterProvider):
+        if groups.expert_manifold and not isinstance(
+            model,
+            base.ManifoldParameterProvider,
+        ):
             raise TypeError(
-                "RFedAGS-Orthogonal 要求模型实现 ManifoldParameterProvider。"
-            )
-        if not groups.expert_manifold:
-            raise ValueError(
-                "RFedAGS-Orthogonal 要求模型至少声明一个 expert 流形变量。"
+                "模型声明了 expert 流形变量，但没有实现 ManifoldParameterProvider。"
             )
 
         self._parameter_map = dict(model.named_parameters())
@@ -391,8 +390,11 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
     def step(self, context: base.ExpertClientBatchContext) -> None:
         train_context = context.train_context
         model = train_context.model
-        if not isinstance(model, base.ManifoldParameterProvider):
-            raise TypeError("本地模型未实现 ManifoldParameterProvider。")
+        if self._manifold_specs and not isinstance(
+            model,
+            base.ManifoldParameterProvider,
+        ):
+            raise TypeError("本地模型声明了流形变量，但未实现 ManifoldParameterProvider。")
 
         # Euclidean expert factors: ordinary SGD steps are already tangent
         # vectors, and vector transport in Euclidean space is the identity.
@@ -446,7 +448,8 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
                     point + local_step,
                 )
 
-        train_context.retract_manifold_parameters_(self._manifold_names)
+        if self._manifold_names:
+            train_context.retract_manifold_parameters_(self._manifold_names)
         self._local_steps += 1
 
     def on_train_end(
@@ -493,7 +496,10 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
 
     @property
     def handles_manifold_retraction(self) -> bool:
-        return True
+        if self.method_context is None:
+            return False
+        groups = self.method_context.optimization_groups
+        return bool(groups is not None and groups.expert_manifold)
 
     def compute_weights(
         self,
@@ -520,9 +526,12 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                 "RFedAGS 聚合器需要 MethodContext.global_model 和 "
                 "MethodContext.optimization_groups。"
             )
-        if not isinstance(model, base.ManifoldParameterProvider):
+        if groups.expert_manifold and not isinstance(
+            model,
+            base.ManifoldParameterProvider,
+        ):
             raise TypeError(
-                "RFedAGS-Orthogonal 要求全局模型实现 ManifoldParameterProvider。"
+                "全局模型声明了 expert 流形变量，但没有实现 ManifoldParameterProvider。"
             )
 
         configured_num_clients = int(_cfg_get(self.cfg, "num_clients", 0))
@@ -677,8 +686,11 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
 
         # Stiefel factors: all client streams have already been transported
         # into the tangent space at the same round-start global point.
-        model_copy = copy.deepcopy(model).to("cpu")
-        model_copy.load_state_dict(global_state, strict=True)
+        model_copy = None
+        if manifold_specs:
+            model_copy = copy.deepcopy(model).to("cpu")
+            model_copy.load_state_dict(global_state, strict=True)
+
         tangent_residuals: Dict[str, float] = {}
         for name, spec in manifold_specs.items():
             point = model_copy.get_manifold_parameter(name)
@@ -718,12 +730,13 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             updated_point = stiefel_qr_retraction(point, aggregated_stream)
             model_copy.set_manifold_parameter_(name, updated_point)
 
-        model_state_after_retraction = model_copy.state_dict()
-        for spec in manifold_specs.values():
-            for parameter_name in spec.parameter_names:
-                new_state_dict[parameter_name] = (
-                    model_state_after_retraction[parameter_name].detach().clone()
-                )
+        if model_copy is not None:
+            model_state_after_retraction = model_copy.state_dict()
+            for spec in manifold_specs.values():
+                for parameter_name in spec.parameter_names:
+                    new_state_dict[parameter_name] = (
+                        model_state_after_retraction[parameter_name].detach().clone()
+                    )
 
         # Expert buffers are not differentiable manifold coordinates. Preserve
         # their normal client-uniform state aggregation separately.
