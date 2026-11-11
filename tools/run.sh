@@ -13,7 +13,7 @@ SCRIPT_DIR="$PROJECT_ROOT/a"
 # 实验公共配置
 # ------------------------------------------------------------
 DATASET="cifar100"
-BACKBONE="vgg11_075"
+BACKBONE="resnet_cifar"
 ROUNDS=100
 ALPHA=0.1
 SEED=0
