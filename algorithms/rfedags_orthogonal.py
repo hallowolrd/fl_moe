@@ -325,13 +325,18 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
                     f"Stiefel 变量 {name!r} 必须满足二维矩阵 n >= p，"
                     f"当前 shape={tuple(point.shape)}。"
                 )
+            point_work = (
+                point.float()
+                if point.dtype in (torch.float16, torch.bfloat16)
+                else point
+            )
             identity = torch.eye(
-                point.shape[1],
-                device=point.device,
-                dtype=point.dtype,
+                point_work.shape[1],
+                device=point_work.device,
+                dtype=point_work.dtype,
             )
             orthogonality_error = torch.linalg.norm(
-                point.transpose(0, 1) @ point - identity,
+                point_work.transpose(0, 1) @ point_work - identity,
                 ord="fro",
             )
             tolerance = 5e-3 if point.dtype in (torch.float16, torch.bfloat16) else 1e-4
@@ -342,7 +347,11 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
                 )
 
             self._initial_manifold_points[name] = point
-            self._manifold_stream[name] = torch.zeros_like(point)
+            self._manifold_stream[name] = torch.zeros(
+                point.shape,
+                device=point.device,
+                dtype=_accumulation_dtype(point),
+            )
 
         expected_trainable_expert_names = set(groups.expert_parameter_names)
         if covered_parameter_names != expected_trainable_expert_names:
@@ -357,7 +366,11 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
             if name not in self._parameter_map:
                 raise KeyError(f"找不到专家欧氏参数：{name}")
             parameter = self._parameter_map[name]
-            self._euclidean_stream[name] = torch.zeros_like(parameter)
+            self._euclidean_stream[name] = torch.zeros(
+                parameter.shape,
+                device=parameter.device,
+                dtype=_accumulation_dtype(parameter),
+            )
 
         all_parameter_names = set(self._parameter_map)
         self._expert_buffer_names = sorted(
@@ -537,7 +550,6 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
         )
 
         weights = base.normalize_weights(self.compute_weights(client_updates))
-        payloads: Dict[int, Mapping[str, Any]] = {}
         euclidean_streams: Dict[int, Mapping[str, torch.Tensor]] = {}
         manifold_streams: Dict[int, Mapping[str, torch.Tensor]] = {}
         buffers_by_client: Dict[int, Mapping[str, torch.Tensor]] = {}
@@ -629,7 +641,6 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                         f"客户端 {update.client_id} 的 buffer {name} 包含 NaN 或 Inf。"
                     )
 
-            payloads[update.client_id] = root
             euclidean_streams[update.client_id] = euclidean_stream
             manifold_streams[update.client_id] = manifold_stream
             buffers_by_client[update.client_id] = expert_buffers
