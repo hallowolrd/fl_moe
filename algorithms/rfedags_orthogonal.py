@@ -682,12 +682,17 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
         tangent_residuals: Dict[str, float] = {}
         for name, spec in manifold_specs.items():
             point = model_copy.get_manifold_parameter(name)
+            aggregation_reference = (
+                point.float()
+                if point.dtype in (torch.float16, torch.bfloat16)
+                else point
+            )
             aggregated_stream = _weighted_tensor_sum(
                 client_updates,
                 weights,
                 manifold_streams,
                 name,
-                point,
+                aggregation_reference,
             )
 
             point_work = point.float() if point.dtype in (torch.float16, torch.bfloat16) else point
