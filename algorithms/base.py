@@ -6206,7 +6206,7 @@ class ClientUpdate:
     # 当前联邦训练轮数
     round_id: int
 
-    # 当前客户端本地训练样本数
+    # 客户端训练集的数据规模，用于联邦聚合权重；不是本轮实际访问次数。
     num_samples: int
 
     # 本地模型相对全局模型的参数变化量。
@@ -6479,7 +6479,8 @@ class ClientTrainStats:
         本地训练准确率，百分比形式。
 
     num_samples:
-        本地训练样本数。
+        本地训练实际处理的样本次数，按 batch 访问累计；固定步数模式下可能
+        因重复遍历 DataLoader 而大于客户端数据集规模。
 
     num_batches:
         本地训练 batch 数。
@@ -6616,8 +6617,8 @@ class ExpertClientTrainingStrategy(ABC):
         """
         返回固定本地 batch 更新步数；返回 None 时沿用 local_epochs。
 
-        固定 K 步算法可以覆盖此方法。达到 K 步后 DataLoader 会从头循环，
-        保证每个客户端恰好执行 K 次本地更新。
+        固定 K 步算法可以覆盖此方法。此模式下 local_epochs 可以设为 0。
+        达到 K 步后 DataLoader 会从头循环，保证每个客户端恰好执行 K 次本地更新。
         """
         return None
 
