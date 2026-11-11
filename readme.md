@@ -37,9 +37,7 @@ femnist
 
 支持的backbone：
 resnet_cifar
-vgg11
 vit_tiny
-swin_tiny
 
 kill $(cat outputs/fashionmnist_vit_tiny/launcher_logs/*.pid)
 
