@@ -8,7 +8,7 @@ conda activate fl_moe
 CUDA_VISIBLE_DEVICES=0 python algorithms/uniform.py \
   --dataset cifar10 \
   --backbone resnet_cifar \
-  --model sparse_moe_orthogonal \
+  --model sparse_moe_classifier \
   --moe-hidden-dim 128 \
   --output-dir two_exp/new_moe_yes_fedavg
 
