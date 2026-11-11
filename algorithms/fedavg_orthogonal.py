@@ -125,10 +125,14 @@ class FedAvgOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
         # The server initializes the global model before broadcasting it.
         # Fail early if a client somehow receives a non-Stiefel starting point.
         for name, block in self._blocks.items():
-            error = stiefel_orthogonality_error(
-                block.get_point(self._parameter_map)
+            initial_point = block.get_point(self._parameter_map)
+            error = stiefel_orthogonality_error(initial_point)
+            tolerance = (
+                5e-3
+                if initial_point.dtype in (torch.float16, torch.bfloat16)
+                else 5e-4
             )
-            if error > 5e-4:
+            if error > tolerance:
                 raise ValueError(
                     f"客户端初始 Stiefel block {name!r} 不满足正交约束："
                     f"error={error:.6e}"
@@ -223,9 +227,6 @@ class FedAvgOrthogonalExpertAggregator(base.Aggregator):
                 block_info[name] = {
                     "parameter_names": list(block.parameter_names),
                     "shape": list(block.shape),
-                    "orthogonality_error": stiefel_orthogonality_error(
-                        block.get_point(parameter_map)
-                    ),
                 }
 
         diagnostics.update(
@@ -239,6 +240,7 @@ class FedAvgOrthogonalExpertAggregator(base.Aggregator):
                     "after_each_client_expert_optimizer_step",
                     "after_server_expert_aggregation",
                 ],
+                "server_retraction_hook": "algorithm_owned_after_aggregate",
                 "stiefel_blocks": block_info,
             }
         )
