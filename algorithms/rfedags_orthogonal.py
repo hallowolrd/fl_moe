@@ -766,10 +766,7 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                 for name, spec in manifold_specs.items()
             },
             "vector_transport": "Stiefel tangent projection to round-start point",
-            "server_retraction": (
-                "model-declared Stiefel retraction "
-                "(QR in OrthogonalSparseMoEClassifier)"
-            ),
+            "server_retraction": "model_declared_stiefel_retraction",
             "weights": {
                 int(client_id): float(weight)
                 for client_id, weight in weights.items()
