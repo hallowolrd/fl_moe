@@ -9559,6 +9559,20 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
     parser.add_argument("--model", type=str, choices=sorted(SUPPORTED_MODELS), default=None, help="模型名称；显式 CLI 参数优先于配置文件。")
     parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
+    augmentation_group = parser.add_mutually_exclusive_group()
+    augmentation_group.add_argument(
+        "--data-augmentation",
+        dest="data_augmentation",
+        action="store_true",
+        default=None,
+        help="开启训练集随机数据增强；覆盖配置文件中的 data_augmentation。",
+    )
+    augmentation_group.add_argument(
+        "--no-data-augmentation",
+        dest="data_augmentation",
+        action="store_false",
+        help="关闭训练集随机数据增强；覆盖配置文件中的 data_augmentation。",
+    )
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--num-clients", type=int, default=None)
     parser.add_argument(
@@ -9615,6 +9629,10 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     for arg_name,config_key in top_level.items():
         value=getattr(args,arg_name,None)
         if value is not None: overrides[config_key]=value
+
+    data_augmentation = getattr(args, "data_augmentation", None)
+    if data_augmentation is not None:
+        overrides["data_augmentation"] = data_augmentation
 
     partition_method = getattr(args, "partition_method", None)
     if partition_method is not None:
