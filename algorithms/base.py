@@ -7454,10 +7454,10 @@ class Aggregator(ABC):
     @property
     def handles_manifold_retraction(self) -> bool:
         """
-        是否由该专家聚合器负责服务器端流形回缩。
+        算法是否在自己的服务器聚合生命周期中负责流形更新与回缩。
 
-        默认 False：沿用 FLServer 的模型级自动回缩。
-        RFedAGS 等自行完成 Stiefel 更新与 Retraction 的专家聚合器应覆盖为 True。
+        base.py 不再根据模型类型推断或自动执行 QR / Retract；
+        算法可在 aggregate() 或 after_aggregate() 中实现自己的几何操作。
         """
         return False
 
