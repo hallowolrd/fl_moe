@@ -6163,8 +6163,9 @@ class ExpertClientTrainingStrategy(ABC):
     optimizer.step() 前调用。策略负责专家参数的本地更新，并可在结束时
     上传 algorithm_payload。non_expert 参数仍由框架的普通优化器更新。
 
-    grad_clip 仅由框架应用于 non_expert 梯度；expert 梯度的裁剪由策略
-    自行负责。是否执行正交约束或流形回缩由具体策略决定，模型本身不触发。
+    默认由框架对全部模型梯度统一执行 grad_clip；若策略声明自己负责
+    expert 梯度裁剪，则框架只裁剪 non_expert 梯度。是否执行正交约束或
+    流形回缩由具体策略决定，模型本身不触发。
     """
 
     @property
@@ -6179,6 +6180,11 @@ class ExpertClientTrainingStrategy(ABC):
         普通 Delta 聚合算法（例如 FedAvg Orthogonal）返回 True；
         由 algorithm_payload 承载专家更新的算法（例如 RFedAGS）保持 False。
         """
+        return False
+
+    @property
+    def handles_expert_grad_clip(self) -> bool:
+        """策略是否自行裁剪 expert 梯度；默认由框架统一裁剪全部模型梯度。"""
         return False
 
     def on_train_start(self, context: ExpertClientTrainContext) -> None:
@@ -6763,10 +6769,20 @@ def train_local_model_with_expert_strategy(
         loss = criterion(logits, targets)
         loss.backward()
 
-        # 通用 grad_clip 只裁剪 non_expert 梯度；expert 梯度由策略自行处理。
         if grad_clip is not None and grad_clip > 0:
+            handles_expert_grad_clip = strategy.handles_expert_grad_clip
+            if not isinstance(handles_expert_grad_clip, bool):
+                raise TypeError(
+                    "ExpertClientTrainingStrategy.handles_expert_grad_clip "
+                    "必须返回 bool。"
+                )
+            clip_parameters = (
+                non_expert_parameters
+                if handles_expert_grad_clip
+                else model.parameters()
+            )
             torch.nn.utils.clip_grad_norm_(
-                non_expert_parameters,
+                clip_parameters,
                 max_norm=float(grad_clip),
             )
 
