@@ -688,7 +688,12 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             stream_norm = float(torch.linalg.norm(stream_work).item())
             relative_residual = residual_norm / max(1.0, stream_norm)
             tangent_residuals[name] = relative_residual
-            if relative_residual > 5e-4:
+            tangent_tolerance = (
+                5e-3
+                if point.dtype in (torch.float16, torch.bfloat16)
+                else 5e-4
+            )
+            if relative_residual > tangent_tolerance:
                 raise ValueError(
                     f"聚合后的 {name} Gradient Stream 不属于全局初始点的切空间："
                     f"relative_residual={relative_residual:.6e}"
