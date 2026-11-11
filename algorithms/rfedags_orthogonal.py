@@ -145,39 +145,6 @@ def stiefel_project_tangent(
     return (g - x @ sym_xtg).to(dtype=point.dtype)
 
 
-def stiefel_qr_retraction(
-    point: torch.Tensor,
-    tangent_vector: torch.Tensor,
-) -> torch.Tensor:
-    """First-order QR retraction with a deterministic diagonal-sign convention."""
-    if point.ndim != 2 or tangent_vector.shape != point.shape:
-        raise ValueError(
-            "Stiefel QR retraction requires equally shaped 2-D tensors; "
-            f"got point={tuple(point.shape)}, vector={tuple(tangent_vector.shape)}."
-        )
-    if point.shape[0] < point.shape[1]:
-        raise ValueError(
-            f"Stiefel matrix must have n >= p, got {tuple(point.shape)}."
-        )
-
-    compute_dtype = (
-        torch.float64
-        if point.dtype == torch.float64 or tangent_vector.dtype == torch.float64
-        else torch.float32
-        if point.dtype in (torch.float16, torch.bfloat16)
-        or tangent_vector.dtype in (torch.float16, torch.bfloat16)
-        else point.dtype
-    )
-    matrix = point.to(dtype=compute_dtype) + tangent_vector.to(
-        device=point.device,
-        dtype=compute_dtype,
-    )
-    q, r = torch.linalg.qr(matrix, mode="reduced")
-    diagonal = torch.diagonal(r)
-    signs = torch.where(diagonal < 0, -torch.ones_like(diagonal), torch.ones_like(diagonal))
-    return (q * signs.unsqueeze(0)).to(dtype=point.dtype)
-
-
 def _tensor_is_finite(value: torch.Tensor) -> bool:
     if value.is_floating_point() or value.is_complex():
         return bool(torch.isfinite(value).all().item())
@@ -727,8 +694,11 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                     f"relative_residual={relative_residual:.6e}"
                 )
 
-            updated_point = stiefel_qr_retraction(point, aggregated_stream)
-            model_copy.set_manifold_parameter_(name, updated_point)
+            model_copy.set_manifold_parameter_(
+                name,
+                point + aggregated_stream,
+            )
+            model_copy.retract_manifold_parameters_([name])
 
         if model_copy is not None:
             model_state_after_retraction = model_copy.state_dict()
@@ -791,7 +761,10 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                 for name, spec in manifold_specs.items()
             },
             "vector_transport": "Stiefel tangent projection to round-start point",
-            "server_retraction": "QR",
+            "server_retraction": (
+                "model-declared Stiefel retraction "
+                "(QR in OrthogonalSparseMoEClassifier)"
+            ),
             "weights": {
                 int(client_id): float(weight)
                 for client_id, weight in weights.items()
