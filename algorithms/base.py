@@ -5130,7 +5130,7 @@ class ManifoldParameterProvider(ABC):
     模型几何接口。
 
     流形变量可能由多个 Parameter 共同组成，因此不强制将其注册成单个
-    nn.Parameter。算法通过 get/set/retract 三个接口访问模型几何变量。
+    nn.Parameter。算法通过 get / get_gradient / set / retract 接口访问模型几何变量。
     """
 
     @abstractmethod
