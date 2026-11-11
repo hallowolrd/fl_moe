@@ -7889,6 +7889,28 @@ class FLServer:
                 "但没有启用 expert_client_training_strategy_builder；"
                 "客户端不会生成对应算法载荷。"
             )
+        if strategy_enabled and not consumes_algorithm_payload:
+            invalid_clients = []
+            for client in self.clients:
+                strategy = client.expert_client_training_strategy
+                includes_delta = (
+                    strategy.includes_expert_parameters_in_model_delta
+                    if strategy is not None
+                    else False
+                )
+                if not isinstance(includes_delta, bool):
+                    raise TypeError(
+                        "ExpertClientTrainingStrategy.includes_expert_parameters_in_model_delta "
+                        "必须返回 bool。"
+                    )
+                if not includes_delta:
+                    invalid_clients.append(client.client_id)
+            if invalid_clients:
+                raise ValueError(
+                    "当前专家聚合器不消费 algorithm_payload，因此启用的专家训练策略"
+                    "必须声明 includes_expert_parameters_in_model_delta=True；"
+                    f"不满足的客户端：{invalid_clients}"
+                )
         if (
             consumes_algorithm_payload
             and type(expert_aggregator).aggregate is Aggregator.aggregate
