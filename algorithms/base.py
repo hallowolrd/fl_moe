@@ -8551,6 +8551,26 @@ class FLServer:
             base_state=non_expert_result.new_state_dict,
             strict=True,
         )
+        if not isinstance(expert_result, AggregationResult):
+            raise TypeError(
+                "专家聚合器 aggregate() 必须返回 AggregationResult，"
+                f"当前类型：{type(expert_result).__name__}"
+            )
+        if not isinstance(expert_result.new_state_dict, Mapping):
+            raise TypeError(
+                "AggregationResult.new_state_dict 必须是 Mapping，"
+                f"当前类型：{type(expert_result.new_state_dict).__name__}"
+            )
+
+        expected_state_names = set(global_state_cpu)
+        returned_state_names = set(expert_result.new_state_dict)
+        if returned_state_names != expected_state_names:
+            missing_names = sorted(expected_state_names - returned_state_names)
+            extra_names = sorted(returned_state_names - expected_state_names)
+            raise ValueError(
+                "专家聚合器必须返回完整模型 state_dict。"
+                f" missing={missing_names[:10]}, extra={extra_names[:10]}"
+            )
 
         new_state_dict = expert_result.new_state_dict
 
