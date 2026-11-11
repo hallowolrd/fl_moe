@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 
+
 @dataclass(frozen=True)
 class _StiefelParameterBlock:
     """A Stiefel variable formed by stacking row-oriented Parameters.
