@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-"""Full-client RFedAGS for MoE expert parameters on a product manifold.
+"""Full-client RFedAGS for all MoE expert parameters on a product manifold.
 
-All expert parameters are handled by this algorithm:
-- Euclidean expert parameters accumulate ordinary negative SGD steps.
-- Stiefel expert variables accumulate Riemannian steps transported to the
-  round-start tangent space.
+The model only defines the MoE architecture and exposes ordinary Parameters.
+This algorithm selects Stiefel-constrained expert parameter blocks through
+configuration; every other expert Parameter remains an Euclidean factor.
 Non-expert parameters continue to use base.py's fixed client-uniform FedAvg.
 """
 
@@ -20,14 +19,26 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from expert_geometry import (
+    StiefelParameterBlock,
+    build_stiefel_parameter_blocks,
+    stiefel_orthogonality_error,
+    stiefel_project_tangent,
+)
+
 
 ALGORITHM_NAME = "rfedags_orthogonal"
 PAYLOAD_KEY = "rfedags"
-PAYLOAD_VERSION = 1
+PAYLOAD_VERSION = 2
 
+DEFAULT_STIEFEL_BLOCKS = {
+    "expert_fc1": {
+        "parameter_patterns": ["moe_head.experts.*.fc1.weight"],
+    }
+}
 
 METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
-    "model": "sparse_moe_orthogonal",
+    "model": "sparse_moe_classifier",
     "model_cfg": {
         "backbone": "resnet_cifar",
         "moe_hidden_dim": 128,
@@ -38,6 +49,9 @@ METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
         "momentum": 0.0,
         "nesterov": False,
         "weight_decay": 0.0,
+    },
+    "orthogonal": {
+        "stiefel_blocks": DEFAULT_STIEFEL_BLOCKS,
     },
     "rfedags": {
         # None: follow local_epochs; all clients must consequently execute
@@ -62,10 +76,37 @@ def _validate_positive_int(value: Any, name: str) -> int:
     return int(value)
 
 
+def _build_stiefel_blocks(
+    model: torch.nn.Module,
+    expert_parameter_names: Sequence[str],
+    cfg: Any,
+) -> Dict[str, StiefelParameterBlock]:
+    block_cfg = _cfg_get(
+        cfg,
+        "orthogonal.stiefel_blocks",
+        DEFAULT_STIEFEL_BLOCKS,
+    )
+    blocks = build_stiefel_parameter_blocks(
+        model=model,
+        expert_parameter_names=expert_parameter_names,
+        block_config=block_cfg,
+    )
+    if not blocks:
+        raise ValueError(
+            "rfedags_orthogonal 至少需要配置一个 orthogonal.stiefel_blocks。"
+        )
+    return blocks
+
+
 def validate_method_config(cfg: Mapping[str, Any]) -> None:
     """Validate the full-client RSGD assumptions used by RFedAGS."""
     frac = float(_cfg_get(cfg, "frac", 1.0))
-    if not math.isfinite(frac) or not math.isclose(frac, 1.0, rel_tol=0.0, abs_tol=1e-12):
+    if not math.isfinite(frac) or not math.isclose(
+        frac,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
         raise ValueError(
             "rfedags_orthogonal 当前只实现全客户端参与，要求 frac=1.0；"
             f"当前值：{frac}"
@@ -103,46 +144,24 @@ def validate_method_config(cfg: Mapping[str, Any]) -> None:
             "未裁剪的 RSGD 更新定义不一致。"
         )
 
+    block_cfg = _cfg_get(
+        cfg,
+        "orthogonal.stiefel_blocks",
+        DEFAULT_STIEFEL_BLOCKS,
+    )
+    if not isinstance(block_cfg, Mapping) or not block_cfg:
+        raise ValueError(
+            "rfedags_orthogonal 要求 orthogonal.stiefel_blocks 是非空 mapping。"
+        )
+
     local_steps = _cfg_get(cfg, "rfedags.local_steps", None)
     if local_steps is not None:
         _validate_positive_int(local_steps, "rfedags.local_steps")
     else:
-        local_epochs = _validate_positive_int(
+        _validate_positive_int(
             _cfg_get(cfg, "local_epochs", 5),
             "local_epochs",
         )
-        if local_epochs <= 0:
-            raise ValueError("未设置 rfedags.local_steps 时，local_epochs 必须大于 0。")
-
-
-def stiefel_project_tangent(
-    point: torch.Tensor,
-    ambient_vector: torch.Tensor,
-) -> torch.Tensor:
-    """Project an ambient matrix onto T_point St(n, p), using the Euclidean metric."""
-    if point.ndim != 2 or ambient_vector.shape != point.shape:
-        raise ValueError(
-            "Stiefel tangent projection requires equally shaped 2-D tensors; "
-            f"got point={tuple(point.shape)}, vector={tuple(ambient_vector.shape)}."
-        )
-    if point.shape[0] < point.shape[1]:
-        raise ValueError(
-            f"Stiefel matrix must have n >= p, got {tuple(point.shape)}."
-        )
-
-    compute_dtype = (
-        torch.float64
-        if point.dtype == torch.float64 or ambient_vector.dtype == torch.float64
-        else torch.float32
-        if point.dtype in (torch.float16, torch.bfloat16)
-        or ambient_vector.dtype in (torch.float16, torch.bfloat16)
-        else point.dtype
-    )
-    x = point.to(dtype=compute_dtype)
-    g = ambient_vector.to(device=point.device, dtype=compute_dtype)
-    xtg = x.transpose(0, 1) @ g
-    sym_xtg = 0.5 * (xtg + xtg.transpose(0, 1))
-    return (g - x @ sym_xtg).to(dtype=point.dtype)
 
 
 def _tensor_is_finite(value: torch.Tensor) -> bool:
@@ -238,99 +257,73 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
         self.configured_local_steps = _cfg_get(cfg, "rfedags.local_steps", None)
 
         self._parameter_map: Dict[str, torch.nn.Parameter] = {}
+        self._expert_names: list[str] = []
         self._euclidean_names: list[str] = []
-        self._manifold_specs: Dict[str, base.ManifoldParameterSpec] = {}
-        self._manifold_names: list[str] = []
-        self._initial_manifold_points: Dict[str, torch.Tensor] = {}
+        self._blocks: Dict[str, StiefelParameterBlock] = {}
+        self._initial_points: Dict[str, torch.Tensor] = {}
         self._euclidean_stream: Dict[str, torch.Tensor] = {}
-        self._manifold_stream: Dict[str, torch.Tensor] = {}
+        self._stiefel_stream: Dict[str, torch.Tensor] = {}
         self._expert_buffer_names: list[str] = []
         self._local_steps = 0
 
     def on_train_start(self, context: base.ExpertClientTrainContext) -> None:
         model = context.model
         groups = context.optimization_groups
-        if groups.expert_manifold and not isinstance(
-            model,
-            base.ManifoldParameterProvider,
-        ):
-            raise TypeError(
-                "模型声明了 expert 流形变量，但没有实现 ManifoldParameterProvider。"
-            )
-
         self._parameter_map = dict(model.named_parameters())
-        self._euclidean_names = list(groups.expert_euclidean_parameters)
-        self._manifold_specs = dict(groups.expert_manifold)
-        self._manifold_names = list(self._manifold_specs)
-        self._initial_manifold_points = {}
-        self._euclidean_stream = {}
-        self._manifold_stream = {}
-        self._local_steps = 0
+        self._expert_names = list(groups.expert_parameter_names)
+        self._blocks = _build_stiefel_blocks(
+            model=model,
+            expert_parameter_names=self._expert_names,
+            cfg=self.cfg,
+        )
 
-        covered_parameter_names = set(self._euclidean_names)
-        for name, spec in self._manifold_specs.items():
-            if str(spec.manifold).lower().strip() != "stiefel":
-                raise NotImplementedError(
-                    f"RFedAGS-Orthogonal 当前只实现 Stiefel 流形，"
-                    f"变量 {name!r} 声明为 {spec.manifold!r}。"
-                )
-            if covered_parameter_names.intersection(spec.parameter_names):
+        stiefel_parameter_names: set[str] = set()
+        self._initial_points = {}
+        self._stiefel_stream = {}
+        for name, block in self._blocks.items():
+            overlap = stiefel_parameter_names.intersection(block.parameter_names)
+            if overlap:
                 raise ValueError(
-                    f"专家参数被重复分配到欧氏组和流形组：{name!r}"
+                    f"多个 Stiefel block 重复选择专家参数：{sorted(overlap)}"
                 )
-            covered_parameter_names.update(spec.parameter_names)
+            stiefel_parameter_names.update(block.parameter_names)
 
-            point = model.get_manifold_parameter(name).detach().clone()
-            if tuple(point.shape) != tuple(spec.shape):
-                raise ValueError(
-                    f"流形变量 {name!r} shape 不匹配："
-                    f"spec={spec.shape}, actual={tuple(point.shape)}"
-                )
-            if point.ndim != 2 or point.shape[0] < point.shape[1]:
-                raise ValueError(
-                    f"Stiefel 变量 {name!r} 必须满足二维矩阵 n >= p，"
-                    f"当前 shape={tuple(point.shape)}。"
-                )
-            point_work = (
-                point.float()
+            point = block.get_point(self._parameter_map)
+            error = stiefel_orthogonality_error(point)
+            tolerance = (
+                5e-3
                 if point.dtype in (torch.float16, torch.bfloat16)
-                else point
+                else 1e-4
             )
-            identity = torch.eye(
-                point_work.shape[1],
-                device=point_work.device,
-                dtype=point_work.dtype,
-            )
-            orthogonality_error = torch.linalg.norm(
-                point_work.transpose(0, 1) @ point_work - identity,
-                ord="fro",
-            )
-            tolerance = 5e-3 if point.dtype in (torch.float16, torch.bfloat16) else 1e-4
-            if float(orthogonality_error.item()) > tolerance:
+            if error > tolerance:
                 raise ValueError(
-                    f"流形变量 {name!r} 初始点不满足 Stiefel 约束："
-                    f"error={float(orthogonality_error.item()):.6e}"
+                    f"客户端初始 Stiefel block {name!r} 不满足正交约束："
+                    f"error={error:.6e}"
                 )
 
-            self._initial_manifold_points[name] = point
-            self._manifold_stream[name] = torch.zeros(
+            self._initial_points[name] = point.detach().clone()
+            self._stiefel_stream[name] = torch.zeros(
                 point.shape,
                 device=point.device,
                 dtype=_accumulation_dtype(point),
             )
 
-        expected_trainable_expert_names = set(groups.expert_parameter_names)
-        if covered_parameter_names != expected_trainable_expert_names:
-            missing = sorted(expected_trainable_expert_names - covered_parameter_names)
-            extra = sorted(covered_parameter_names - expected_trainable_expert_names)
+        self._euclidean_names = [
+            name
+            for name in self._expert_names
+            if name not in stiefel_parameter_names
+        ]
+        covered_names = set(self._euclidean_names) | stiefel_parameter_names
+        if covered_names != set(self._expert_names):
+            missing = sorted(set(self._expert_names) - covered_names)
+            extra = sorted(covered_names - set(self._expert_names))
             raise ValueError(
-                "RFedAGS 参数几何分组没有完整覆盖可训练专家参数："
+                "RFedAGS 参数几何分组未完整覆盖专家参数："
                 f"missing={missing[:10]}, extra={extra[:10]}"
             )
 
+        self._euclidean_stream = {}
         for name in self._euclidean_names:
-            if name not in self._parameter_map:
-                raise KeyError(f"找不到专家欧氏参数：{name}")
             parameter = self._parameter_map[name]
             self._euclidean_stream[name] = torch.zeros(
                 parameter.shape,
@@ -342,6 +335,7 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
         self._expert_buffer_names = sorted(
             set(groups.expert_state_names) - all_parameter_names
         )
+        self._local_steps = 0
 
     def local_step_limit(
         self,
@@ -355,16 +349,10 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
         )
 
     def step(self, context: base.ExpertClientBatchContext) -> None:
-        train_context = context.train_context
-        model = train_context.model
-        if self._manifold_specs and not isinstance(
-            model,
-            base.ManifoldParameterProvider,
-        ):
-            raise TypeError("本地模型声明了流形变量，但未实现 ManifoldParameterProvider。")
+        model = context.train_context.model
+        self._parameter_map = dict(model.named_parameters())
 
-        # Euclidean expert factors: ordinary SGD steps are already tangent
-        # vectors, and vector transport in Euclidean space is the identity.
+        # Euclidean expert factors: the Euclidean vector transport is identity.
         with torch.no_grad():
             for name in self._euclidean_names:
                 parameter = self._parameter_map[name]
@@ -379,23 +367,19 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
                     raise ValueError(f"专家参数 {name} 的梯度包含 NaN 或 Inf。")
 
                 local_step = gradient.detach().mul(-self.lr)
-                self._euclidean_stream[name].add_(local_step)
+                self._euclidean_stream[name].add_(
+                    local_step.to(dtype=self._euclidean_stream[name].dtype)
+                )
                 parameter.add_(local_step)
 
             # Stiefel expert factors: Riemannian SGD + projection transport
             # back to the common round-start tangent space.
-            for name, spec in self._manifold_specs.items():
-                point = model.get_manifold_parameter(name)
-                ambient_gradient = model.get_manifold_parameter_gradient(name)
-                if tuple(ambient_gradient.shape) != tuple(point.shape):
-                    raise ValueError(
-                        f"流形变量 {name!r} 的梯度 shape 不匹配："
-                        f"point={tuple(point.shape)}, "
-                        f"gradient={tuple(ambient_gradient.shape)}"
-                    )
+            for name, block in self._blocks.items():
+                point = block.get_point(self._parameter_map)
+                ambient_gradient = block.get_gradient(self._parameter_map)
                 if not _tensor_is_finite(ambient_gradient):
                     raise ValueError(
-                        f"流形变量 {name!r} 的欧氏梯度包含 NaN 或 Inf。"
+                        f"Stiefel block {name!r} 的欧氏梯度包含 NaN 或 Inf。"
                     )
 
                 riemannian_gradient = stiefel_project_tangent(
@@ -405,18 +389,19 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
                 local_step = riemannian_gradient.mul(-self.lr)
 
                 transported_step = stiefel_project_tangent(
-                    self._initial_manifold_points[name],
+                    self._initial_points[name],
                     local_step,
                 )
-                self._manifold_stream[name].add_(transported_step)
-
-                model.set_manifold_parameter_(
-                    name,
-                    point + local_step,
+                self._stiefel_stream[name].add_(
+                    transported_step.to(dtype=self._stiefel_stream[name].dtype)
                 )
 
-        if self._manifold_names:
-            train_context.retract_manifold_parameters_(self._manifold_names)
+                block.set_point_(
+                    self._parameter_map,
+                    point + local_step,
+                )
+                block.retract_(self._parameter_map)
+
         self._local_steps += 1
 
     def on_train_end(
@@ -435,15 +420,14 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
             PAYLOAD_KEY: {
                 "version": PAYLOAD_VERSION,
                 "local_steps": int(self._local_steps),
-                # Each stream stores the sum of actual negative local update
-                # vectors, not the sum of positive gradients.
+                # Streams are sums of actual negative local update vectors.
                 "euclidean_stream": {
                     name: value.detach().clone()
                     for name, value in self._euclidean_stream.items()
                 },
-                "manifold_stream": {
+                "stiefel_stream": {
                     name: value.detach().clone()
-                    for name, value in self._manifold_stream.items()
+                    for name, value in self._stiefel_stream.items()
                 },
                 "expert_buffers": expert_buffers,
             }
@@ -463,16 +447,34 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
 
     @property
     def handles_manifold_retraction(self) -> bool:
-        if self.method_context is None:
-            return False
-        groups = self.method_context.optimization_groups
-        return bool(groups is not None and groups.expert_manifold)
+        return True
 
     def compute_weights(
         self,
         client_updates: Sequence[base.ClientUpdate],
     ) -> Dict[int, float]:
         return base.build_uniform_weights(client_updates)
+
+    def _blocks_for_model(
+        self,
+        model: torch.nn.Module,
+    ) -> Dict[str, StiefelParameterBlock]:
+        if self.method_context is None or self.method_context.optimization_groups is None:
+            groups = base.build_federated_optimization_groups(model)
+            expert_names = groups.expert_parameter_names
+        else:
+            expert_names = self.method_context.optimization_groups.expert_parameter_names
+        return _build_stiefel_blocks(
+            model=model,
+            expert_parameter_names=expert_names,
+            cfg=self.cfg,
+        )
+
+    @torch.no_grad()
+    def initialize_model(self, model: torch.nn.Module) -> None:
+        parameter_map = dict(model.named_parameters())
+        for block in self._blocks_for_model(model).values():
+            block.retract_(parameter_map)
 
     def aggregate(
         self,
@@ -493,13 +495,6 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                 "RFedAGS 聚合器需要 MethodContext.global_model 和 "
                 "MethodContext.optimization_groups。"
             )
-        if groups.expert_manifold and not isinstance(
-            model,
-            base.ManifoldParameterProvider,
-        ):
-            raise TypeError(
-                "全局模型声明了 expert 流形变量，但没有实现 ManifoldParameterProvider。"
-            )
 
         configured_num_clients = int(_cfg_get(self.cfg, "num_clients", 0))
         expected_client_ids = set(range(configured_num_clients))
@@ -518,16 +513,23 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             )
 
         named_parameters = dict(model.named_parameters())
-        euclidean_names = list(groups.expert_euclidean_parameters)
-        manifold_specs = dict(groups.expert_manifold)
-        manifold_names = list(manifold_specs)
+        expert_names = list(groups.expert_parameter_names)
+        blocks = self._blocks_for_model(model)
+        stiefel_parameter_names = {
+            name
+            for block in blocks.values()
+            for name in block.parameter_names
+        }
+        euclidean_names = [
+            name for name in expert_names if name not in stiefel_parameter_names
+        ]
         expert_buffer_names = sorted(
             expected_state_names - set(named_parameters)
         )
 
         weights = base.normalize_weights(self.compute_weights(client_updates))
         euclidean_streams: Dict[int, Mapping[str, torch.Tensor]] = {}
-        manifold_streams: Dict[int, Mapping[str, torch.Tensor]] = {}
+        stiefel_streams: Dict[int, Mapping[str, torch.Tensor]] = {}
         buffers_by_client: Dict[int, Mapping[str, torch.Tensor]] = {}
         local_steps_by_client: Dict[int, int] = {}
 
@@ -550,12 +552,12 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             local_steps_by_client[update.client_id] = local_steps
 
             euclidean_stream = root.get("euclidean_stream")
-            manifold_stream = root.get("manifold_stream")
+            stiefel_stream = root.get("stiefel_stream")
             expert_buffers = root.get("expert_buffers")
             if not isinstance(euclidean_stream, Mapping):
                 raise TypeError("euclidean_stream 必须是 Mapping。")
-            if not isinstance(manifold_stream, Mapping):
-                raise TypeError("manifold_stream 必须是 Mapping。")
+            if not isinstance(stiefel_stream, Mapping):
+                raise TypeError("stiefel_stream 必须是 Mapping。")
             if not isinstance(expert_buffers, Mapping):
                 raise TypeError("expert_buffers 必须是 Mapping。")
 
@@ -563,9 +565,9 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                 raise ValueError(
                     f"客户端 {update.client_id} 的欧氏专家 stream 参数集合不完整。"
                 )
-            if set(manifold_stream) != set(manifold_names):
+            if set(stiefel_stream) != set(blocks):
                 raise ValueError(
-                    f"客户端 {update.client_id} 的流形 stream 集合不完整。"
+                    f"客户端 {update.client_id} 的 Stiefel stream block 集合不完整。"
                 )
             if set(expert_buffers) != set(expert_buffer_names):
                 raise ValueError(
@@ -587,19 +589,18 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                         f"客户端 {update.client_id} 的 {name} stream 包含 NaN 或 Inf。"
                     )
 
-            for name, value in manifold_stream.items():
+            for name, value in stiefel_stream.items():
                 if not torch.is_tensor(value):
                     raise TypeError(
-                        f"客户端 {update.client_id} 的流形 stream {name} 必须是 Tensor。"
+                        f"客户端 {update.client_id} 的 Stiefel stream {name} 必须是 Tensor。"
                     )
-                reference = model.get_manifold_parameter(name)
-                if tuple(value.shape) != tuple(reference.shape):
+                if tuple(value.shape) != tuple(blocks[name].shape):
                     raise ValueError(
-                        f"客户端 {update.client_id} 的 {name} stream shape 不匹配。"
+                        f"客户端 {update.client_id} 的 Stiefel block {name} shape 不匹配。"
                     )
                 if not _tensor_is_finite(value):
                     raise ValueError(
-                        f"客户端 {update.client_id} 的 {name} stream 包含 NaN 或 Inf。"
+                        f"客户端 {update.client_id} 的 Stiefel stream {name} 包含 NaN 或 Inf。"
                     )
 
             for name, value in expert_buffers.items():
@@ -618,7 +619,7 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
                     )
 
             euclidean_streams[update.client_id] = euclidean_stream
-            manifold_streams[update.client_id] = manifold_stream
+            stiefel_streams[update.client_id] = stiefel_stream
             buffers_by_client[update.client_id] = expert_buffers
 
         unique_local_steps = set(local_steps_by_client.values())
@@ -639,7 +640,7 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
         if set(new_state_dict) != set(global_state):
             raise ValueError("base_state 与 global_state 的 state_dict keys 不一致。")
 
-        # Euclidean factors: vector transport is the identity and Retr_x(v)=x+v.
+        # Euclidean expert factors: average their actual local update streams.
         for name in euclidean_names:
             reference = global_state[name]
             aggregated_stream = _weighted_tensor_sum(
@@ -651,16 +652,14 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             )
             new_state_dict[name] = reference + aggregated_stream
 
-        # Stiefel factors: all client streams have already been transported
-        # into the tangent space at the same round-start global point.
-        model_copy = None
-        if manifold_specs:
-            model_copy = copy.deepcopy(model).to("cpu")
-            model_copy.load_state_dict(global_state, strict=True)
+        # Rebuild the Stiefel blocks on a CPU copy of the round-start model.
+        model_copy = copy.deepcopy(model).to("cpu")
+        model_copy.load_state_dict(global_state, strict=True)
+        copy_parameters = dict(model_copy.named_parameters())
 
         tangent_residuals: Dict[str, float] = {}
-        for name, spec in manifold_specs.items():
-            point = model_copy.get_manifold_parameter(name)
+        for name, block in blocks.items():
+            point = block.get_point(copy_parameters)
             aggregation_reference = (
                 point.float()
                 if point.dtype in (torch.float16, torch.bfloat16)
@@ -669,12 +668,16 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             aggregated_stream = _weighted_tensor_sum(
                 client_updates,
                 weights,
-                manifold_streams,
+                stiefel_streams,
                 name,
                 aggregation_reference,
             )
 
-            point_work = point.float() if point.dtype in (torch.float16, torch.bfloat16) else point
+            point_work = (
+                point.float()
+                if point.dtype in (torch.float16, torch.bfloat16)
+                else point
+            )
             stream_work = (
                 aggregated_stream.float()
                 if aggregated_stream.dtype in (torch.float16, torch.bfloat16)
@@ -695,23 +698,23 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             )
             if relative_residual > tangent_tolerance:
                 raise ValueError(
-                    f"聚合后的 {name} Gradient Stream 不属于全局初始点的切空间："
+                    f"聚合后的 Stiefel block {name!r} Gradient Stream "
+                    "不属于全局初始点的切空间："
                     f"relative_residual={relative_residual:.6e}"
                 )
 
-            model_copy.set_manifold_parameter_(
-                name,
+            block.set_point_(
+                copy_parameters,
                 point + aggregated_stream,
             )
-            model_copy.retract_manifold_parameters_([name])
+            block.retract_(copy_parameters)
 
-        if model_copy is not None:
-            model_state_after_retraction = model_copy.state_dict()
-            for spec in manifold_specs.values():
-                for parameter_name in spec.parameter_names:
-                    new_state_dict[parameter_name] = (
-                        model_state_after_retraction[parameter_name].detach().clone()
-                    )
+        model_copy_state = model_copy.state_dict()
+        for block in blocks.values():
+            for parameter_name in block.parameter_names:
+                new_state_dict[parameter_name] = (
+                    model_copy_state[parameter_name].detach().clone()
+                )
 
         # Expert buffers are not differentiable manifold coordinates. Preserve
         # their normal client-uniform state aggregation separately.
@@ -733,21 +736,15 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             )
         base.check_finite_state_dict(new_state_dict)
 
-        orthogonality_errors: Dict[str, float] = {}
-        for name in manifold_names:
-            point = model_copy.get_manifold_parameter(name)
-            point_work = point.float() if point.dtype in (torch.float16, torch.bfloat16) else point
-            identity = torch.eye(
-                point_work.shape[1],
-                device=point_work.device,
-                dtype=point_work.dtype,
-            )
-            orthogonality_errors[name] = float(
-                torch.linalg.norm(
-                    point_work.transpose(0, 1) @ point_work - identity,
-                    ord="fro",
-                ).item()
-            )
+        stiefel_diagnostics: Dict[str, Any] = {}
+        for name, block in blocks.items():
+            point = block.get_point(copy_parameters)
+            stiefel_diagnostics[name] = {
+                "shape": list(block.shape),
+                "parameter_names": list(block.parameter_names),
+                "tangent_relative_residual": tangent_residuals[name],
+                "orthogonality_error": stiefel_orthogonality_error(point),
+            }
 
         diagnostics = {
             "aggregation_rule": "client_uniform",
@@ -755,18 +752,9 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             "gradient_stream": "sum_of_negative_local_update_vectors",
             "local_steps": int(local_steps),
             "num_euclidean_expert_parameters": len(euclidean_names),
-            "manifold_variables": {
-                name: {
-                    "manifold": spec.manifold,
-                    "shape": list(spec.shape),
-                    "parameter_names": list(spec.parameter_names),
-                    "tangent_relative_residual": tangent_residuals[name],
-                    "orthogonality_error": orthogonality_errors[name],
-                }
-                for name, spec in manifold_specs.items()
-            },
+            "stiefel_blocks": stiefel_diagnostics,
             "vector_transport": "Stiefel tangent projection to round-start point",
-            "server_retraction": "model_declared_stiefel_retraction",
+            "server_retraction": "algorithm_owned_QR",
             "weights": {
                 int(client_id): float(weight)
                 for client_id, weight in weights.items()
