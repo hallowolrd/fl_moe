@@ -314,7 +314,6 @@ def normalize_dataset_name(dataset_name: str) -> str:
 
 SUPPORTED_MODELS = {
     "sparse_moe_classifier",
-    "sparse_moe_orthogonal",
 }
 
 
@@ -5115,301 +5114,6 @@ class SparseMoEClassifier(nn.Module):
         )
 
 
-@dataclass(frozen=True)
-class ManifoldParameterSpec:
-    """描述一个由多个 PyTorch 参数共同表示的流形变量。"""
-
-    name: str
-    manifold: str
-    parameter_names: Tuple[str, ...]
-    shape: Tuple[int, ...]
-
-
-class ManifoldParameterProvider(ABC):
-    """
-    模型几何接口。
-
-    流形变量可能由多个 Parameter 共同组成，因此不强制将其注册成单个
-    nn.Parameter。算法通过 get / get_gradient / set / retract 接口访问模型几何变量。
-    """
-
-    @abstractmethod
-    def manifold_parameter_specs(self) -> Mapping[str, ManifoldParameterSpec]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_manifold_parameter(self, name: str) -> torch.Tensor:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_manifold_parameter_gradient(self, name: str) -> torch.Tensor:
-        """
-        将底层 PyTorch Parameter 的欧氏梯度映射到流形变量坐标。
-
-        返回 Tensor 的形状必须与 get_manifold_parameter(name) 一致。
-        对由多个 Parameter 共同表示的流形变量，模型负责完成梯度拼接、
-        转置或其他必要的链式映射；优化算法不应猜测模型内部参数布局。
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def set_manifold_parameter_(
-        self,
-        name: str,
-        value: torch.Tensor,
-    ) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def retract_manifold_parameters_(
-        self,
-        names: Optional[Iterable[str]] = None,
-    ) -> None:
-        raise NotImplementedError
-
-
-class OrthogonalSparseMoEClassifier(SparseMoEClassifier, ManifoldParameterProvider):
-    """
-    跨专家特征投影子空间正交的 Sparse MoE 分类模型。
-
-    将所有专家的 fc1.weight 按行拼接为 W_all，并约束：
-        W_all @ W_all.T = I
-
-    因此不同专家的 fc1 行空间两两正交。默认隐藏维度为 128，
-    对应 4 个专家、512 维 Backbone 特征。
-    """
-
-    def __init__(
-        self,
-        num_classes: int,
-        num_experts: int = 4,
-        topk: int = 2,
-        in_channels: int = 3,
-        image_size: int = 32,
-        moe_hidden_dim: int = 128,
-        renormalize_topk_probs: bool = False,
-        backbone_name: str = DEFAULT_BACKBONE_NAME,
-    ) -> None:
-        num_experts = int(num_experts)
-        moe_hidden_dim = int(moe_hidden_dim)
-
-        if num_experts <= 0:
-            raise ValueError(
-                f"num_experts 必须大于 0，当前值：{num_experts}"
-            )
-        if moe_hidden_dim <= 0:
-            raise ValueError(
-                f"moe_hidden_dim 必须大于 0，当前值：{moe_hidden_dim}"
-            )
-
-        total_rows = num_experts * moe_hidden_dim
-        if total_rows > MOE_FEATURE_DIM:
-            raise ValueError(
-                "跨专家正交约束要求 "
-                "num_experts * moe_hidden_dim <= "
-                f"{MOE_FEATURE_DIM}，当前为 "
-                f"{num_experts} * {moe_hidden_dim} = {total_rows}。"
-            )
-
-        super().__init__(
-            num_classes=num_classes,
-            num_experts=num_experts,
-            topk=topk,
-            in_channels=in_channels,
-            image_size=image_size,
-            moe_hidden_dim=moe_hidden_dim,
-            renormalize_topk_probs=renormalize_topk_probs,
-            backbone_name=backbone_name,
-        )
-
-        # 父类完成 Xavier 初始化后，立即将专家投影权重映射到正交约束集合。
-        self.retract_expert_subspaces_()
-
-    def manifold_parameter_specs(self) -> Mapping[str, ManifoldParameterSpec]:
-        """声明跨专家 fc1 投影矩阵是一个整体 Stiefel 变量。"""
-        expert_weight_ids = {
-            id(expert.fc1.weight)
-            for expert in self.moe_head.experts
-        }
-        parameter_names = tuple(
-            name
-            for name, parameter in self.named_parameters()
-            if id(parameter) in expert_weight_ids
-        )
-        matrix = self.get_manifold_parameter("expert_projection")
-        return {
-            "expert_projection": ManifoldParameterSpec(
-                name="expert_projection",
-                manifold="stiefel",
-                parameter_names=parameter_names,
-                shape=tuple(matrix.shape),
-            )
-        }
-
-    @torch.no_grad()
-    def get_manifold_parameter(self, name: str) -> torch.Tensor:
-        """取得 X=W_all.T，形状为 [feature_dim, total_expert_hidden_dim]。"""
-        if name != "expert_projection":
-            raise KeyError(f"未知流形变量：{name}")
-
-        weights = [
-            expert.fc1.weight
-            for expert in self.moe_head.experts
-        ]
-        if not weights:
-            raise ValueError("模型中没有 expert fc1.weight。")
-
-        return torch.cat(weights, dim=0).transpose(0, 1).detach().clone()
-
-    @torch.no_grad()
-    def get_manifold_parameter_gradient(self, name: str) -> torch.Tensor:
-        """
-        将各 expert.fc1.weight.grad 映射到 X=W_all.T 的欧氏梯度。
-
-        未被当前 batch 激活的专家梯度按零处理；随后 RFedAGS 会在整体
-        Stiefel 流形上执行切空间投影，因此跨专家正交约束仍然完整生效。
-        """
-        if name != "expert_projection":
-            raise KeyError(f"未知流形变量：{name}")
-
-        weights = [
-            expert.fc1.weight
-            for expert in self.moe_head.experts
-        ]
-        if not weights:
-            raise ValueError("模型中没有 expert fc1.weight。")
-
-        gradients = []
-        for weight in weights:
-            gradient = weight.grad
-            if gradient is None:
-                gradient = torch.zeros_like(weight)
-            gradients.append(gradient.detach())
-
-        return torch.cat(gradients, dim=0).transpose(0, 1).clone()
-
-    @torch.no_grad()
-    def set_manifold_parameter_(
-        self,
-        name: str,
-        value: torch.Tensor,
-    ) -> None:
-        """将整体 Stiefel 矩阵写回各 expert 的 fc1.weight。"""
-        if name != "expert_projection":
-            raise KeyError(f"未知流形变量：{name}")
-        if not torch.is_tensor(value) or value.dim() != 2:
-            raise TypeError("expert_projection 必须是二维 Tensor。")
-
-        weights = [
-            expert.fc1.weight
-            for expert in self.moe_head.experts
-        ]
-        if not weights:
-            raise ValueError("模型中没有 expert fc1.weight。")
-
-        expected_shape = (
-            int(weights[0].size(1)),
-            int(sum(weight.size(0) for weight in weights)),
-        )
-        if tuple(value.shape) != expected_shape:
-            raise ValueError(
-                "expert_projection shape 不匹配："
-                f"expected={expected_shape}, actual={tuple(value.shape)}"
-            )
-        if not bool(torch.isfinite(value).all().item()):
-            raise ValueError("expert_projection 包含 NaN 或 Inf。")
-
-        weight_all = value.detach().transpose(0, 1).to(
-            device=weights[0].device,
-            dtype=weights[0].dtype,
-        )
-        offset = 0
-        for weight in weights:
-            rows = int(weight.size(0))
-            weight.copy_(weight_all[offset:offset + rows])
-            offset += rows
-
-    @torch.no_grad()
-    def retract_manifold_parameters_(
-        self,
-        names: Optional[Iterable[str]] = None,
-    ) -> None:
-        """对指定流形变量执行回缩；当前模型只有整体 expert_projection。"""
-        requested = None if names is None else set(names)
-        if requested is not None:
-            unknown = requested - {"expert_projection"}
-            if unknown:
-                raise KeyError(f"未知流形变量：{sorted(unknown)}")
-        if requested is None or "expert_projection" in requested:
-            self.retract_expert_subspaces_()
-
-    @torch.no_grad()
-    def retract_expert_subspaces_(self) -> None:
-        """使用 QR 回缩，使所有专家的 fc1 权重行向量整体正交。"""
-        experts = self.moe_head.experts
-        weights = [expert.fc1.weight for expert in experts]
-        if not weights:
-            return
-
-        weight_all = torch.cat(weights, dim=0)
-        total_rows, input_dim = weight_all.shape
-
-        if total_rows > input_dim:
-            raise ValueError(
-                "跨专家正交回缩要求专家隐藏维度总和不超过输入特征维度，"
-                f"当前为 {total_rows} > {input_dim}。"
-            )
-
-        original_dtype = weight_all.dtype
-        qr_input = weight_all.transpose(0, 1)
-
-        # 部分设备不支持低精度 QR，低精度权重统一使用 FP32 计算。
-        if qr_input.dtype in (torch.float16, torch.bfloat16):
-            qr_input = qr_input.float()
-
-        q, r = torch.linalg.qr(qr_input, mode="reduced")
-
-        # 固定 QR 分解的符号约定，不改变正交性。
-        diagonal = torch.diagonal(r)
-        signs = torch.where(
-            diagonal < 0,
-            -torch.ones_like(diagonal),
-            torch.ones_like(diagonal),
-        )
-        weight_retracted = (q * signs.unsqueeze(0)).transpose(0, 1)
-        weight_retracted = weight_retracted.to(dtype=original_dtype)
-
-        offset = 0
-        for expert in experts:
-            rows = expert.fc1.weight.size(0)
-            expert.fc1.weight.copy_(
-                weight_retracted[offset:offset + rows]
-            )
-            offset += rows
-
-    @torch.no_grad()
-    def orthogonality_error(self) -> float:
-        """返回 ||W_all W_all.T - I||_F，供实验验证正交约束。"""
-        weight_all = torch.cat(
-            [expert.fc1.weight for expert in self.moe_head.experts],
-            dim=0,
-        )
-
-        if weight_all.dtype in (torch.float16, torch.bfloat16):
-            weight_all = weight_all.float()
-
-        identity = torch.eye(
-            weight_all.size(0),
-            device=weight_all.device,
-            dtype=weight_all.dtype,
-        )
-        error = torch.linalg.norm(
-            weight_all @ weight_all.transpose(0, 1) - identity,
-            ord="fro",
-        )
-        return float(error.item())
-
-
 def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
     """
     根据 cfg 构建 SparseMoEClassifier。
@@ -5493,78 +5197,6 @@ def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
     )
 
 
-def build_orthogonal_sparse_moe_classifier_from_cfg(
-    cfg: Any,
-) -> OrthogonalSparseMoEClassifier:
-    """
-    根据 cfg 构建跨专家正交 Sparse MoE。
-
-    配置示例：
-        model: sparse_moe_orthogonal
-        num_experts: 4
-        topk: 2
-        model_cfg:
-          moe_hidden_dim: 128
-
-    moe_hidden_dim 默认 128；所有专家隐藏维度之和必须不超过
-    Backbone 输出的 512 维特征维度。
-    """
-    model_cfg = _cfg_get(cfg, "model_cfg", {})
-
-    input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
-    if input_shape is None:
-        input_shape = (3, 32, 32)
-
-    default_in_channels = int(input_shape[0])
-    default_image_size = int(input_shape[1])
-    default_moe_hidden_dim = _cfg_get(
-        model_cfg,
-        "hidden_dim",
-        128,
-    )
-
-    return OrthogonalSparseMoEClassifier(
-        num_classes=int(_cfg_get(cfg, "num_classes")),
-        num_experts=int(_cfg_get(cfg, "num_experts", 4)),
-        topk=int(_cfg_get(cfg, "topk", 2)),
-        in_channels=int(
-            _cfg_get(
-                model_cfg,
-                "in_channels",
-                default_in_channels,
-            )
-        ),
-        image_size=int(
-            _cfg_get(
-                model_cfg,
-                "image_size",
-                default_image_size,
-            )
-        ),
-        moe_hidden_dim=int(
-            _cfg_get(
-                model_cfg,
-                "moe_hidden_dim",
-                default_moe_hidden_dim,
-            )
-        ),
-        renormalize_topk_probs=bool(
-            _cfg_get(
-                model_cfg,
-                "renormalize_topk_probs",
-                False,
-            )
-        ),
-        backbone_name=str(
-            _cfg_get(
-                model_cfg,
-                "backbone",
-                DEFAULT_BACKBONE_NAME,
-            )
-        ),
-    )
-
-
 # ============================================================================
 # 8.3 模型注册、构建与参数量统计
 # Bundled from models/build.py
@@ -5576,7 +5208,6 @@ ModelBuilder = Callable[[Any], nn.Module]
 
 MODEL_BUILDERS: Dict[str, ModelBuilder] = {
     "sparse_moe_classifier": build_sparse_moe_classifier_from_cfg,
-    "sparse_moe_orthogonal": build_orthogonal_sparse_moe_classifier_from_cfg,
 }
 
 
@@ -5589,7 +5220,6 @@ def build_model(cfg: Any) -> nn.Module:
 
     当前支持：
         sparse_moe_classifier
-        sparse_moe_orthogonal
 
     后续扩展其他模型时，只需要：
         1. 新增模型文件
@@ -5941,45 +5571,31 @@ def validate_param_groups(
 @dataclass(frozen=True)
 class FederatedOptimizationGroups:
     """
-    面向优化算法的参数分组，与 ParamGroups 的专家/非专家语义分离。
+    面向联邦优化职责的参数分组。
 
     non_expert_parameters:
-        继续使用普通本地优化器更新的 Backbone / Router 等参数。
-    expert_euclidean_parameters:
-        交由专家算法处理的欧氏专家参数。
-    expert_manifold:
-        交由专家算法处理的流形变量定义；一个变量可以由多个 Parameter 组成。
+        Backbone / Router 等非专家可训练参数。
+    expert_parameters:
+        全部可训练专家参数。具体采用欧氏更新还是流形更新，由专家聚合算法决定。
     *_state_names:
-        对应 state_dict 分组，包含需要处理的浮点 buffer。
+        对应 state_dict 分组，包含需要处理的参数和 buffer。
     """
 
     non_expert_state_names: List[str]
     expert_state_names: List[str]
     non_expert_parameters: List[str]
-    expert_euclidean_parameters: List[str]
-    expert_manifold: Dict[str, ManifoldParameterSpec] = field(default_factory=dict)
+    expert_parameters: List[str]
     buffers: List[str] = field(default_factory=list)
     frozen_parameters: List[str] = field(default_factory=list)
 
     @property
     def expert_parameter_names(self) -> List[str]:
-        names = list(self.expert_euclidean_parameters)
-        for spec in self.expert_manifold.values():
-            names.extend(spec.parameter_names)
-        return names
+        return list(self.expert_parameters)
 
     def summary(self) -> Dict[str, Any]:
         return {
             "num_non_expert_parameters": len(self.non_expert_parameters),
-            "num_expert_euclidean_parameters": len(self.expert_euclidean_parameters),
-            "expert_manifold": {
-                name: {
-                    "manifold": spec.manifold,
-                    "parameter_names": list(spec.parameter_names),
-                    "shape": list(spec.shape),
-                }
-                for name, spec in self.expert_manifold.items()
-            },
+            "num_expert_parameters": len(self.expert_parameters),
             "num_buffers": len(self.buffers),
             "num_frozen_parameters": len(self.frozen_parameters),
         }
@@ -5992,14 +5608,11 @@ def build_federated_optimization_groups(
     strict: bool = True,
 ) -> FederatedOptimizationGroups:
     """
-    按联邦优化职责拆分参数。
+    按模型参数归属拆分 non_expert 与 expert。
 
-    当前默认职责：
-      - non_expert 参数由普通本地优化器训练，并由固定 uniform 聚合器聚合；
-      - expert 参数交由注入的专家训练策略和专家聚合器处理；
-      - Stiefel 等流形变量由模型的 ManifoldParameterProvider 显式声明。
-
-    不实现任何具体黎曼优化算法。
+    本函数只识别参数属于哪个专家，不决定其几何类型或约束方式。
+    欧氏更新、正交约束、流形优化等行为全部由注入的专家训练策略和
+    专家聚合器决定。
     """
     if param_groups is None:
         param_groups = build_param_groups(
@@ -6025,74 +5638,15 @@ def build_federated_optimization_groups(
     expert_state_names = set(param_groups.expert)
     non_expert_state_names = set(param_groups.non_expert)
 
-    manifold_specs: Dict[str, ManifoldParameterSpec] = {}
-    if isinstance(model, ManifoldParameterProvider):
-        manifold_specs = dict(model.manifold_parameter_specs())
-
-    manifold_parameter_names = set()
-    for spec_name, spec in manifold_specs.items():
-        if not isinstance(spec, ManifoldParameterSpec):
-            raise TypeError(
-                "manifold_parameter_specs() 的值必须是 ManifoldParameterSpec，"
-                f"当前 {spec_name!r} 的类型为 {type(spec).__name__}。"
-            )
-        if spec_name != spec.name:
-            raise ValueError(
-                f"流形变量 key 与 spec.name 不一致：{spec_name!r} != {spec.name!r}"
-            )
-        if not spec.parameter_names:
-            raise ValueError(f"流形变量 {spec_name!r} 没有关联 Parameter。")
-
-        names = set(spec.parameter_names)
-        overlap = manifold_parameter_names & names
-        if overlap:
-            raise ValueError(
-                f"多个流形变量重复包含 Parameter：{sorted(overlap)}"
-            )
-
-        missing = names - parameter_names
-        if missing:
-            raise KeyError(
-                f"流形变量 {spec_name!r} 引用了模型中不存在的 Parameter："
-                f"{sorted(missing)}"
-            )
-
-        non_expert_names = names - expert_state_names
-        if non_expert_names:
-            raise ValueError(
-                f"当前专家优化接口只允许把 expert 参数声明为流形变量，"
-                f"变量 {spec_name!r} 包含非 expert 参数：{sorted(non_expert_names)}"
-            )
-
-        frozen_manifold_names = names - trainable_names
-        if frozen_manifold_names:
-            raise ValueError(
-                f"流形变量 {spec_name!r} 包含被冻结的 Parameter："
-                f"{sorted(frozen_manifold_names)}"
-            )
-
-        actual_value = model.get_manifold_parameter(spec_name)
-        if tuple(actual_value.shape) != tuple(spec.shape):
-            raise ValueError(
-                f"流形变量 {spec_name!r} 声明 shape={spec.shape}，"
-                f"实际 shape={tuple(actual_value.shape)}。"
-            )
-
-        manifold_parameter_names.update(names)
-
     non_expert_parameters = [
         name
         for name, parameter in named_parameters.items()
         if name in non_expert_state_names and parameter.requires_grad
     ]
-    expert_euclidean_parameters = [
+    expert_parameters = [
         name
         for name, parameter in named_parameters.items()
-        if (
-            name in expert_state_names
-            and parameter.requires_grad
-            and name not in manifold_parameter_names
-        )
+        if name in expert_state_names and parameter.requires_grad
     ]
     buffers = [
         name
@@ -6100,12 +5654,22 @@ def build_federated_optimization_groups(
         if name not in parameter_names
     ]
 
+    if set(non_expert_parameters) | set(expert_parameters) != trainable_names:
+        missing = sorted(
+            trainable_names - set(non_expert_parameters) - set(expert_parameters)
+        )
+        raise ValueError(
+            "联邦优化分组未覆盖全部可训练参数；"
+            f"missing={missing[:10]}"
+        )
+    if set(non_expert_parameters) & set(expert_parameters):
+        raise ValueError("non_expert 与 expert 参数分组发生重叠。")
+
     return FederatedOptimizationGroups(
         non_expert_state_names=list(param_groups.non_expert),
         expert_state_names=list(param_groups.expert),
         non_expert_parameters=non_expert_parameters,
-        expert_euclidean_parameters=expert_euclidean_parameters,
-        expert_manifold=manifold_specs,
+        expert_parameters=expert_parameters,
         buffers=buffers,
         frozen_parameters=frozen_names,
     )
@@ -6562,43 +6126,6 @@ class ExpertClientTrainContext:
     local_epochs: int
     non_expert_grad_clip: Optional[float]
 
-    def retract_manifold_parameters_(
-        self,
-        names: Optional[Iterable[str]] = None,
-    ) -> None:
-        """
-        对当前客户端模型的专家流形变量执行回缩。
-
-        专家训练策略在更新 Stiefel 等流形变量后，应显式调用此方法。
-        框架不会在 strategy.step() 后自动回缩，以免覆盖算法自身的
-        向量传输、组合更新或回缩时序。
-        """
-        available_names = set(self.optimization_groups.expert_manifold)
-        if names is None:
-            requested_names = available_names
-        elif isinstance(names, str):
-            requested_names = {names}
-        else:
-            requested_names = set(names)
-
-        unknown_names = requested_names - available_names
-        if unknown_names:
-            raise KeyError(
-                "请求回缩的流形变量未在 expert_manifold 中声明："
-                f"{sorted(str(name) for name in unknown_names)}"
-            )
-
-        if not requested_names:
-            return
-
-        if not isinstance(self.model, ManifoldParameterProvider):
-            raise TypeError(
-                "当前模型声明了专家流形变量，但没有实现 "
-                "ManifoldParameterProvider。"
-            )
-
-        self.model.retract_manifold_parameters_(requested_names)
-
     @property
     def expert_parameters(self) -> Dict[str, nn.Parameter]:
         parameter_map = dict(self.model.named_parameters())
@@ -6633,17 +6160,26 @@ class ExpertClientTrainingStrategy(ABC):
     专家本地训练策略接口。
 
     框架先执行 forward/backward；step() 在反向传播后、non_expert
-    optimizer.step() 前调用。策略只负责 expert 参数，并可在结束时上传
-    algorithm_payload。non_expert 参数仍由框架的普通优化器更新。
+    optimizer.step() 前调用。策略负责专家参数的本地更新，并可在结束时
+    上传 algorithm_payload。non_expert 参数仍由框架的普通优化器更新。
 
     grad_clip 仅由框架应用于 non_expert 梯度；expert 梯度的裁剪由策略
-    自行负责。策略若更新了 Stiefel 等流形变量，也必须按算法要求显式调用
-    context.train_context.retract_manifold_parameters_() 执行回缩。
+    自行负责。是否执行正交约束或流形回缩由具体策略决定，模型本身不触发。
     """
 
     @property
     def strategy_name(self) -> str:
         return self.__class__.__name__
+
+    @property
+    def includes_expert_parameters_in_model_delta(self) -> bool:
+        """
+        策略是否已在本地更新专家参数，并要求框架把专家参数差一并上传。
+
+        普通 Delta 聚合算法（例如 FedAvg Orthogonal）返回 True；
+        由 algorithm_payload 承载专家更新的算法（例如 RFedAGS）保持 False。
+        """
+        return False
 
     def on_train_start(self, context: ExpertClientTrainContext) -> None:
         """每个客户端每轮训练开始时调用，可用于初始化本轮状态。"""
@@ -6900,12 +6436,25 @@ class FLClient:
             device="cpu",
         )
 
+        include_expert_delta = (
+            self.expert_client_training_strategy is not None
+            and self.expert_client_training_strategy.includes_expert_parameters_in_model_delta
+        )
+        if self.expert_client_training_strategy is not None and not isinstance(
+            include_expert_delta,
+            bool,
+        ):
+            raise TypeError(
+                "ExpertClientTrainingStrategy.includes_expert_parameters_in_model_delta "
+                "必须返回 bool。"
+            )
+
         model_delta = subtract_state_dict(
             local_state=local_state_cpu,
             global_state=global_state_cpu,
             param_names=(
                 optimization_groups.non_expert_state_names
-                if optimization_groups is not None
+                if optimization_groups is not None and not include_expert_delta
                 else None
             ),
             strict=True,
@@ -7000,15 +6549,6 @@ def train_local_model(
                 )
 
             optimizer.step()
-
-            # 模型若声明流形变量，则使用通用几何接口执行回缩；
-            # 普通模型仍不执行任何额外操作。
-            if isinstance(model, ManifoldParameterProvider):
-                model.retract_manifold_parameters_()
-            else:
-                retract = getattr(model, "retract_expert_subspaces_", None)
-                if callable(retract):
-                    retract()
 
             batch_size = int(targets.size(0))
 
@@ -7885,6 +7425,12 @@ class Aggregator(ABC):
             )
         self.method_context = method_context
 
+    def initialize_model(self, model: nn.Module) -> None:
+        """Apply algorithm-owned initialization to the global model, if required."""
+
+    def after_aggregate(self, model: nn.Module) -> None:
+        """Apply algorithm-owned post-aggregation operations, if required."""
+
     @property
     @abstractmethod
     def method_name(self) -> str:
@@ -8307,6 +7853,7 @@ class FLServer:
             method_context=self.method_context,
         )
         expert_aggregator = self.aggregators.expert
+        expert_aggregator.initialize_model(self.global_model)
         strategy_enabled = expert_client_training_strategy_builder is not None
         consumes_algorithm_payload = expert_aggregator.consumes_algorithm_payload
         handles_manifold_retraction = expert_aggregator.handles_manifold_retraction
@@ -8320,11 +7867,6 @@ class FLServer:
                 "Aggregator.handles_manifold_retraction 必须返回 bool。"
             )
 
-        if strategy_enabled and not consumes_algorithm_payload:
-            raise ValueError(
-                "启用 expert_client_training_strategy_builder 后，"
-                "专家聚合器必须声明 consumes_algorithm_payload=True。"
-            )
         if consumes_algorithm_payload and not strategy_enabled:
             raise ValueError(
                 "专家聚合器声明 consumes_algorithm_payload=True，"
@@ -8339,15 +7881,6 @@ class FLServer:
                 "声明 consumes_algorithm_payload=True 的专家聚合器必须"
                 "真正覆盖 aggregate()，不能使用 Aggregator 的默认 Delta 聚合实现。"
             )
-        if handles_manifold_retraction and (
-            not isinstance(self.global_model, ManifoldParameterProvider)
-            or not self.optimization_groups.expert_manifold
-        ):
-            raise ValueError(
-                "专家聚合器声明 handles_manifold_retraction=True，"
-                "但当前模型没有可用的 expert_manifold 几何变量。"
-            )
-
         self.train_state = TrainState(
             round_id=0,
             best_acc=0.0,
@@ -8619,25 +8152,9 @@ class FLServer:
             strict=True,
         )
 
-        # 默认由模型几何接口执行服务端回缩；若聚合器已自行处理，则跳过。
-        if not self.aggregators.expert.handles_manifold_retraction:
-            manifold_names = tuple(self.optimization_groups.expert_manifold)
-            if manifold_names:
-                if not isinstance(self.global_model, ManifoldParameterProvider):
-                    raise TypeError(
-                        "optimization_groups 声明了流形变量，"
-                        "但 global_model 未实现 ManifoldParameterProvider。"
-                    )
-                self.global_model.retract_manifold_parameters_(manifold_names)
-            else:
-                # 兼容尚未迁移到 ManifoldParameterProvider 的旧模型。
-                retract = getattr(
-                    self.global_model,
-                    "retract_expert_subspaces_",
-                    None,
-                )
-                if callable(retract):
-                    retract()
+        # 聚合后的 QR / Retract 等操作由当前专家聚合算法决定。
+        self.aggregators.expert.after_aggregate(self.global_model)
+        check_finite_state_dict(self.global_model.state_dict())
 
         self.global_model.to("cpu")
 
