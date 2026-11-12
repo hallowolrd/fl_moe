@@ -282,17 +282,36 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
             user_file = run_dir / "user_notes.txt"
             user_file.write_text("keep", encoding="utf-8")
 
+            # The training entrypoint passes ConfigNode, not a plain dict.
             resolved = base.ensure_run_dir(
-                {
-                    "run_dir": str(run_dir),
-                    "run": {"overwrite": True},
-                }
+                base.ConfigNode(
+                    {
+                        "run_dir": str(run_dir),
+                        "run": {"overwrite": True},
+                    }
+                )
             )
 
             self.assertEqual(resolved, run_dir)
             for filename in base.RUN_OUTPUT_FILENAMES:
                 self.assertFalse((run_dir / filename).exists())
             self.assertEqual(user_file.read_text(encoding="utf-8"), "keep")
+
+            # Without overwrite, ensure_run_dir must preserve existing outputs.
+            protected_summary = run_dir / "summary.json"
+            protected_summary.write_text("keep summary", encoding="utf-8")
+            base.ensure_run_dir(
+                base.ConfigNode(
+                    {
+                        "run_dir": str(run_dir),
+                        "run": {"overwrite": False},
+                    }
+                )
+            )
+            self.assertEqual(
+                protected_summary.read_text(encoding="utf-8"),
+                "keep summary",
+            )
 
     def test_training_log_is_truncated_for_each_invocation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
