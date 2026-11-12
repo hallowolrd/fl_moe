@@ -9046,8 +9046,9 @@ def save_round_results_csv(
 
             row = {
                 "round_id": int(item.round_id),
-                "selected_clients": " ".join(
-                    str(client_id) for client_id in item.selected_clients
+                "selected_clients": json.dumps(
+                    list(item.selected_clients),
+                    ensure_ascii=False,
                 ),
                 "avg_train_loss": train_metrics.get(
                     "avg_train_loss",
