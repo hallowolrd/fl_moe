@@ -299,11 +299,6 @@ METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
     "orthogonal": {
         "stiefel_blocks": DEFAULT_STIEFEL_BLOCKS,
     },
-    "rfedags": {
-        # None: follow local_epochs; all clients must consequently execute
-        # the same number of batches. Set a positive integer to use fixed K.
-        "local_steps": None,
-    },
     "agg": {
         "non_expert": {"method": "uniform"},
         "expert": {"method": ALGORITHM_NAME},
@@ -400,13 +395,15 @@ def validate_method_config(cfg: Mapping[str, Any]) -> None:
             "rfedags_orthogonal 要求 orthogonal.stiefel_blocks 是非空 mapping。"
         )
 
-    local_steps = _cfg_get(cfg, "rfedags.local_steps", None)
-    if local_steps is not None:
-        _validate_positive_int(local_steps, "rfedags.local_steps")
-    else:
-        _validate_positive_int(
-            _cfg_get(cfg, "local_epochs", 5),
-            "local_epochs",
+    legacy_rfedags_cfg = _cfg_get(cfg, "rfedags", {})
+    if (
+        isinstance(legacy_rfedags_cfg, Mapping)
+        and legacy_rfedags_cfg.get("local_steps") is not None
+    ):
+        raise ValueError(
+            "rfedags.local_steps 已迁移为通用顶层配置 local_steps；"
+            "请将 YAML 中的 rfedags.local_steps 改为 local_steps，"
+            "或使用命令行参数 --local-steps。"
         )
 
 
@@ -500,7 +497,6 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
         self.cfg = cfg
         self.client_id = int(client_id)
         self.lr = float(_cfg_get(cfg, "optimizer.lr", 0.01))
-        self.configured_local_steps = _cfg_get(cfg, "rfedags.local_steps", None)
 
         self._parameter_map: Dict[str, torch.nn.Parameter] = {}
         self._expert_names: list[str] = []
@@ -582,17 +578,6 @@ class RFedAGSOrthogonalClientStrategy(base.ExpertClientTrainingStrategy):
             set(groups.expert_state_names) - all_parameter_names
         )
         self._local_steps = 0
-
-    def local_step_limit(
-        self,
-        context: base.ExpertClientTrainContext,
-    ) -> Optional[int]:
-        if self.configured_local_steps is None:
-            return None
-        return _validate_positive_int(
-            self.configured_local_steps,
-            "rfedags.local_steps",
-        )
 
     def step(self, context: base.ExpertClientBatchContext) -> None:
         model = context.train_context.model
@@ -873,8 +858,8 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             raise ValueError(
                 "RFedAGS 全客户端版本要求每个客户端执行相同的本地更新步数；"
                 f"当前各客户端步数：{local_steps_by_client}。"
-                "请设置统一的 rfedags.local_steps，或确保各客户端 DataLoader "
-                "具有相同 batch 数。"
+                "请设置统一的顶层 local_steps（命令行使用 --local-steps K），"
+                "或确保各客户端 DataLoader 具有相同 batch 数。"
             )
         local_steps = unique_local_steps.pop()
 
@@ -1031,25 +1016,6 @@ def build_expert_client_training_strategy(
     )
 
 
-def register_method_cli_arguments(parser: Any) -> None:
-    parser.add_argument(
-        "--rfedags-local-steps",
-        type=int,
-        default=None,
-        help=(
-            "RFedAGS 每个客户端每轮固定本地更新步数 K；"
-            "不指定时沿用 local_epochs。"
-        ),
-    )
-
-
-def build_method_cli_overrides(args: Any) -> Dict[str, Any]:
-    local_steps = getattr(args, "rfedags_local_steps", None)
-    if local_steps is None:
-        return {}
-    return {"rfedags": {"local_steps": int(local_steps)}}
-
-
 def main() -> int:
     return base.main(
         expert_aggregator_builder=build_expert_aggregator,
@@ -1057,8 +1023,6 @@ def main() -> int:
         expert_method_name=ALGORITHM_NAME,
         method_config_defaults=METHOD_CONFIG_DEFAULTS,
         method_config_validator=validate_method_config,
-        method_cli_argument_registrar=register_method_cli_arguments,
-        method_cli_overrides_builder=build_method_cli_overrides,
         expert_client_training_strategy_builder=(
             build_expert_client_training_strategy
         ),
