@@ -755,9 +755,9 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     生成 run_name 和 run_dir。
 
     规则：
-    1. run_name 缺失 / 为空 / auto / null 时，自动根据实验设置生成
-    2. 如果输出目录已存在，默认自动追加 _v2 / _v3
-    3. 如果 run.overwrite=True，则允许使用已有目录，不自动追加版本号
+    1. run_name 缺失 / 为空 / auto / null 时，直接使用专家聚合方法名。
+    2. 自动生成的名称始终保持唯一，目录已存在时追加 _v2 / _v3。
+    3. 手动指定 run_name 时，仍由 run.unique_name / run.overwrite 控制重名行为。
     """
     cfg = copy.deepcopy(cfg)
 
@@ -773,7 +773,9 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     unique_name = bool(cfg.get("run", {}).get("unique_name", True))
     overwrite = bool(cfg.get("run", {}).get("overwrite", False))
 
-    if unique_name and not overwrite:
+    # 自动生成的名称始终唯一，不受 unique_name / overwrite 开关影响。
+    # 手动指定的名称保留原有行为。
+    if should_auto_name or (unique_name and not overwrite):
         run_name = _make_unique_run_name(run_name, output_dir)
 
     cfg["run_name"] = run_name
@@ -799,67 +801,20 @@ def _is_auto_run_name(value: Any) -> bool:
 
 def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     """
-    根据关键实验设置自动生成实验名。
+    自动实验名称只使用专家聚合方法名。
 
-    文件夹名只放关键字段，详细参数会保存到 config_used.yaml。
+    完整实验参数统一保存在 config_used.yaml 中。
     """
-    dataset = _safe_name(cfg.get("dataset", "dataset"))
-    num_clients = _safe_name(cfg.get("num_clients", "c"))
-    partition_cfg = cfg.get("partition", {})
-    partition_method = str(partition_cfg.get("method", "dirichlet")).lower()
-    dirichlet_cfg = partition_cfg.get("dirichlet", {})
-    sample_balance = (
-        dirichlet_cfg.get("sample_balance", "balanced")
-        if partition_method == "dirichlet"
-        else "na"
-    )
-    alpha = _safe_name(
-        dirichlet_cfg.get("alpha", "na")
-        if partition_method == "dirichlet"
-        else "na"
-    )
-    partition_method = _safe_name(partition_method)
-    sample_balance = _safe_name(sample_balance)
-    model = _safe_name(cfg.get("model", "model"))
-    model_cfg = cfg.get("model_cfg", {})
-    backbone = _safe_name(
-        model_cfg.get("backbone", "backbone")
-        if isinstance(model_cfg, Mapping)
-        else "backbone"
-    )
-    num_experts = _safe_name(cfg.get("num_experts", "e"))
-    topk = _safe_name(cfg.get("topk", "topk"))
-    rounds = _safe_name(cfg.get("rounds", "r"))
-    local_steps = cfg.get("local_steps", None)
-    if local_steps is None:
-        local_training_suffix = f"_ep{_safe_name(cfg.get('local_epochs', 'ep'))}"
-    else:
-        local_training_suffix = f"_st{_safe_name(local_steps)}"
-    seed = _safe_name(cfg.get("seed", "seed"))
-
     agg_cfg = cfg.get("agg", {})
-    non_expert_method = _safe_name(
-        agg_cfg.get("non_expert", {}).get("method", "non_expert")
-    )
-    expert_method = _safe_name(
-        agg_cfg.get("expert", {}).get("method", "expert")
-    )
+    expert_cfg = agg_cfg.get("expert", {})
+    expert_method = expert_cfg.get("method", "expert")
 
-    return (
-        f"{dataset}"
-        f"_c{num_clients}"
-        f"_p{partition_method}_{sample_balance}"
-        f"_a{alpha}"
-        f"_{model}"
-        f"_bb{backbone}"
-        f"_e{num_experts}"
-        f"_top{topk}"
-        f"_r{rounds}"
-        f"{local_training_suffix}"
-        f"_ne{non_expert_method}"
-        f"_ex{expert_method}"
-        f"_s{seed}"
-    )
+    if not isinstance(expert_method, str) or not expert_method.strip():
+        raise ConfigError(
+            "自动生成 run_name 时，agg.expert.method 必须是非空字符串。"
+        )
+
+    return _safe_name(expert_method)
 
 
 def _safe_name(value: Any) -> str:
