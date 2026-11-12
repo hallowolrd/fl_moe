@@ -755,13 +755,13 @@ def save_config(
 
     # Separate top-level sections with a blank line for readability.
     yaml_text = re.sub(
-        r"\\n(?=[A-Za-z_][A-Za-z0-9_]*:\\n)",
+        r"\n(?=[A-Za-z_][A-Za-z0-9_]*:\n)",
         "\\n\\n",
         yaml_text,
     )
 
     with output_path.open("w", encoding="utf-8") as f:
-        f.write("# 实验记录文件：仅用于查看，不作为训练输入配置。\\n\\n")
+        f.write("# 实验记录文件：仅用于查看，不作为训练输入配置。\n\n")
         f.write(yaml_text)
 
 
