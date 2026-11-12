@@ -132,6 +132,11 @@ def _build_stiefel_parameter_blocks(
     """
     if block_config is None:
         block_config = {}
+    elif isinstance(block_config, base.ConfigNode):
+        # ConfigNode is the framework's nested config wrapper, not a Mapping.
+        # Convert it at this algorithm boundary so the block parser receives
+        # the same plain-dict structure as it does from YAML validation.
+        block_config = block_config.to_dict()
     if not isinstance(block_config, Mapping):
         raise TypeError("orthogonal.stiefel_blocks 必须是 mapping。")
 
