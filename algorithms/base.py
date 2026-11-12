@@ -770,20 +770,65 @@ def save_config(
         f.write(yaml_text)
 
 
+# Files owned by the experiment runner inside each run directory.
+# User-created files are deliberately not removed during overwrite.
+RUN_OUTPUT_FILENAMES = (
+    "train.log",
+    "config_used.yaml",
+    "partition_summary.json",
+    "summary.json",
+    "results.csv",
+)
+
+
 def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
     """
-    创建实验输出目录，并返回 Path。
-
-    注意：
-    load_config 只负责生成 run_dir 字段；
-    真正创建目录放在这里，避免读取配置时产生太多副作用。
+    Create the experiment directory and reset framework-owned outputs when
+    run.overwrite=True. Files not owned by the runner are preserved.
     """
     if isinstance(cfg, ConfigNode):
         run_dir = Path(cfg.run_dir)
+        overwrite = cfg.get("run.overwrite", False)
     else:
         run_dir = Path(cfg["run_dir"])
+        run_cfg = cfg.get("run", {})
+        if not isinstance(run_cfg, Mapping):
+            raise ConfigError("run 必须是 dict。")
+        overwrite = run_cfg.get("overwrite", False)
+
+    if not isinstance(overwrite, bool):
+        raise ConfigError(
+            "run.overwrite 必须是布尔值，"
+            f"当前值：{overwrite!r}"
+        )
 
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    if overwrite:
+        output_paths = [
+            run_dir / filename
+            for filename in RUN_OUTPUT_FILENAMES
+        ]
+
+        # Preflight before deleting anything. A directory at a reserved output
+        # path is unexpected and must not be recursively removed.
+        invalid_paths = [
+            path
+            for path in output_paths
+            if path.exists()
+            and not path.is_file()
+            and not path.is_symlink()
+        ]
+        if invalid_paths:
+            raise ConfigError(
+                "以下实验输出路径存在但不是普通文件，拒绝覆盖："
+                + ", ".join(str(path) for path in invalid_paths)
+            )
+
+        for path in output_paths:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+
     return run_dir
 
 
@@ -992,13 +1037,39 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
         run_name = _safe_name(raw_run_name)
 
     output_dir = Path(cfg.get("output_dir", "outputs_bias"))
-    unique_name = bool(cfg.get("run", {}).get("unique_name", True))
-    overwrite = bool(cfg.get("run", {}).get("overwrite", False))
+    run_cfg = cfg.get("run", {})
+    if not isinstance(run_cfg, Mapping):
+        raise ConfigError("run 必须是 dict。")
+
+    unique_name = run_cfg.get("unique_name", True)
+    overwrite = run_cfg.get("overwrite", False)
+
+    if not isinstance(unique_name, bool):
+        raise ConfigError(
+            "run.unique_name 必须是布尔值，"
+            f"当前值：{unique_name!r}"
+        )
+    if not isinstance(overwrite, bool):
+        raise ConfigError(
+            "run.overwrite 必须是布尔值，"
+            f"当前值：{overwrite!r}"
+        )
 
     # 自动生成的名称始终唯一，不受 unique_name / overwrite 开关影响。
-    # 手动指定的名称保留原有行为。
+    # 手动指定名称时：
+    # - unique_name=True 且 overwrite=False：追加版本号。
+    # - overwrite=True：复用原目录，后续由 ensure_run_dir 清理旧产物。
+    # - unique_name=False 且 overwrite=False：目录已存在则拒绝静默复用。
     if should_auto_name or (unique_name and not overwrite):
         run_name = _make_unique_run_name(run_name, output_dir)
+    elif not unique_name and not overwrite:
+        existing_run_dir = output_dir / run_name
+        if existing_run_dir.exists():
+            raise ConfigError(
+                f"实验目录已存在：{existing_run_dir}。"
+                "请启用 run.overwrite，或启用 run.unique_name "
+                "让框架自动创建新的实验目录。"
+            )
 
     cfg["run_name"] = run_name
     cfg["run_dir"] = str(output_dir / run_name)
@@ -1637,8 +1708,10 @@ def tee_output_to_file(
     old_stdout = sys.stdout
     old_stderr = sys.stderr
 
+    # Each training invocation starts a fresh log. In particular, this
+    # prevents stale output from a reused/overwritten run directory.
     with log_path.open(
-        "a",
+        "w",
         encoding="utf-8",
         buffering=1,
     ) as log_file:
