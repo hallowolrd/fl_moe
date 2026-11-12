@@ -55,4 +55,9 @@ python algorithms/fedavg_orthogonal.py --dataset cifar10 --backbone resnet_cifar
 RFedAGS 正交专家聚合：
 \`\`\`bash
 python algorithms/rfedags_orthogonal.py --dataset cifar10 --backbone resnet_cifar --local-steps 5
+
+本地训练预算（所有算法通用）：
+- 默认按 Epoch 训练：`local_epochs: 5`、`local_steps: null`。
+- 固定本地更新次数：增加命令行参数 `--local-steps 100`，该设置优先于 `local_epochs`。
+- Epoch 模式要求本轮参与客户端的 DataLoader batch 数一致；使用不平衡样本量划分时，建议设置统一的 `--local-steps K`。
 \`\`\`
