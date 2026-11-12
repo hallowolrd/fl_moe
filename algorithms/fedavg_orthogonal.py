@@ -18,6 +18,11 @@ from typing import Any, Dict, Iterable, Sequence, Tuple
 
 import torch
 
+from orthogonal_diagnostics import (
+    build_stiefel_orthogonality_diagnostics,
+    stiefel_orthogonality_error as _stiefel_orthogonality_error,
+)
+
 
 @dataclass(frozen=True)
 class _StiefelParameterBlock:
@@ -224,27 +229,6 @@ def _build_stiefel_parameter_blocks(
     return result
 
 
-def _stiefel_orthogonality_error(point: torch.Tensor) -> float:
-    """Return ||X.T X - I||_F in a numerically safe accumulation dtype."""
-    work = (
-        point.float()
-        if point.dtype in (torch.float16, torch.bfloat16)
-        else point
-    )
-    identity = torch.eye(
-        work.shape[1],
-        device=work.device,
-        dtype=work.dtype,
-    )
-    return float(
-        torch.linalg.norm(
-            work.transpose(0, 1) @ work - identity,
-            ord="fro",
-        ).item()
-    )
-
-
-
 ALGORITHM_NAME = "fedavg_orthogonal"
 
 DEFAULT_STIEFEL_BLOCKS = {
@@ -421,6 +405,18 @@ class FedAvgOrthogonalExpertAggregator(base.Aggregator):
         for block in self._blocks_for_model(model).values():
             block.retract_(parameter_map)
 
+    @torch.no_grad()
+    def build_post_aggregate_diagnostics(
+        self,
+        model: torch.nn.Module,
+    ) -> Dict[str, Any]:
+        return {
+            "orthogonality": build_stiefel_orthogonality_diagnostics(
+                model=model,
+                blocks=self._blocks_for_model(model),
+            )
+        }
+
     def build_diagnostics(
         self,
         client_updates: Sequence[base.ClientUpdate],
@@ -432,15 +428,6 @@ class FedAvgOrthogonalExpertAggregator(base.Aggregator):
             weights=weights,
             param_names=param_names,
         )
-        block_info: Dict[str, Any] = {}
-        if self.method_context is not None and self.method_context.global_model is not None:
-            model = self.method_context.global_model
-            for name, block in self._blocks_for_model(model).items():
-                block_info[name] = {
-                    "parameter_names": list(block.parameter_names),
-                    "shape": list(block.shape),
-                }
-
         diagnostics.update(
             {
                 "aggregation_rule": "client_uniform",
@@ -453,7 +440,6 @@ class FedAvgOrthogonalExpertAggregator(base.Aggregator):
                     "after_server_expert_aggregation",
                 ],
                 "server_retraction_hook": "algorithm_owned_after_aggregate",
-                "stiefel_blocks": block_info,
             }
         )
         return diagnostics

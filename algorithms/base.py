@@ -5231,7 +5231,7 @@ class AggregationResult:
     # num_clients
     # total_samples
     # param_group
-    # param_count
+    # num_state_entries: selected state_dict entries, including buffers
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
@@ -6834,6 +6834,13 @@ class Aggregator(ABC):
     def after_aggregate(self, model: nn.Module) -> None:
         """Apply algorithm-owned post-aggregation operations, if required."""
 
+    def build_post_aggregate_diagnostics(
+        self,
+        model: nn.Module,
+    ) -> Dict[str, Any]:
+        """Build diagnostics from the server model after after_aggregate."""
+        return {}
+
     @property
     @abstractmethod
     def method_name(self) -> str:
@@ -6963,29 +6970,23 @@ class Aggregator(ABC):
         weights: Mapping[int, float],
         param_names: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
-        """
-        构建聚合诊断信息。
+        """Build common, algorithm-independent aggregation diagnostics.
 
-        这些信息后面会写入日志，方便确认：
-            1. 当前用的是什么聚合方法
-            2. 聚合的是 expert 还是 non_expert
-            3. 有多少客户端参与
-            4. 每个客户端权重是多少
+        The weights argument remains in the signature for compatibility with
+        aggregator implementations, but canonical weights are stored only in
+        AggregationResult.weights. num_state_entries counts selected state_dict
+        entries, including buffers; it is not a trainable-parameter count.
         """
-        param_count = None
-
-        if param_names is not None:
-            param_count = len(list(param_names))
+        _ = weights
+        num_state_entries = (
+            len(list(param_names)) if param_names is not None else None
+        )
 
         return {
             "method": self.method_name,
             "param_group": self.param_group_name,
             "num_clients": len(client_updates),
-            "param_count": param_count,
-            "weights": {
-                int(client_id): float(weight)
-                for client_id, weight in weights.items()
-            },
+            "num_state_entries": num_state_entries,
         }
 
     def _validate_client_updates(
@@ -7635,6 +7636,37 @@ class FLServer:
         self.aggregators.expert.after_aggregate(self.global_model)
         check_finite_state_dict(self.global_model.state_dict())
 
+        # Collect diagnostics only after the final server model state has
+        # been loaded and all algorithm-owned post-aggregation operations ran.
+        post_diagnostics = (
+            self.aggregators.expert.build_post_aggregate_diagnostics(
+                self.global_model,
+            )
+        )
+        if not isinstance(post_diagnostics, Mapping):
+            raise TypeError(
+                "build_post_aggregate_diagnostics() 必须返回 Mapping，"
+                f"当前类型：{type(post_diagnostics).__name__}"
+            )
+        if post_diagnostics:
+            current_diagnostics = expert_result.diagnostics
+            if not isinstance(current_diagnostics, Mapping):
+                raise TypeError(
+                    "AggregationResult.diagnostics 必须是 Mapping，"
+                    f"当前类型：{type(current_diagnostics).__name__}"
+                )
+            duplicate_keys = (
+                set(current_diagnostics).intersection(post_diagnostics)
+            )
+            if duplicate_keys:
+                raise ValueError(
+                    "聚合前诊断与聚合后诊断存在重复字段："
+                    f"{sorted(str(key) for key in duplicate_keys)}"
+                )
+            merged_diagnostics = dict(current_diagnostics)
+            merged_diagnostics.update(dict(post_diagnostics))
+            expert_result.diagnostics = merged_diagnostics
+
         self.global_model.to("cpu")
 
         return {
@@ -7896,7 +7928,7 @@ class FLServer:
                 f"round={round_result.round_id} "
                 f"method={agg_info.get('method', 'unknown')} "
                 f"clients={agg_info.get('num_clients', 'unknown')} "
-                f"params={agg_info.get('param_count', 'unknown')} "
+                f"state_entries={agg_info.get('num_state_entries', 'unknown')} "
                 f"weights={weights_text}"
             )
 
@@ -8005,7 +8037,7 @@ class FLServer:
                     "method": "uniform",
                     "param_group": "expert",
                     "num_clients": 10,
-                    "param_count": 16,
+                    "num_state_entries": 16,
                     ...
                 }
             }
@@ -8022,7 +8054,7 @@ class FLServer:
                 "method": "unknown",
                 "param_group": group_name,
                 "num_clients": "unknown",
-                "param_count": "unknown",
+                "num_state_entries": "unknown",
                 "weights": None,
                 "raw_summary": summary,
             }
@@ -8052,9 +8084,15 @@ class FLServer:
                 ),
             ),
         )
-        param_count = diagnostics.get(
-            "param_count",
-            summary.get("param_count", "unknown"),
+        num_state_entries = diagnostics.get(
+            "num_state_entries",
+            diagnostics.get(
+                "param_count",
+                summary.get(
+                    "num_state_entries",
+                    summary.get("param_count", "unknown"),
+                ),
+            ),
         )
 
         weights = None
@@ -8084,7 +8122,7 @@ class FLServer:
             "method": method,
             "param_group": param_group,
             "num_clients": num_clients,
-            "param_count": param_count,
+            "num_state_entries": num_state_entries,
             "weights": weights,
             "diagnostics": dict(diagnostics),
         }

@@ -21,6 +21,11 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 
+from orthogonal_diagnostics import (
+    build_stiefel_orthogonality_diagnostics,
+    stiefel_orthogonality_error as _stiefel_orthogonality_error,
+)
+
 
 @dataclass(frozen=True)
 class _StiefelParameterBlock:
@@ -255,27 +260,6 @@ def _stiefel_project_tangent(
     xtg = x.transpose(0, 1) @ g
     sym_xtg = 0.5 * (xtg + xtg.transpose(0, 1))
     return (g - x @ sym_xtg).to(dtype=point.dtype)
-
-
-def _stiefel_orthogonality_error(point: torch.Tensor) -> float:
-    """Return ||X.T X - I||_F in a numerically safe accumulation dtype."""
-    work = (
-        point.float()
-        if point.dtype in (torch.float16, torch.bfloat16)
-        else point
-    )
-    identity = torch.eye(
-        work.shape[1],
-        device=work.device,
-        dtype=work.dtype,
-    )
-    return float(
-        torch.linalg.norm(
-            work.transpose(0, 1) @ work - identity,
-            ord="fro",
-        ).item()
-    )
-
 
 
 ALGORITHM_NAME = "rfedags_orthogonal"
@@ -707,6 +691,18 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
         )
 
     @torch.no_grad()
+    def build_post_aggregate_diagnostics(
+        self,
+        model: torch.nn.Module,
+    ) -> Dict[str, Any]:
+        return {
+            "orthogonality": build_stiefel_orthogonality_diagnostics(
+                model=model,
+                blocks=self._blocks_for_model(model),
+            )
+        }
+
+    @torch.no_grad()
     def initialize_model(self, model: torch.nn.Module) -> None:
         parameter_map = dict(model.named_parameters())
         for block in self._blocks_for_model(model).values():
@@ -972,30 +968,41 @@ class RFedAGSOrthogonalAggregator(base.Aggregator):
             )
         base.check_finite_state_dict(new_state_dict)
 
-        stiefel_diagnostics: Dict[str, Any] = {}
-        for name, block in blocks.items():
-            point = block.get_point(copy_parameters)
-            stiefel_diagnostics[name] = {
-                "shape": list(block.shape),
-                "parameter_names": list(block.parameter_names),
-                "tangent_relative_residual": tangent_residuals[name],
-                "orthogonality_error": _stiefel_orthogonality_error(point),
+        diagnostic_param_names = (
+            list(param_names)
+            if param_names is not None
+            else sorted(expected_state_names)
+        )
+        diagnostics = self.build_diagnostics(
+            client_updates=client_updates,
+            weights=weights,
+            param_names=diagnostic_param_names,
+        )
+        diagnostics.update(
+            {
+                "aggregation_rule": "client_uniform",
+                "client_participation": "all_clients",
+                "gradient_stream": "sum_of_negative_local_update_vectors",
+                "local_steps": int(local_steps),
+                "num_euclidean_expert_parameters": len(euclidean_names),
+                "manifold_diagnostics": {
+                    "stiefel_tangent": {
+                        "metric": "relative_frobenius_norm",
+                        "measurement_stage": "aggregated_stream_at_round_start_point",
+                        "blocks": {
+                            name: {
+                                "tangent_relative_residual": float(
+                                    tangent_residuals[name]
+                                )
+                            }
+                            for name in blocks
+                        },
+                    }
+                },
+                "vector_transport": "Stiefel tangent projection to round-start point",
+                "server_retraction": "algorithm_owned_QR",
             }
-
-        diagnostics = {
-            "aggregation_rule": "client_uniform",
-            "client_participation": "all_clients",
-            "gradient_stream": "sum_of_negative_local_update_vectors",
-            "local_steps": int(local_steps),
-            "num_euclidean_expert_parameters": len(euclidean_names),
-            "stiefel_blocks": stiefel_diagnostics,
-            "vector_transport": "Stiefel tangent projection to round-start point",
-            "server_retraction": "algorithm_owned_QR",
-            "weights": {
-                int(client_id): float(weight)
-                for client_id, weight in weights.items()
-            },
-        }
+        )
 
         return base.AggregationResult(
             new_state_dict=new_state_dict,
