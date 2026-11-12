@@ -5,12 +5,17 @@ cd /home/cjq/Project/clean
 conda activate fl_moe
 
 单个实验运行命令
-CUDA_VISIBLE_DEVICES=0 python algorithms/uniform.py \
+CUDA_VISIBLE_DEVICES=1 python algorithms/uniform.py \
   --dataset cifar10 \
+  --dirichlet-sample-balance balanced \
   --backbone resnet_cifar \
   --model sparse_moe_classifier \
   --moe-hidden-dim 128 \
-  --output-dir two_exp/new_moe_yes_fedavg
+  --lr 0.01 \
+  --momentum 0 \
+  --weight-decay 0 \
+  --data-augmentation \
+  --output-dir three01_exp/
 
 折线图运行命令
 python tools/paper_draw.py \
