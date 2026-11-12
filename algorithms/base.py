@@ -7238,6 +7238,30 @@ class FLServer:
                     seed=seed,
                 )
 
+                # Epoch 模式下，每个客户端的实际更新次数由 DataLoader 长度决定。
+                # 在开始本轮本地训练前先检查，避免完成昂贵训练后才发现步数不一致。
+                if _cfg_get(self.cfg, "local_steps", None) is None:
+                    local_epochs = int(_cfg_get(self.cfg, "local_epochs", 5))
+                    planned_steps_by_client = {
+                        int(client.client_id): (
+                            local_epochs * len(client.train_loader)
+                        )
+                        for client in selected_clients
+                    }
+                    if len(set(planned_steps_by_client.values())) != 1:
+                        raise ValueError(
+                            "当前使用 Epoch 本地训练模式，但参与客户端的预计更新次数不一致："
+                            f"{planned_steps_by_client}。"
+                            "请设置统一的顶层 local_steps（命令行使用 --local-steps K），"
+                            "或使用 sample_balance=balanced 使各客户端 DataLoader "
+                            "具有相同 batch 数。"
+                        )
+                    if any(step_count <= 0 for step_count in planned_steps_by_client.values()):
+                        raise ValueError(
+                            "Epoch 本地训练模式下，参与客户端必须至少有一个训练 batch；"
+                            f"当前预计更新次数：{planned_steps_by_client}。"
+                        )
+
                 client_updates: List[ClientUpdate] = []
 
                 # 逐客户端训练，保证每完成一个客户端本地训练就更新一次总进度条。
