@@ -5484,6 +5484,7 @@ class FLClient:
                 optimizer=optimizer,
                 device=self.device,
                 local_epochs=local_epochs,
+                local_steps=local_steps,
                 grad_clip=grad_clip,
                 client_id=self.client_id,
                 round_id=int(round_id),
