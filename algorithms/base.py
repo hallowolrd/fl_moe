@@ -5252,7 +5252,11 @@ class RoundResult:
     """
     每一轮联邦训练结束后的结果摘要。
 
-    这个结构主要用于日志、results.csv、后续实验分析。
+    各类数据按职责分别保存：
+        train_metrics: 客户端本地训练指标的样本数加权平均。
+        test_metrics: 服务器全局模型的测试集指标。
+        aggregation_info: non_expert / expert 聚合结果与算法诊断。
+        client_diagnostics: 每个客户端的完整轻量诊断信息。
     """
 
     # 当前轮数
@@ -5261,33 +5265,31 @@ class RoundResult:
     # 本轮参与训练的客户端编号
     selected_clients: List[int]
 
-    # 测试集 loss
-    test_loss: float
+    # 客户端本地训练指标的加权平均
+    train_metrics: Dict[str, Optional[float]]
 
-    # 测试集准确率
-    test_acc: float
+    # 服务器全局模型测试指标
+    test_metrics: Dict[str, float]
 
     # 当前历史最佳准确率
     best_acc: float
 
-    # 本轮客户端训练指标摘要
-    client_metrics: Dict[int, Dict[str, float]] = field(default_factory=dict)
-
-    # 本轮聚合信息摘要
+    # 本轮聚合信息摘要，不包含客户端诊断和训练指标
     aggregation_info: Dict[str, Any] = field(default_factory=dict)
 
+    # 每个客户端的完整轻量诊断信息
+    client_diagnostics: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
-        """
-        转成普通 dict，方便写 json / csv。
-        """
+        """转换为用于 summary.json 的普通字典。"""
         return {
             "round_id": int(self.round_id),
             "selected_clients": list(self.selected_clients),
-            "test_loss": float(self.test_loss),
-            "test_acc": float(self.test_acc),
+            "train_metrics": dict(self.train_metrics),
+            "test_metrics": dict(self.test_metrics),
             "best_acc": float(self.best_acc),
-            "client_metrics": self.client_metrics,
-            "aggregation_info": self.aggregation_info,
+            "aggregation_info": dict(self.aggregation_info),
+            "client_diagnostics": dict(self.client_diagnostics),
         }
 
 
@@ -5315,16 +5317,24 @@ class TrainState:
     # method-specific running state
     extra: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(
+        self,
+        include_best_metrics: bool = True,
+    ) -> Dict[str, Any]:
         """
-        转成普通 dict，方便写入训练摘要。
+        转成普通 dict。
+
+        include_best_metrics=False 时，仅输出运行状态和额外状态，
+        避免 ServerTrainResult 顶层与嵌套 train_state 重复保存最佳指标。
         """
-        return {
+        result = {
             "round_id": int(self.round_id),
-            "best_acc": float(self.best_acc),
-            "best_round": int(self.best_round),
-            "extra": self.extra,
         }
+        if include_best_metrics:
+            result["best_acc"] = float(self.best_acc)
+            result["best_round"] = int(self.best_round)
+        result["extra"] = self.extra
+        return result
 
 
 def average_client_metric(
@@ -5390,31 +5400,6 @@ def average_client_metric(
         return default
 
     return sum(value * weight for value, weight in values) / total_weight
-
-
-def collect_client_metrics(
-    client_updates: List[ClientUpdate],
-) -> Dict[int, Dict[str, float]]:
-    """
-    把客户端训练指标整理成 dict。
-
-    输出格式：
-        {
-            client_id: {
-                "train_loss": ...,
-                "train_acc": ...,
-                "num_batches": ...
-            }
-        }
-
-    注意：
-        这里只收集 metrics，不包含 num_samples / expert_usage。
-        如果需要更完整的诊断信息，请使用 collect_client_diagnostics()。
-    """
-    return {
-        int(update.client_id): dict(update.metrics)
-        for update in client_updates
-    }
 
 
 # ============================================================================
@@ -7146,21 +7131,29 @@ class ServerTrainResult:
 
     round_results: List[RoundResult]
     train_state: TrainState
-    best_acc: float
-    best_round: int
+
+    @property
+    def best_acc(self) -> float:
+        """最终最佳准确率的唯一数据源为 TrainState。"""
+        return float(self.train_state.best_acc)
+
+    @property
+    def best_round(self) -> int:
+        """最终最佳轮次的唯一数据源为 TrainState。"""
+        return int(self.train_state.best_round)
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        转成普通 dict，方便后续保存日志。
-        """
+        """转换为最终实验摘要，最佳指标只在顶层保存一次。"""
         return {
-            "best_acc": float(self.best_acc),
-            "best_round": int(self.best_round),
+            "best_acc": self.best_acc,
+            "best_round": self.best_round,
             "round_results": [
                 item.to_dict()
                 for item in self.round_results
             ],
-            "train_state": self.train_state.to_dict(),
+            "train_state": self.train_state.to_dict(
+                include_best_metrics=False,
+            ),
         }
 
 
@@ -7560,8 +7553,6 @@ class FLServer:
         return ServerTrainResult(
             round_results=list(self.round_results),
             train_state=self.train_state,
-            best_acc=float(self.train_state.best_acc),
-            best_round=int(self.train_state.best_round),
         )
 
     def aggregate_client_updates(
@@ -7722,25 +7713,25 @@ class FLServer:
             default=None,
         )
 
-        full_aggregation_info = dict(aggregation_info)
-        full_aggregation_info["avg_train_loss"] = avg_train_loss
-        full_aggregation_info["avg_train_acc"] = avg_train_acc
-
-        # 保存每个客户端的轻量诊断信息。
-        # 注意：这里不保存 model_delta，也不保存 method_evidence 原始矩阵，
-        # 避免 summary.json / train.log 过大。
-        full_aggregation_info["client_diagnostics"] = (
-            self._build_client_diagnostics(client_updates)
-        )
+        # 不同职责的数据分别存储，aggregation_info 只包含聚合结果与诊断。
+        train_metrics = {
+            "avg_train_loss": avg_train_loss,
+            "avg_train_acc": avg_train_acc,
+        }
+        test_metrics = {
+            "test_loss": float(eval_result.loss),
+            "test_acc": float(eval_result.acc),
+        }
+        client_diagnostics = self._build_client_diagnostics(client_updates)
 
         return RoundResult(
             round_id=int(round_id),
             selected_clients=selected_client_ids,
-            test_loss=float(eval_result.loss),
-            test_acc=float(eval_result.acc),
+            train_metrics=train_metrics,
+            test_metrics=test_metrics,
             best_acc=float(self.train_state.best_acc),
-            client_metrics=collect_client_metrics(list(client_updates)),
-            aggregation_info=full_aggregation_info,
+            aggregation_info=dict(aggregation_info),
+            client_diagnostics=client_diagnostics,
         )
 
     def print_startup_summary(self) -> None:
@@ -7799,11 +7790,11 @@ class FLServer:
         这部分适合控制台实时观察，所以尽量短。
         因为 train.py 使用 tee 输出，所以这一行也会进入 train.log。
         """
-        avg_train_loss = round_result.aggregation_info.get(
+        avg_train_loss = round_result.train_metrics.get(
             "avg_train_loss",
             None,
         )
-        avg_train_acc = round_result.aggregation_info.get(
+        avg_train_acc = round_result.train_metrics.get(
             "avg_train_acc",
             None,
         )
@@ -7822,8 +7813,8 @@ class FLServer:
             f"[Round {round_result.round_id:03d}] "
             f"train_loss={avg_train_loss_text} | "
             f"train_acc={avg_train_acc_text} | "
-            f"test_loss={round_result.test_loss:.4f} | "
-            f"test_acc={round_result.test_acc:.2f}% | "
+            f"test_loss={round_result.test_metrics['test_loss']:.4f} | "
+            f"test_acc={round_result.test_metrics['test_acc']:.2f}% | "
             f"best_acc={round_result.best_acc:.2f}%"
         )
 
@@ -7836,11 +7827,11 @@ class FLServer:
 
         详细日志行为固定：记录整体指标、参与客户端、聚合权重和客户端诊断表。
         """
-        avg_train_loss = round_result.aggregation_info.get(
+        avg_train_loss = round_result.train_metrics.get(
             "avg_train_loss",
             None,
         )
-        avg_train_acc = round_result.aggregation_info.get(
+        avg_train_acc = round_result.train_metrics.get(
             "avg_train_acc",
             None,
         )
@@ -7860,8 +7851,8 @@ class FLServer:
             f"round={round_result.round_id} "
             f"train_loss={avg_train_loss_text} "
             f"train_acc={avg_train_acc_text} "
-            f"test_loss={round_result.test_loss:.4f} "
-            f"test_acc={round_result.test_acc:.2f}% "
+            f"test_loss={round_result.test_metrics['test_loss']:.4f} "
+            f"test_acc={round_result.test_metrics['test_acc']:.2f}% "
             f"best_acc={round_result.best_acc:.2f}%"
         )
 
@@ -7946,10 +7937,7 @@ class FLServer:
             4. expert 聚合权重
             5. expert_usage
         """
-        client_diagnostics = round_result.aggregation_info.get(
-            "client_diagnostics",
-            {},
-        )
+        client_diagnostics = round_result.client_diagnostics
         if not isinstance(client_diagnostics, Mapping):
             return
 
@@ -9050,23 +9038,24 @@ def save_round_results_csv(
         writer.writeheader()
 
         for item in round_results:
-            aggregation_info = item.aggregation_info
+            train_metrics = item.train_metrics
+            test_metrics = item.test_metrics
 
             row = {
                 "round_id": int(item.round_id),
                 "selected_clients": " ".join(
                     str(client_id) for client_id in item.selected_clients
                 ),
-                "avg_train_loss": aggregation_info.get(
+                "avg_train_loss": train_metrics.get(
                     "avg_train_loss",
                     "",
                 ),
-                "avg_train_acc": aggregation_info.get(
+                "avg_train_acc": train_metrics.get(
                     "avg_train_acc",
                     "",
                 ),
-                "test_loss": float(item.test_loss),
-                "test_acc": float(item.test_acc),
+                "test_loss": float(test_metrics["test_loss"]),
+                "test_acc": float(test_metrics["test_acc"]),
                 "best_acc": float(item.best_acc),
             }
 
