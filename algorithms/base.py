@@ -585,6 +585,9 @@ def _build_config_record(
     model_cfg = as_mapping(raw.get("model_cfg"))
     if model_cfg.get("backbone") is not None:
         model_record["backbone"] = copy.deepcopy(model_cfg["backbone"])
+    for key in ("in_channels", "image_size"):
+        if key in model_cfg:
+            model_record[key] = copy.deepcopy(model_cfg[key])
 
     moe_record: Dict[str, Any] = {}
     hidden_dim = model_cfg.get(
@@ -669,9 +672,10 @@ def _build_config_record(
     if expert_cfg.get("method") is not None:
         aggregation_record["expert"] = copy.deepcopy(expert_cfg["method"])
 
-    # Method-owned geometry settings are included only when present.
+    # Include geometry settings only for an active orthogonal expert method.
+    expert_method_name = str(expert_cfg.get("method", "")).lower()
     orthogonal_cfg = as_mapping(raw.get("orthogonal"))
-    if orthogonal_cfg:
+    if orthogonal_cfg and "orthogonal" in expert_method_name:
         aggregation_record["orthogonal"] = copy.deepcopy(dict(orthogonal_cfg))
 
     if aggregation_record:
