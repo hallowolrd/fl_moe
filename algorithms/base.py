@@ -239,7 +239,8 @@ import threading
 import traceback
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 from typing import (
     Any,
     Callable,
@@ -8965,6 +8966,7 @@ def save_partition_summary(
             f,
             ensure_ascii=False,
             indent=2,
+            allow_nan=False,
         )
 
 
@@ -8992,6 +8994,7 @@ def save_train_outputs(
             f,
             ensure_ascii=False,
             indent=2,
+            allow_nan=False,
         )
 
     if save_csv:
@@ -9062,41 +9065,103 @@ def save_round_results_csv(
             writer.writerow(row)
 
 
-def make_json_safe(obj: Any) -> Any:
+def make_json_safe(obj: Any, path: str = "$") -> Any:
     """
-    把对象转换成 JSON 可保存格式。
+    递归转换为严格 JSON 可序列化的数据。
 
-    主要处理：
-        torch.Tensor
-        torch.device
-        Path
-        dict
-        list / tuple
+    支持：
+        Tensor / torch.device / torch.dtype
+        NumPy ndarray / scalar
+        Mapping / list / tuple / set / frozenset
+        Enum / dataclass / to_dict 对象
+        Path 和 JSON 基本类型
+
+    NaN / Inf 不会被静默替换为 null，而是抛出带字段路径的 ValueError，
+    避免实验数值异常在保存阶段被隐藏。
     """
+    if obj is None or isinstance(obj, (str, bool, int)):
+        return obj
+
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise ValueError(
+                f"JSON 数据在 {path} 处包含非有限浮点数：{obj!r}"
+            )
+        return obj
+
+    if isinstance(obj, Enum):
+        return make_json_safe(obj.value, path=path)
+
     if isinstance(obj, torch.Tensor):
-        if obj.numel() == 1:
-            return obj.item()
-        return obj.detach().cpu().tolist()
+        tensor = obj.detach().cpu()
+        if tensor.is_complex():
+            raise TypeError(
+                f"JSON 数据在 {path} 处包含复数 Tensor，无法直接序列化。"
+            )
+        if tensor.numel() == 1:
+            return make_json_safe(tensor.item(), path=path)
+        return make_json_safe(tensor.tolist(), path=path)
 
-    if isinstance(obj, torch.device):
+    if isinstance(obj, (torch.device, torch.dtype)):
         return str(obj)
 
     if isinstance(obj, Path):
         return str(obj)
 
-    if isinstance(obj, dict):
+    if isinstance(obj, np.ndarray):
+        return make_json_safe(obj.tolist(), path=path)
+
+    if isinstance(obj, np.generic):
+        return make_json_safe(obj.item(), path=path)
+
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return make_json_safe(obj.to_dict(), path=path)
+
+    if is_dataclass(obj) and not isinstance(obj, type):
         return {
-            str(key): make_json_safe(value)
-            for key, value in obj.items()
+            item.name: make_json_safe(
+                getattr(obj, item.name),
+                path=f"{path}.{item.name}",
+            )
+            for item in fields(obj)
         }
+
+    if isinstance(obj, Mapping):
+        result = {}
+        for key, value in obj.items():
+            safe_key = str(key)
+            if safe_key in result:
+                raise ValueError(
+                    f"JSON 数据在 {path} 处出现转换后重复的字典键：{safe_key!r}"
+                )
+            result[safe_key] = make_json_safe(
+                value,
+                path=f"{path}.{safe_key}",
+            )
+        return result
 
     if isinstance(obj, (list, tuple)):
         return [
-            make_json_safe(value)
-            for value in obj
+            make_json_safe(value, path=f"{path}[{index}]")
+            for index, value in enumerate(obj)
         ]
 
-    if hasattr(obj, "to_dict"):
-        return make_json_safe(obj.to_dict())
+    if isinstance(obj, (set, frozenset)):
+        safe_values = [
+            make_json_safe(value, path=f"{path}{{item}}")
+            for value in obj
+        ]
+        return sorted(
+            safe_values,
+            key=lambda value: json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            ),
+        )
 
-    return obj
+    raise TypeError(
+        f"JSON 数据在 {path} 处包含不支持的对象类型："
+        f"{type(obj).__module__}.{type(obj).__qualname__}"
+    )
