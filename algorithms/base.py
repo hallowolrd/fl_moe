@@ -421,6 +421,7 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "frac": 1.0,
     "rounds": 50,
     "local_epochs": 5,
+    "local_steps": None,
     "batch_size": 64,
     "test_batch_size": 64,
     "num_workers": 2,
@@ -839,7 +840,11 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
     num_experts = _safe_name(cfg.get("num_experts", "e"))
     topk = _safe_name(cfg.get("topk", "topk"))
     rounds = _safe_name(cfg.get("rounds", "r"))
-    local_epochs = _safe_name(cfg.get("local_epochs", "ep"))
+    local_steps = cfg.get("local_steps", None)
+    if local_steps is None:
+        local_training_suffix = f"_ep{_safe_name(cfg.get('local_epochs', 'ep'))}"
+    else:
+        local_training_suffix = f"_st{_safe_name(local_steps)}"
     seed = _safe_name(cfg.get("seed", "seed"))
 
     agg_cfg = cfg.get("agg", {})
@@ -860,7 +865,7 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
         f"_e{num_experts}"
         f"_top{topk}"
         f"_r{rounds}"
-        f"_ep{local_epochs}"
+        f"{local_training_suffix}"
         f"_ne{non_expert_method}"
         f"_ex{expert_method}"
         f"_s{seed}"
@@ -963,9 +968,15 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_positive_int(cfg, "num_classes")
     _require_positive_int(cfg, "num_clients")
     _require_positive_int(cfg, "rounds")
-    # 0 is valid only for expert strategies that provide a fixed local step limit.
-    # main() enforces that condition; the selected training path validates it again.
     _require_non_negative_int(cfg, "local_epochs")
+    local_steps = cfg.get("local_steps", None)
+    if local_steps is None:
+        if int(cfg.get("local_epochs", 0)) <= 0:
+            raise ConfigError(
+                "local_steps 未设置时，local_epochs 必须是正整数。"
+            )
+    else:
+        _require_positive_int(cfg, "local_steps")
     _require_positive_int(cfg, "batch_size")
     _require_positive_int(cfg, "test_batch_size")
     _require_non_negative_int(cfg, "num_workers")
@@ -5249,6 +5260,7 @@ class ExpertClientTrainContext:
     non_expert_optimizer: optim.Optimizer
     optimization_groups: FederatedOptimizationGroups
     local_epochs: int
+    local_steps: Optional[int]
     non_expert_grad_clip: Optional[float]
 
     @property
@@ -5314,18 +5326,6 @@ class ExpertClientTrainingStrategy(ABC):
 
     def on_train_start(self, context: ExpertClientTrainContext) -> None:
         """每个客户端每轮训练开始时调用，可用于初始化本轮状态。"""
-
-    def local_step_limit(
-        self,
-        context: ExpertClientTrainContext,
-    ) -> Optional[int]:
-        """
-        返回固定本地 batch 更新步数；返回 None 时沿用 local_epochs。
-
-        固定 K 步算法可以覆盖此方法。此模式下 local_epochs 可以设为 0。
-        达到 K 步后 DataLoader 会从头循环，保证每个客户端恰好执行 K 次本地更新。
-        """
-        return None
 
     @abstractmethod
     def step(self, context: ExpertClientBatchContext) -> None:
@@ -5440,6 +5440,11 @@ class FLClient:
 
         criterion = build_criterion(self.cfg)
         local_epochs = int(_cfg_get(self.cfg, "local_epochs", 5))
+        configured_local_steps = _cfg_get(self.cfg, "local_steps", None)
+        local_steps = (
+            None if configured_local_steps is None
+            else int(configured_local_steps)
+        )
         grad_clip = _get_grad_clip(self.cfg)
         algorithm_payload: Dict[str, Any] = {}
         optimization_groups: Optional[FederatedOptimizationGroups] = None
@@ -5457,6 +5462,7 @@ class FLClient:
                 optimizer=optimizer,
                 device=self.device,
                 local_epochs=local_epochs,
+                local_steps=local_steps,
                 grad_clip=grad_clip,
             )
         else:
@@ -5602,6 +5608,13 @@ class FLClient:
             extra={
                 "optimizer": get_optimizer_type(self.cfg),
                 "local_epochs": int(local_epochs),
+                "configured_local_steps": (
+                    int(local_steps) if local_steps is not None else None
+                ),
+                "local_training_mode": (
+                    "steps" if local_steps is not None else "epochs"
+                ),
+                "actual_local_steps": int(stats.num_batches),
                 "grad_clip": float(grad_clip) if grad_clip is not None else None,
                 "expert_training_strategy": (
                     self.expert_client_training_strategy.strategy_name
@@ -5626,6 +5639,75 @@ class FLClient:
         return update
 
 
+def _iter_local_training_batches(
+    train_loader: DataLoader,
+    local_epochs: int,
+    local_steps: Optional[int],
+):
+    """
+    统一生成本地训练 batch。
+
+    local_steps 非 None 时，严格生成 K 个 batch；DataLoader 耗尽后重新迭代。
+    local_steps 为 None 时，完整遍历 local_epochs 个 epoch。
+    """
+    if (
+        isinstance(local_epochs, bool)
+        or not isinstance(local_epochs, int)
+        or local_epochs < 0
+    ):
+        raise ValueError(
+            "local_epochs 必须是非负整数，"
+            f"当前值：{local_epochs!r}"
+        )
+
+    if local_steps is not None:
+        if (
+            isinstance(local_steps, bool)
+            or not isinstance(local_steps, int)
+            or local_steps <= 0
+        ):
+            raise ValueError(
+                "local_steps 必须是正整数或 None，"
+                f"当前值：{local_steps!r}"
+            )
+
+        batches_per_epoch = len(train_loader)
+        if batches_per_epoch <= 0:
+            raise ValueError(
+                "客户端 DataLoader 没有可训练 batch，无法执行固定 local_steps。"
+            )
+
+        iterator = iter(train_loader)
+        for step_index in range(local_steps):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(train_loader)
+                try:
+                    batch = next(iterator)
+                except StopIteration as exc:
+                    raise ValueError(
+                        "客户端 DataLoader 为空，无法执行固定 local_steps。"
+                    ) from exc
+
+            yield (
+                step_index // batches_per_epoch,
+                step_index % batches_per_epoch,
+                batch,
+            )
+        return
+
+    if local_epochs <= 0:
+        raise ValueError(
+            "local_steps 为 None 时，local_epochs 必须大于 0；"
+            f"当前值：{local_epochs}"
+        )
+
+    for epoch in range(local_epochs):
+        for batch_index, batch in enumerate(train_loader):
+            yield epoch, batch_index, batch
+
+
 def train_local_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -5633,24 +5715,15 @@ def train_local_model(
     optimizer: optim.Optimizer,
     device: torch.device,
     local_epochs: int,
+    local_steps: Optional[int] = None,
     grad_clip: Optional[float] = None,
 ) -> ClientTrainStats:
     """
     训练一个客户端本地模型。
 
-    这里的训练 loss 只有 CrossEntropyLoss。
-
-    明确不加入：
-        1. aux_loss
-        2. router balance
-        3. entropy regularization
-        4. expert diversity
-        5. router consistency
-        6. proximal loss
+    local_steps 优先于 local_epochs；为 None 时按完整 epoch 训练。
+    这里的训练 loss 只有 CrossEntropyLoss，不加入辅助损失或正则项。
     """
-    if local_epochs <= 0:
-        raise ValueError(f"local_epochs 必须大于 0，当前值：{local_epochs}")
-
     model.train()
 
     total_loss = 0.0
@@ -5658,35 +5731,38 @@ def train_local_model(
     total_samples = 0
     total_batches = 0
 
-    for _ in range(local_epochs):
-        for batch in train_loader:
-            images, targets = unpack_batch(batch)
+    for _, _, batch in _iter_local_training_batches(
+        train_loader=train_loader,
+        local_epochs=local_epochs,
+        local_steps=local_steps,
+    ):
+        images, targets = unpack_batch(batch)
 
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
 
-            outputs = model(images)
-            logits = extract_logits(outputs)
+        outputs = model(images)
+        logits = extract_logits(outputs)
 
-            loss = criterion(logits, targets)
-            loss.backward()
+        loss = criterion(logits, targets)
+        loss.backward()
 
-            if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    max_norm=float(grad_clip),
-                )
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=float(grad_clip),
+            )
 
-            optimizer.step()
+        optimizer.step()
 
-            batch_size = int(targets.size(0))
+        batch_size = int(targets.size(0))
 
-            total_loss += float(loss.item()) * batch_size
-            total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
-            total_samples += batch_size
-            total_batches += 1
+        total_loss += float(loss.item()) * batch_size
+        total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
+        total_samples += batch_size
+        total_batches += 1
 
     if total_samples <= 0:
         raise ValueError("客户端本地训练没有处理任何样本。")
@@ -5798,6 +5874,7 @@ def train_local_model_with_expert_strategy(
     global_state: Mapping[str, torch.Tensor],
     optimization_groups: FederatedOptimizationGroups,
     strategy: ExpertClientTrainingStrategy,
+    local_steps: Optional[int] = None,
 ) -> ExpertClientTrainResult:
     """
     使用专家训练策略更新 expert，同时用普通 optimizer 更新 non_expert。
@@ -5848,27 +5925,12 @@ def train_local_model_with_expert_strategy(
         non_expert_optimizer=optimizer,
         optimization_groups=optimization_groups,
         local_epochs=int(local_epochs),
+        local_steps=local_steps,
         non_expert_grad_clip=grad_clip,
     )
 
     model.train()
     strategy.on_train_start(context)
-    step_limit = strategy.local_step_limit(context)
-    if step_limit is not None:
-        if (
-            isinstance(step_limit, bool)
-            or not isinstance(step_limit, int)
-            or step_limit <= 0
-        ):
-            raise ValueError(
-                "strategy.local_step_limit() 必须返回正整数或 None，"
-                f"当前值：{step_limit!r}"
-            )
-    elif local_epochs <= 0:
-        raise ValueError(
-            "策略未提供固定 local_step_limit() 时，local_epochs 必须大于 0；"
-            f"当前值：{local_epochs}"
-        )
 
     total_loss = 0.0
     total_correct = 0
@@ -5936,37 +5998,16 @@ def train_local_model_with_expert_strategy(
         total_samples += batch_size
         total_batches += 1
 
-    if step_limit is not None:
-        batches_per_epoch = len(train_loader)
-        if batches_per_epoch <= 0:
-            raise ValueError("客户端 DataLoader 没有可训练 batch。")
-
-        iterator = iter(train_loader)
-        for step_index in range(step_limit):
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                iterator = iter(train_loader)
-                try:
-                    batch = next(iterator)
-                except StopIteration as exc:
-                    raise ValueError(
-                        "客户端 DataLoader 为空，无法执行固定本地步数。"
-                    ) from exc
-
-            run_batch(
-                batch=batch,
-                epoch=step_index // batches_per_epoch,
-                batch_index=step_index % batches_per_epoch,
-            )
-    else:
-        for epoch in range(local_epochs):
-            for batch_index, batch in enumerate(train_loader):
-                run_batch(
-                    batch=batch,
-                    epoch=epoch,
-                    batch_index=batch_index,
-                )
+    for epoch, batch_index, batch in _iter_local_training_batches(
+        train_loader=train_loader,
+        local_epochs=local_epochs,
+        local_steps=local_steps,
+    ):
+        run_batch(
+            batch=batch,
+            epoch=epoch,
+            batch_index=batch_index,
+        )
 
     if total_samples <= 0:
         raise ValueError("专家策略本地训练没有处理任何样本。")
@@ -6901,6 +6942,50 @@ class ServerTrainResult:
         }
 
 
+def validate_equal_client_update_steps(
+    client_updates: Sequence[ClientUpdate],
+) -> int:
+    """
+    检查本轮所有参与客户端实际执行的本地梯度更新次数是否一致。
+
+    ClientTrainStats.num_batches 记录每次 optimizer/strategy 更新对应的 batch 数，
+    因此这里检查 metrics["num_batches"]，而不是只检查配置值。
+    """
+    if not client_updates:
+        raise ValueError("client_updates 不能为空。")
+
+    steps_by_client: Dict[int, int] = {}
+    for update in client_updates:
+        client_id = int(update.client_id)
+        raw_steps = update.metrics.get("num_batches")
+        if (
+            isinstance(raw_steps, bool)
+            or not isinstance(raw_steps, (int, float))
+            or not math.isfinite(float(raw_steps))
+            or not float(raw_steps).is_integer()
+            or int(raw_steps) <= 0
+        ):
+            raise ValueError(
+                f"客户端 {client_id} 的实际本地更新次数无效："
+                f"metrics['num_batches']={raw_steps!r}。"
+            )
+        if client_id in steps_by_client:
+            raise ValueError(f"本轮出现重复的客户端更新：client_id={client_id}。")
+        steps_by_client[client_id] = int(raw_steps)
+
+    unique_steps = set(steps_by_client.values())
+    if len(unique_steps) != 1:
+        raise ValueError(
+            "本轮所有参与客户端必须执行相同数量的本地梯度更新；"
+            f"当前实际更新次数：{steps_by_client}。"
+            "请设置统一的顶层 local_steps（命令行使用 --local-steps K）；"
+            "如果使用 Epoch 模式，请确保各客户端 DataLoader 的 batch 数一致，"
+            "例如采用 sample_balance=balanced。"
+        )
+
+    return unique_steps.pop()
+
+
 class FLServer:
     """
     联邦学习服务端。
@@ -7265,6 +7350,8 @@ class FLServer:
         if len(client_updates) == 0:
             raise ValueError("client_updates 不能为空。")
 
+        actual_local_steps = validate_equal_client_update_steps(client_updates)
+
         global_state_cpu = state_dict_to(
             self.global_model.state_dict(),
             device="cpu",
@@ -7322,6 +7409,7 @@ class FLServer:
         self.global_model.to("cpu")
 
         return {
+            "local_update_steps": int(actual_local_steps),
             "non_expert": non_expert_result.summary(),
             "expert": expert_result.summary(),
         }
@@ -7412,6 +7500,17 @@ class FLServer:
         print(f"[Server] device: {self.device}")
         print(f"[Server] num_clients: {len(self.clients)}")
         print(f"[Server] rounds: {int(_cfg_get(self.cfg, 'rounds', 50))}")
+        local_steps = _cfg_get(self.cfg, "local_steps", None)
+        if local_steps is None:
+            print(
+                "[Server] local_training: "
+                f"epochs={int(_cfg_get(self.cfg, 'local_epochs', 5))}"
+            )
+        else:
+            print(
+                "[Server] local_training: "
+                f"steps={int(local_steps)} (local_epochs ignored)"
+            )
         print(f"[Server] frac: {float(_cfg_get(self.cfg, 'frac', 1.0))}")
         print(f"[Server] model: {_cfg_get(self.cfg, 'model', 'unknown')}")
         print(
@@ -8314,6 +8413,12 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--frac", type=float, default=None)
     parser.add_argument("--rounds", type=int, default=None)
     parser.add_argument("--local-epochs", type=int, default=None)
+    parser.add_argument(
+        "--local-steps",
+        type=int,
+        default=None,
+        help="每个客户端每轮固定本地梯度更新次数；设置后优先于 local_epochs。",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--test-batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -8340,7 +8445,7 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     overrides: Dict[str, Any] = {}
     top_level={
         "model":"model","data_root":"data_root","num_clients":"num_clients","frac":"frac",
-        "rounds":"rounds","local_epochs":"local_epochs","batch_size":"batch_size",
+        "rounds":"rounds","local_epochs":"local_epochs","local_steps":"local_steps","batch_size":"batch_size",
         "test_batch_size":"test_batch_size","num_workers":"num_workers","num_experts":"num_experts",
         "topk":"topk","seed":"seed","device":"device","output_dir":"output_dir","run_name":"run_name",
     }
@@ -8436,15 +8541,6 @@ def main(
         if args.config is not None
         else load_embedded_config(embedded_method_config, method_defaults=method_config_defaults, method_validator=method_config_validator, config_overrides=config_overrides)
     )
-
-    if (
-        int(_cfg_get(cfg, "local_epochs", 5)) == 0
-        and expert_client_training_strategy_builder is None
-    ):
-        raise ConfigError(
-            "local_epochs=0 仅适用于提供固定 local_step_limit() 的专家训练策略；"
-            "普通训练路径必须设置 local_epochs > 0。"
-        )
 
     configured_non_expert_method = str(
         cfg.get("agg.non_expert.method", "uniform")
