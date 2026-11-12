@@ -521,31 +521,248 @@ def load_config(
     return ConfigNode(raw_cfg)
 
 
+def _build_config_record(
+    cfg: ConfigNode | Mapping[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build a human-readable experiment record.
+
+    This is intentionally a presentation format, not a training input schema.
+    It groups effective settings, omits derived/runtime-only metadata, and
+    hides optional features that are not enabled.
+    """
+    if isinstance(cfg, ConfigNode):
+        raw = cfg.to_dict()
+    elif isinstance(cfg, Mapping):
+        raw = copy.deepcopy(dict(cfg))
+    else:
+        raise TypeError("cfg 必须是 ConfigNode 或 Mapping。")
+
+    def as_mapping(value: Any) -> Mapping[str, Any]:
+        return value if isinstance(value, Mapping) else {}
+
+    record: Dict[str, Any] = {}
+
+    # 1. Data
+    data_cfg: Dict[str, Any] = {}
+    for source_key, record_key in (
+        ("dataset", "dataset"),
+        ("data_root", "root"),
+        ("num_clients", "clients"),
+        ("frac", "participation"),
+        ("num_workers", "workers"),
+    ):
+        value = raw.get(source_key)
+        if value is not None:
+            data_cfg[record_key] = copy.deepcopy(value)
+
+    partition_cfg = as_mapping(raw.get("partition"))
+    partition_method = partition_cfg.get("method")
+    if partition_method is not None:
+        partition_record: Dict[str, Any] = {
+            "method": copy.deepcopy(partition_method)
+        }
+        if str(partition_method).strip().lower() == "dirichlet":
+            dirichlet_cfg = as_mapping(partition_cfg.get("dirichlet"))
+            for key in ("alpha", "sample_balance"):
+                if key in dirichlet_cfg:
+                    partition_record[key] = copy.deepcopy(dirichlet_cfg[key])
+        data_cfg["partition"] = partition_record
+
+    # Data augmentation defaults to enabled in build_datasets().
+    # Show it only when enabled, as requested.
+    if bool(raw.get("data_augmentation", True)):
+        data_cfg["augmentation"] = True
+
+    if data_cfg:
+        record["data"] = data_cfg
+
+    # 2. Model
+    model_record: Dict[str, Any] = {}
+    if raw.get("model") is not None:
+        model_record["architecture"] = copy.deepcopy(raw["model"])
+
+    model_cfg = as_mapping(raw.get("model_cfg"))
+    if model_cfg.get("backbone") is not None:
+        model_record["backbone"] = copy.deepcopy(model_cfg["backbone"])
+
+    moe_record: Dict[str, Any] = {}
+    hidden_dim = model_cfg.get(
+        "moe_hidden_dim",
+        model_cfg.get("hidden_dim", 512),
+    )
+    if hidden_dim is not None:
+        moe_record["hidden_dim"] = copy.deepcopy(hidden_dim)
+
+    for source_key, record_key in (
+        ("num_experts", "experts"),
+        ("topk", "top_k"),
+    ):
+        value = raw.get(source_key)
+        if value is not None:
+            moe_record[record_key] = copy.deepcopy(value)
+
+    if bool(model_cfg.get("renormalize_topk_probs", False)):
+        moe_record["renormalize_topk_probs"] = True
+
+    if moe_record:
+        model_record["moe"] = moe_record
+    if model_record:
+        record["model"] = model_record
+
+    # 3. Training
+    training_record: Dict[str, Any] = {}
+    if raw.get("rounds") is not None:
+        training_record["communication_rounds"] = copy.deepcopy(raw["rounds"])
+
+    local_record: Dict[str, Any] = {}
+    local_steps = raw.get("local_steps")
+    if local_steps is not None:
+        local_record["steps"] = copy.deepcopy(local_steps)
+    elif raw.get("local_epochs") is not None:
+        local_record["epochs"] = copy.deepcopy(raw["local_epochs"])
+
+    if raw.get("batch_size") is not None:
+        local_record["batch_size"] = copy.deepcopy(raw["batch_size"])
+    if local_record:
+        training_record["local"] = local_record
+
+    if raw.get("test_batch_size") is not None:
+        training_record["evaluation"] = {
+            "batch_size": copy.deepcopy(raw["test_batch_size"])
+        }
+
+    optimizer_cfg = as_mapping(raw.get("optimizer"))
+    if optimizer_cfg:
+        optimizer_record: Dict[str, Any] = {}
+        optimizer_name = optimizer_cfg.get("type")
+        if optimizer_name is not None:
+            optimizer_record["name"] = copy.deepcopy(optimizer_name)
+
+        if optimizer_cfg.get("lr") is not None:
+            optimizer_record["learning_rate"] = copy.deepcopy(optimizer_cfg["lr"])
+
+        for key in ("momentum", "weight_decay"):
+            if key in optimizer_cfg:
+                optimizer_record[key] = copy.deepcopy(optimizer_cfg[key])
+
+        # Optional optimizer switches are shown only when enabled.
+        if bool(optimizer_cfg.get("nesterov", False)):
+            optimizer_record["nesterov"] = True
+
+        if optimizer_record:
+            training_record["optimizer"] = optimizer_record
+
+    if training_record:
+        record["training"] = training_record
+
+    # 4. Aggregation
+    agg_cfg = as_mapping(raw.get("agg"))
+    aggregation_record: Dict[str, Any] = {}
+
+    non_expert_cfg = as_mapping(agg_cfg.get("non_expert"))
+    expert_cfg = as_mapping(agg_cfg.get("expert"))
+    if non_expert_cfg.get("method") is not None:
+        aggregation_record["non_expert"] = copy.deepcopy(
+            non_expert_cfg["method"]
+        )
+    if expert_cfg.get("method") is not None:
+        aggregation_record["expert"] = copy.deepcopy(expert_cfg["method"])
+
+    # Method-owned geometry settings are included only when present.
+    orthogonal_cfg = as_mapping(raw.get("orthogonal"))
+    if orthogonal_cfg:
+        aggregation_record["orthogonal"] = copy.deepcopy(dict(orthogonal_cfg))
+
+    if aggregation_record:
+        record["aggregation"] = aggregation_record
+
+    # 5. Reproducibility
+    reproducibility_record: Dict[str, Any] = {}
+    if raw.get("seed") is not None:
+        reproducibility_record["seed"] = copy.deepcopy(raw["seed"])
+    if bool(raw.get("deterministic", False)):
+        reproducibility_record["deterministic"] = True
+    if reproducibility_record:
+        record["reproducibility"] = reproducibility_record
+
+    # 6. Runtime
+    if raw.get("device") is not None:
+        record["runtime"] = {"device": copy.deepcopy(raw["device"])}
+
+    # 7. Server evidence: omit the whole section when disabled.
+    evidence_cfg = as_mapping(raw.get("server_evidence"))
+    evidence_size = int(evidence_cfg.get("size", 0) or 0)
+    if evidence_size > 0:
+        evidence_record: Dict[str, Any] = {"size": evidence_size}
+        if evidence_cfg.get("batch_size") is not None:
+            evidence_record["batch_size"] = copy.deepcopy(
+                evidence_cfg["batch_size"]
+            )
+        if "class_balanced" in evidence_cfg:
+            evidence_record["class_balanced"] = copy.deepcopy(
+                evidence_cfg["class_balanced"]
+            )
+        record["server_evidence"] = evidence_record
+
+    # 8. Logging: only enabled options are recorded.
+    logging_cfg = as_mapping(raw.get("logging"))
+    logging_record = {
+        key: True
+        for key in (
+            "save_config",
+            "save_results_csv",
+            "progress_bar",
+            "collect_expert_usage",
+        )
+        if bool(logging_cfg.get(key, False))
+    }
+    if logging_record:
+        record["logging"] = logging_record
+
+    # 9. Output: keep the root and final name; run_dir is derived from them.
+    output_record: Dict[str, Any] = {}
+    if raw.get("output_dir") is not None:
+        output_record["root"] = str(raw["output_dir"])
+    if raw.get("run_name") is not None:
+        output_record["run_name"] = str(raw["run_name"])
+    if output_record:
+        record["output"] = output_record
+
+    return record
+
+
 def save_config(
     cfg: ConfigNode | Mapping[str, Any],
     output_path: str | Path,
 ) -> None:
     """
-    保存最终配置。
+    Save a grouped, human-readable experiment record.
 
-    一般用于保存：
-        outputs/<run_name>/config_used.yaml
+    The generated config_used.yaml is a record for inspection, not a
+    configuration file intended to be passed back to the training loader.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if isinstance(cfg, ConfigNode):
-        cfg_dict = cfg.to_dict()
-    else:
-        cfg_dict = dict(cfg)
+    record = _build_config_record(cfg)
+    yaml_text = yaml.safe_dump(
+        record,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+    )
+
+    # Separate top-level sections with a blank line for readability.
+    yaml_text = re.sub(
+        r"\\n(?=[A-Za-z_][A-Za-z0-9_]*:\\n)",
+        "\\n\\n",
+        yaml_text,
+    )
 
     with output_path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(
-            cfg_dict,
-            f,
-            allow_unicode=True,
-            sort_keys=False,
-        )
+        f.write("# 实验记录文件：仅用于查看，不作为训练输入配置。\\n\\n")
+        f.write(yaml_text)
 
 
 def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
