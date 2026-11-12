@@ -7508,7 +7508,7 @@ class FLServer:
                 )
                 self.round_results.append(round_result)
 
-                avg_train_loss = round_result.aggregation_info.get(
+                avg_train_loss = round_result.train_metrics.get(
                     "avg_train_loss",
                     None,
                 )
