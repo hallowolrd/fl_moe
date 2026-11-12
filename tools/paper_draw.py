@@ -183,6 +183,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_run_metadata(csv_path: Path) -> Tuple[str | None, str | None, str]:
+    """
+    Read dataset/backbone from config_used.yaml and use the run directory
+    name as the identity of this plotted experiment.
+
+    A run directory is intentionally not collapsed into its aggregation
+    method: multiple runs of the same method must remain independently
+    comparable in one figure.
+    """
     config_path = csv_path.parent / "config_used.yaml"
 
     if not config_path.is_file():
@@ -191,22 +199,47 @@ def load_run_metadata(csv_path: Path) -> Tuple[str | None, str | None, str]:
     with config_path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    dataset = cfg.get("dataset")
+    if not isinstance(cfg, dict):
+        raise ValueError(
+            f"{config_path} 的 YAML 根节点必须是字典，"
+            f"当前类型：{type(cfg).__name__}"
+        )
 
-    model_cfg = cfg.get("model_cfg", {}) or {}
-    backbone = model_cfg.get("backbone") if isinstance(model_cfg, dict) else None
+    # Current config_used.yaml schema.
+    data_cfg = cfg.get("data", {})
+    dataset = (
+        data_cfg.get("dataset")
+        if isinstance(data_cfg, dict)
+        else None
+    )
 
-    agg_cfg = cfg.get("agg", {}) or {}
-    expert_cfg = agg_cfg.get("expert", {}) if isinstance(agg_cfg, dict) else {}
-    method = expert_cfg.get("method") if isinstance(expert_cfg, dict) else None
+    model_record = cfg.get("model", {})
+    backbone = (
+        model_record.get("backbone")
+        if isinstance(model_record, dict)
+        else None
+    )
 
-    if not method:
-        method = csv_path.parent.name
+    # Backward compatibility with historical config_used.yaml files.
+    if dataset is None:
+        dataset = cfg.get("dataset")
+
+    if backbone is None:
+        model_cfg = cfg.get("model_cfg", {})
+        backbone = (
+            model_cfg.get("backbone")
+            if isinstance(model_cfg, dict)
+            else None
+        )
+
+    # Keep every run independently identifiable, including run_name_v2,
+    # custom run names, and repeated runs of the same aggregation method.
+    run_name = csv_path.parent.name
 
     return (
         str(dataset) if dataset is not None else None,
         str(backbone) if backbone is not None else None,
-        str(method),
+        run_name,
     )
 
 
@@ -387,27 +420,32 @@ def main() -> int:
             f"没有找到 dataset={dataset!r}, backbone={backbone!r} 的 results.csv。"
         )
 
-    latest_by_method: Dict[str, Path] = {}
-    for run in matching_runs:
-        method = str(run["method"])
-        csv_path = Path(run["csv"])
-        previous = latest_by_method.get(method)
-        if previous is None or csv_path.stat().st_mtime > previous.stat().st_mtime:
-            latest_by_method[method] = csv_path
-
+    # Do not deduplicate by aggregation method or keep only the newest run.
+    # Each experiment directory is one independently comparable curve.
     selected = sorted(
-        latest_by_method.items(),
-        key=lambda item: method_order(item[0]),
+        matching_runs,
+        key=lambda run: (
+            method_order(str(run["method"])),
+            str(Path(run["csv"]).parent.relative_to(input_dir)).lower(),
+        ),
     )
+
+    base_labels = [
+        friendly_method_name(str(run["method"]))
+        for run in selected
+    ]
+    base_label_counts: Dict[str, int] = {}
+    for base_label in base_labels:
+        base_label_counts[base_label] = base_label_counts.get(base_label, 0) + 1
 
     if len(selected) < 5:
         print(
-            f"[Warning] 当前只识别到 {len(selected)} 个算法结果；"
+            f"[Warning] 当前只找到 {len(selected)} 个实验结果；"
             "将对已找到的结果作图。"
         )
     elif len(selected) > 5:
         print(
-            f"[Warning] 当前识别到 {len(selected)} 个算法结果；"
+            f"[Warning] 当前找到 {len(selected)} 个实验结果；"
             "图中会全部绘制。"
         )
 
@@ -422,10 +460,19 @@ def main() -> int:
     all_smoothed: List[float] = []
     max_round = 0
 
-    for index, (method, csv_path) in enumerate(selected):
-        label = friendly_method_name(method)
+    for index, run in enumerate(selected):
+        method = str(run["method"])
+        csv_path = Path(run["csv"])
+        base_label = friendly_method_name(method)
 
-        if label in HIDDEN_METHODS:
+        # When multiple runs map to the same friendly method name, append
+        # their relative run-directory paths so every legend entry is unique.
+        label = base_label
+        if base_label_counts[base_label] > 1:
+            run_id = csv_path.parent.relative_to(input_dir).as_posix()
+            label = f"{base_label} ({run_id})"
+
+        if base_label in HIDDEN_METHODS or method in HIDDEN_METHODS:
             continue
 
         rounds, test_acc = read_test_acc(csv_path)
@@ -448,8 +495,14 @@ def main() -> int:
         smoothed = moving_average(test_acc, args.window)
 
         fallback_style = PLOT_STYLES[index % len(PLOT_STYLES)]
-        color = METHOD_COLORS.get(label, fallback_style["color"])
-        style = STYLE_BY_COLOR.get(color, fallback_style)
+        if base_label_counts[base_label] > 1:
+            # Repeated runs of one method get separate styles/colors so their
+            # curves remain visually distinguishable.
+            color = fallback_style["color"]
+            style = fallback_style
+        else:
+            color = METHOD_COLORS.get(base_label, fallback_style["color"])
+            style = STYLE_BY_COLOR.get(color, fallback_style)
 
         ax.plot(
             rounds,
