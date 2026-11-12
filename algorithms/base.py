@@ -756,7 +756,7 @@ def save_config(
     # Separate top-level sections with a blank line for readability.
     yaml_text = re.sub(
         r"\n(?=[A-Za-z_][A-Za-z0-9_]*:\n)",
-        "\\n\\n",
+        "\n\n",
         yaml_text,
     )
 
