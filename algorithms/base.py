@@ -456,20 +456,10 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "class_balanced": True,
     },
     "logging": {
-        "log_every": 1,
         "save_config": True,
         "save_results_csv": True,
         "progress_bar": True,
-        "progress_in_non_tty": False,
-        "console_round_summary": True,
-        "file_round_detail": True,
-        "log_round_clients": True,
-        "log_client_table": True,
-        "log_client_metrics": True,
-        "log_agg_weights": True,
-        "compact_uniform_weights": True,
         "collect_expert_usage": True,
-        "expert_usage_max_batches": 0,
     },
 }
 
@@ -918,6 +908,57 @@ def _infer_num_classes(dataset: str) -> int:
     return int(info["num_classes"])
 
 
+def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
+    """
+    Validate the intentionally small public logging configuration surface.
+
+    Only four logging options remain configurable. Legacy/fixed behavior keys
+    are rejected explicitly so stale YAML files cannot silently change the
+    framework's fixed logging behavior.
+    """
+    logging_cfg = cfg.get("logging", {})
+    if not isinstance(logging_cfg, Mapping):
+        raise ConfigError("logging 必须是 dict。")
+
+    deprecated_keys = {
+        "log_every",
+        "progress_in_non_tty",
+        "console_round_summary",
+        "file_round_detail",
+        "log_round_clients",
+        "log_client_table",
+        "log_client_metrics",
+        "log_agg_weights",
+        "compact_uniform_weights",
+        "expert_usage_max_batches",
+    }
+    configured_deprecated = sorted(
+        set(logging_cfg.keys()).intersection(deprecated_keys)
+    )
+    if configured_deprecated:
+        fields = ", ".join(configured_deprecated)
+        raise ConfigError(
+            "logging 中包含已废弃的配置项："
+            f"{fields}。这些行为现在由框架固定，不再支持通过 YAML 或命令行修改；"
+            "请从配置文件中删除这些字段。"
+        )
+
+    supported_keys = {
+        "save_config",
+        "save_results_csv",
+        "progress_bar",
+        "collect_expert_usage",
+    }
+    unsupported_keys = sorted(set(logging_cfg.keys()) - supported_keys)
+    if unsupported_keys:
+        fields = ", ".join(str(key) for key in unsupported_keys)
+        supported = ", ".join(sorted(supported_keys))
+        raise ConfigError(
+            "logging 只允许配置以下字段："
+            f"{supported}。检测到不支持的字段：{fields}。"
+        )
+
+
 def _validate_config(cfg: Mapping[str, Any]) -> None:
     """
     基础合法性检查。
@@ -1086,6 +1127,8 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             f"optimizer.weight_decay 必须是有限的非负数，当前值：{weight_decay}"
         )
+
+    _validate_logging_config(cfg)
 
 
 def _require_positive_int(cfg: Mapping[str, Any], key: str) -> None:
@@ -6085,7 +6128,8 @@ def collect_expert_usage(
     注意：
         这个函数只做前向统计，不更新模型参数。
     """
-    max_batches = int(_cfg_get(cfg, "logging.expert_usage_max_batches", 0))
+    # 固定遍历完整客户端数据集，不再提供 max_batches 配置。
+    max_batches = 0
     num_experts = int(_cfg_get(cfg, "num_experts", 0))
     topk = int(_cfg_get(cfg, "topk", 2))
 
@@ -7158,33 +7202,17 @@ class FLServer:
         seed = int(_cfg_get(self.cfg, "seed", 0))
 
         logging_cfg = _cfg_get(self.cfg, "logging", {})
-        log_every = int(_cfg_get(logging_cfg, "log_every", 1))
 
-        # 控制台进度条开关。
-        # progress_bar: 是否启用 tqdm。
-        # progress_in_non_tty: 是否允许在 nohup / 重定向等非交互终端里显示进度条。
+        # 日志行为固定：每轮记录，不提供配置入口。
+        log_every = 1
+        console_round_summary = True
+        file_round_detail = True
+        progress_in_non_tty = False
+
+        # 仅进度条显示本身保留为可配置项。
         progress_bar_enabled = _cfg_get_bool(
             logging_cfg,
             "progress_bar",
-            True,
-        )
-        progress_in_non_tty = _cfg_get_bool(
-            logging_cfg,
-            "progress_in_non_tty",
-            False,
-        )
-
-        # 控制台只打印短摘要，方便实时观察。
-        console_round_summary = _cfg_get_bool(
-            logging_cfg,
-            "console_round_summary",
-            True,
-        )
-
-        # train.log 写更详细的结构化日志，但不写进度条。
-        file_round_detail = _cfg_get_bool(
-            logging_cfg,
-            "file_round_detail",
             True,
         )
 
@@ -7598,33 +7626,8 @@ class FLServer:
         """
         写入每轮详细日志。
 
-        这部分只写 train.log，不打印到控制台。
-
-        当前记录：
-            1. 本轮整体 train/test 指标
-            2. 本轮选择的客户端
-            3. non_expert / expert 分别用的聚合方法
-            4. non_expert / expert 每个客户端的聚合权重
-            5. 每个客户端样本数、本地 train_loss/train_acc、expert_usage
+        详细日志行为固定：记录整体指标、参与客户端、聚合权重和客户端诊断表。
         """
-        logging_cfg = _cfg_get(self.cfg, "logging", {})
-
-        log_round_clients = _cfg_get_bool(
-            logging_cfg,
-            "log_round_clients",
-            True,
-        )
-        log_client_table = _cfg_get_bool(
-            logging_cfg,
-            "log_client_table",
-            True,
-        )
-        log_agg_weights = _cfg_get_bool(
-            logging_cfg,
-            "log_agg_weights",
-            True,
-        )
-
         avg_train_loss = round_result.aggregation_info.get(
             "avg_train_loss",
             None,
@@ -7654,22 +7657,19 @@ class FLServer:
             f"best_acc={round_result.best_acc:.2f}%"
         )
 
-        if log_round_clients:
-            self._write_log_only(
-                f"[Clients] "
-                f"round={round_result.round_id} "
-                f"ids={self._format_client_ids(round_result.selected_clients)}"
-            )
-
-        # 聚合器摘要：方法、客户端数、参数数量、权重。
-        self._write_aggregation_info_to_log(
-            round_result=round_result,
-            log_agg_weights=log_agg_weights,
+        self._write_log_only(
+            f"[Clients] "
+            f"round={round_result.round_id} "
+            f"ids={self._format_client_ids(round_result.selected_clients)}"
         )
 
-        # 每个客户端一行诊断信息：样本数、训练指标、聚合权重、expert usage。
-        if log_client_table:
-            self._write_client_table_to_log(round_result)
+        # 固定记录 non_expert / expert 聚合方法与客户端权重。
+        self._write_aggregation_info_to_log(
+            round_result=round_result,
+        )
+
+        # 固定记录每个客户端的诊断信息。
+        self._write_client_table_to_log(round_result)
 
     def _build_client_diagnostics(
         self,
@@ -7697,22 +7697,12 @@ class FLServer:
     def _write_aggregation_info_to_log(
         self,
         round_result: RoundResult,
-        log_agg_weights: bool,
     ) -> None:
         """
-        写入 non_expert / expert 聚合摘要。
+        写入 non_expert / expert 聚合摘要及客户端权重。
 
-        输出示例：
-            [Agg][non_expert] round=1 method=uniform clients=10 params=121 weights=uniform(each=0.1000)
-            [Agg][expert] round=1 method=<method> clients=10 params=16 weights={0:0.0812,1:0.1033,...}
+        权重日志固定开启；均匀权重固定使用紧凑格式。
         """
-        logging_cfg = _cfg_get(self.cfg, "logging", {})
-        compact_uniform_weights = _cfg_get_bool(
-            logging_cfg,
-            "compact_uniform_weights",
-            True,
-        )
-
         for group_name in ("non_expert", "expert"):
             agg_info = self._extract_aggregation_info(
                 round_result=round_result,
@@ -7721,13 +7711,9 @@ class FLServer:
             if agg_info is None:
                 continue
 
-            if log_agg_weights:
-                weights_text = self._format_weights(
-                    agg_info.get("weights", None),
-                    compact_uniform=compact_uniform_weights,
-                )
-            else:
-                weights_text = "hidden"
+            weights_text = self._format_weights(
+                agg_info.get("weights", None),
+            )
 
             self._write_log_only(
                 f"[Agg][{group_name}] "
@@ -7993,13 +7979,11 @@ class FLServer:
     def _format_weights(
         self,
         weights: Any,
-        *,
-        compact_uniform: bool,
     ) -> str:
         """
         格式化聚合权重。
 
-        uniform 权重默认压缩成：
+        uniform 权重固定压缩成：
             uniform(each=0.1000)
 
         非 uniform 权重打印成：
@@ -8029,7 +8013,7 @@ class FLServer:
             key=lambda item: item[0],
         )
 
-        if compact_uniform and self._is_uniform_weight_items(numeric_items):
+        if self._is_uniform_weight_items(numeric_items):
             return f"uniform(each={numeric_items[0][1]:.4f})"
 
         body = ",".join(
