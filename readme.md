@@ -54,5 +54,5 @@ python algorithms/fedavg_orthogonal.py --dataset cifar10 --backbone resnet_cifar
 
 RFedAGS 正交专家聚合：
 \`\`\`bash
-python algorithms/rfedags_orthogonal.py --dataset cifar10 --backbone resnet_cifar --rfedags-local-steps 5
+python algorithms/rfedags_orthogonal.py --dataset cifar10 --backbone resnet_cifar --local-steps 5
 \`\`\`
