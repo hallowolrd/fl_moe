@@ -48,7 +48,7 @@ def _stiefel_orthogonality_error(point: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def __build_stiefel_orthogonality_diagnostics(
+def _build_stiefel_orthogonality_diagnostics(
     model: torch.nn.Module,
     blocks: Mapping[str, Any],
 ) -> Dict[str, Any]:
