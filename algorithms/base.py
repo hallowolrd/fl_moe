@@ -423,7 +423,18 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "batch_size": 64,
     "test_batch_size": 64,
     "num_workers": 2,
-    "model_cfg": {},
+    "model_cfg": {
+        "transformer_layers": 6,
+        "hidden_dim": 256,
+        "attention_heads": 4,
+        "patch_size": 4,
+        "expert_hidden_dim": 1024,
+        "moe_block_indices": [2, 4, 6],
+        "routing": "top1",
+        "auxiliary_loss": false,
+        "router_statistics": true,
+        "dropout": 0.0,
+    },
     "num_experts": 4,
     "optimizer": {
         "type": "sgd",
@@ -4077,10 +4088,459 @@ def _infer_pin_memory(cfg: Any) -> bool:
 
 # ============================================================================
 # 8. 模型构建与管理（Model）
-# Model construction is supplied by the model package and injected into FL.
+# Built-in SwitchViT construction plus an injectable ModelBuilder interface.
 # ============================================================================
 
 ModelBuilder = Callable[[Any], nn.Module]
+
+
+# ============================================================================
+# Built-in image-classification Switch Transformer.
+# The model lives in base.py so the FL framework can use it without an external
+# model package. MoE blocks are 1-indexed in configuration.
+# ============================================================================
+
+SWITCH_VIT_DEFAULT_MODEL_CFG: Dict[str, Any] = {
+    "transformer_layers": 6,
+    "hidden_dim": 256,
+    "attention_heads": 4,
+    "patch_size": 4,
+    "expert_hidden_dim": 1024,
+    "moe_block_indices": [2, 4, 6],
+    "routing": "top1",
+    "auxiliary_loss": False,
+    "router_statistics": True,
+    "dropout": 0.0,
+}
+
+
+def _switch_model_config(cfg: Any) -> Dict[str, Any]:
+    raw = _cfg_get(cfg, "model_cfg", {})
+    if hasattr(raw, "to_dict"):
+        raw = raw.to_dict()
+    if not isinstance(raw, Mapping):
+        raise TypeError("model_cfg 必须是 Mapping。")
+    return _deep_merge(
+        base=SWITCH_VIT_DEFAULT_MODEL_CFG,
+        override=dict(raw),
+    )
+
+
+class SwitchFeedForward(nn.Module):
+    """Standard dense Transformer FFN used by non-MoE blocks."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        expert_hidden_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_dim, expert_hidden_dim)
+        self.activation = nn.GELU()
+        self.fc2 = nn.Linear(expert_hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs = self.fc1(inputs)
+        outputs = self.activation(outputs)
+        outputs = self.dropout(outputs)
+        outputs = self.fc2(outputs)
+        return self.dropout(outputs)
+
+
+class SwitchExpert(nn.Module):
+    """One independent two-layer feed-forward expert."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        expert_hidden_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_dim, expert_hidden_dim)
+        self.activation = nn.GELU()
+        self.fc2 = nn.Linear(expert_hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs = self.fc1(inputs)
+        outputs = self.activation(outputs)
+        outputs = self.dropout(outputs)
+        outputs = self.fc2(outputs)
+        return self.dropout(outputs)
+
+
+class SwitchRouter(nn.Module):
+    """Top-1 token router. It returns probabilities and selected expert ids."""
+
+    def __init__(self, hidden_dim: int, num_experts: int) -> None:
+        super().__init__()
+        self.projection = nn.Linear(hidden_dim, num_experts)
+        self.num_experts = int(num_experts)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        router_logits = self.projection(tokens)
+        # Compute routing probabilities in FP32 for numerical stability.
+        router_probabilities = torch.softmax(router_logits.float(), dim=-1)
+        top1_probabilities, top1_experts = torch.max(
+            router_probabilities,
+            dim=-1,
+        )
+        return router_probabilities, top1_probabilities, top1_experts
+
+
+class SwitchMoE(nn.Module):
+    """
+    Top-1 Switch FFN with token dispatch and no capacity constraint.
+
+    Every token is sent to exactly one expert. No token is dropped. The selected
+    router probability scales the selected expert output, preserving a gradient
+    path from the task loss into the router without an auxiliary loss.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        expert_hidden_dim: int,
+        num_experts: int,
+        dropout: float = 0.0,
+        collect_router_statistics: bool = True,
+    ) -> None:
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError("num_experts 必须是正整数。")
+
+        self.num_experts = int(num_experts)
+        self.collect_router_statistics = bool(collect_router_statistics)
+        self.router = SwitchRouter(
+            hidden_dim=hidden_dim,
+            num_experts=self.num_experts,
+        )
+        self.experts = nn.ModuleDict({
+            f"expert_{expert_id}": SwitchExpert(
+                hidden_dim=hidden_dim,
+                expert_hidden_dim=expert_hidden_dim,
+                dropout=dropout,
+            )
+            for expert_id in range(self.num_experts)
+        })
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        if inputs.ndim != 3:
+            raise ValueError(
+                "SwitchMoE 输入必须是 [batch, tokens, hidden_dim]，"
+                f"当前 shape={tuple(inputs.shape)}"
+            )
+
+        batch_size, token_count, hidden_dim = inputs.shape
+        flat_tokens = inputs.reshape(batch_size * token_count, hidden_dim)
+
+        router_probabilities, top1_probabilities, top1_experts = self.router(
+            flat_tokens
+        )
+
+        # Dispatch each token to only its selected expert. index_copy is
+        # differentiable with respect to expert outputs and selected gate values.
+        flat_outputs = torch.zeros_like(flat_tokens)
+        for expert_id, expert in enumerate(self.experts.values()):
+            token_indices = torch.nonzero(
+                top1_experts == expert_id,
+                as_tuple=False,
+            ).flatten()
+            if token_indices.numel() == 0:
+                continue
+
+            expert_inputs = flat_tokens.index_select(0, token_indices)
+            expert_outputs = expert(expert_inputs)
+            gate = top1_probabilities.index_select(
+                0,
+                token_indices,
+            ).to(dtype=expert_outputs.dtype).unsqueeze(-1)
+            flat_outputs = flat_outputs.index_copy(
+                0,
+                token_indices,
+                expert_outputs * gate,
+            )
+
+        outputs = flat_outputs.reshape(batch_size, token_count, hidden_dim)
+
+        stats: Dict[str, Any] = {}
+        if self.collect_router_statistics:
+            tokens_per_expert = torch.bincount(
+                top1_experts,
+                minlength=self.num_experts,
+            )
+            stats = {
+                "tokens_per_expert": tokens_per_expert,
+                "router_prob_sum": router_probabilities.sum(dim=0),
+                "top1_prob_sum": top1_probabilities.sum(),
+                "num_tokens": int(top1_experts.numel()),
+            }
+
+        return outputs, stats
+
+
+class SwitchTransformerBlock(nn.Module):
+    """Pre-LN Transformer block with either a dense FFN or a Switch MoE FFN."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        attention_heads: int,
+        expert_hidden_dim: int,
+        num_experts: int,
+        use_moe: bool,
+        dropout: float = 0.0,
+        collect_router_statistics: bool = True,
+    ) -> None:
+        super().__init__()
+        self.use_moe = bool(use_moe)
+        self.norm1 = nn.LayerNorm(hidden_dim, eps=1e-6)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=attention_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attention_dropout = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
+
+        if self.use_moe:
+            self.mlp = SwitchMoE(
+                hidden_dim=hidden_dim,
+                expert_hidden_dim=expert_hidden_dim,
+                num_experts=num_experts,
+                dropout=dropout,
+                collect_router_statistics=collect_router_statistics,
+            )
+        else:
+            self.mlp = SwitchFeedForward(
+                hidden_dim=hidden_dim,
+                expert_hidden_dim=expert_hidden_dim,
+                dropout=dropout,
+            )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        normalized = self.norm1(inputs)
+        attention_outputs, _ = self.attention(
+            normalized,
+            normalized,
+            normalized,
+            need_weights=False,
+        )
+        outputs = inputs + self.attention_dropout(attention_outputs)
+
+        if self.use_moe:
+            mlp_outputs, router_stats = self.mlp(self.norm2(outputs))
+        else:
+            mlp_outputs = self.mlp(self.norm2(outputs))
+            router_stats = {}
+
+        return outputs + mlp_outputs, router_stats
+
+
+class SwitchViT(nn.Module):
+    """
+    Image-classification Switch ViT.
+
+    Default CIFAR configuration:
+      - 6 Transformer blocks, hidden size 256, 4 attention heads
+      - 4x4 patches + CLS token = 65 tokens for 32x32 images
+      - MoE FFNs in blocks 2, 4, and 6; dense FFNs in blocks 1, 3, and 5
+      - 4 experts per MoE layer, each with hidden size 1024
+      - Top-1 routing, no capacity limit, no token dropping, no auxiliary loss
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        input_shape: Sequence[int],
+        transformer_layers: int = 6,
+        hidden_dim: int = 256,
+        attention_heads: int = 4,
+        patch_size: int = 4,
+        expert_hidden_dim: int = 1024,
+        num_experts: int = 4,
+        moe_block_indices: Sequence[int] = (2, 4, 6),
+        dropout: float = 0.0,
+        router_statistics: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if len(input_shape) != 3:
+            raise ValueError(
+                "input_shape 必须为 (channels, height, width)，"
+                f"当前值：{input_shape}"
+            )
+        in_channels, image_height, image_width = (
+            int(input_shape[0]),
+            int(input_shape[1]),
+            int(input_shape[2]),
+        )
+        if min(in_channels, image_height, image_width) <= 0:
+            raise ValueError(f"非法 input_shape：{input_shape}")
+        if image_height % patch_size != 0 or image_width % patch_size != 0:
+            raise ValueError(
+                f"图像尺寸 {(image_height, image_width)} 必须能被 "
+                f"patch_size={patch_size} 整除。"
+            )
+        if hidden_dim % attention_heads != 0:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} 必须能被 "
+                f"attention_heads={attention_heads} 整除。"
+            )
+        if transformer_layers <= 0 or num_classes <= 0:
+            raise ValueError("transformer_layers 和 num_classes 必须为正整数。")
+
+        normalized_moe_blocks = tuple(int(index) for index in moe_block_indices)
+        if (
+            not normalized_moe_blocks
+            or len(set(normalized_moe_blocks)) != len(normalized_moe_blocks)
+            or any(index < 1 or index > transformer_layers for index in normalized_moe_blocks)
+        ):
+            raise ValueError(
+                "moe_block_indices 必须是无重复且位于模型层数范围内的 1-based 层号。"
+            )
+
+        self.num_classes = int(num_classes)
+        self.input_shape = (in_channels, image_height, image_width)
+        self.transformer_layers = int(transformer_layers)
+        self.hidden_dim = int(hidden_dim)
+        self.num_experts = int(num_experts)
+        self.moe_block_indices = normalized_moe_blocks
+        self.patch_size = int(patch_size)
+
+        grid_height = image_height // patch_size
+        grid_width = image_width // patch_size
+        num_patches = grid_height * grid_width
+
+        self.patch_embed = nn.Conv2d(
+            in_channels,
+            hidden_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches + 1, hidden_dim)
+        )
+        self.pos_dropout = nn.Dropout(dropout)
+
+        self.blocks = nn.ModuleList([
+            SwitchTransformerBlock(
+                hidden_dim=hidden_dim,
+                attention_heads=attention_heads,
+                expert_hidden_dim=expert_hidden_dim,
+                num_experts=num_experts,
+                use_moe=(block_index in normalized_moe_blocks),
+                dropout=dropout,
+                collect_router_statistics=router_statistics,
+            )
+            for block_index in range(1, transformer_layers + 1)
+        ])
+
+        self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+        self.head = nn.Linear(hidden_dim, num_classes)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv2d):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, images: torch.Tensor) -> ModelOutput:
+        if images.ndim != 4:
+            raise ValueError(
+                "SwitchViT 输入必须是 [batch, channels, height, width]，"
+                f"当前 shape={tuple(images.shape)}"
+            )
+        if tuple(images.shape[1:]) != self.input_shape:
+            raise ValueError(
+                f"输入图像 shape={tuple(images.shape[1:])} 与模型配置 "
+                f"input_shape={self.input_shape} 不一致。"
+            )
+
+        outputs = self.patch_embed(images)
+        outputs = outputs.flatten(2).transpose(1, 2)
+        cls_tokens = self.cls_token.expand(outputs.shape[0], -1, -1)
+        outputs = torch.cat((cls_tokens, outputs), dim=1)
+        outputs = self.pos_dropout(outputs + self.pos_embed)
+
+        moe_stats: Dict[str, Any] = {}
+        for block_index, block in enumerate(self.blocks, start=1):
+            outputs, layer_stats = block(outputs)
+            if layer_stats:
+                # Use the same module path as the expert parameters, allowing
+                # per-layer diagnostics to line up with federated param groups.
+                layer_name = f"blocks.{block_index - 1}.mlp"
+                moe_stats[layer_name] = layer_stats
+
+        cls_features = self.norm(outputs[:, 0])
+        logits = self.head(cls_features)
+
+        return ModelOutput(
+            logits=logits,
+            aux_loss=None,
+            aux_loss_by_layer={},
+            moe_stats=moe_stats,
+        )
+
+
+def build_switch_vit_model(cfg: Any) -> nn.Module:
+    """Build the default SwitchViT from the shared experiment configuration."""
+    model_cfg = _switch_model_config(cfg)
+
+    if str(model_cfg.get("routing", "top1")).strip().lower() != "top1":
+        raise ValueError("当前 SwitchViT 仅实现 Top-1 Routing。")
+    if bool(model_cfg.get("auxiliary_loss", False)):
+        raise ValueError(
+            "SwitchViT Auxiliary Loss 当前按实验约定关闭，暂不支持开启。"
+        )
+
+    num_experts = int(_cfg_get(cfg, "num_experts", 4))
+    input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
+    if isinstance(input_shape, ConfigNode):
+        input_shape = tuple(input_shape.to_dict().values())
+    if not isinstance(input_shape, (tuple, list)):
+        raise TypeError("input_shape 必须是包含 channels、height、width 的序列。")
+
+    return SwitchViT(
+        num_classes=int(_cfg_get(cfg, "num_classes", 10)),
+        input_shape=input_shape,
+        transformer_layers=int(model_cfg["transformer_layers"]),
+        hidden_dim=int(model_cfg["hidden_dim"]),
+        attention_heads=int(model_cfg["attention_heads"]),
+        patch_size=int(model_cfg["patch_size"]),
+        expert_hidden_dim=int(model_cfg["expert_hidden_dim"]),
+        num_experts=num_experts,
+        moe_block_indices=model_cfg["moe_block_indices"],
+        dropout=float(model_cfg.get("dropout", 0.0)),
+        router_statistics=bool(model_cfg.get("router_statistics", True)),
+    )
 
 
 def build_model(cfg: Any, model_builder: ModelBuilder) -> nn.Module:
@@ -8257,10 +8717,10 @@ def main(
     """
     args = parse_args(method_cli_argument_registrar=method_cli_argument_registrar)
 
+    # 默认使用 base.py 内置的图像分类 SwitchViT；外部仍可显式注入
+    # 自定义 ModelBuilder，不改变已有的模型解耦与测试接口。
     if model_builder is None:
-        raise ValueError(
-            "base.main 必须显式传入 model_builder；模型由外部模型模块构建。"
-        )
+        model_builder = build_switch_vit_model
     if not callable(model_builder):
         raise TypeError("model_builder 必须是可调用对象。")
     config_overrides = build_common_cli_overrides(args)
