@@ -6765,7 +6765,6 @@ class FLServer:
         """从 ClientUpdate 中提取公共及方法插件提供的轻量诊断信息。"""
         diagnostics: Dict[int, Dict[str, Any]] = {}
         for update in client_updates:
-            extra = dict(update.extra or {})
             client_diag: Dict[str, Any] = {
                 "num_samples": int(update.num_samples),
                 "metrics": dict(update.metrics or {}),
