@@ -226,6 +226,35 @@ class SwitchViTTests(unittest.TestCase):
             [0, 3, 3],
         )
 
+    def test_switch_vit_capacity_config_reaches_every_moe_layer(self) -> None:
+        cfg = {
+            **self.cfg,
+            "model_cfg": {
+                "expert_capacity": True,
+                "capacity_factor": 1.0,
+                "token_dropping": False,
+            },
+        }
+        model = base.build_switch_vit_model(cfg)
+        images = torch.randn(1, 3, 32, 32)
+
+        output = model(images)
+
+        self.assertEqual(
+            set(output.moe_stats),
+            {"blocks.1.mlp", "blocks.3.mlp", "blocks.5.mlp"},
+        )
+        for block_index in (1, 3, 5):
+            moe = model.blocks[block_index].mlp
+            self.assertTrue(moe.expert_capacity)
+            self.assertFalse(moe.token_dropping)
+            layer_stats = output.moe_stats[f"blocks.{block_index}.mlp"]
+            self.assertEqual(
+                int(layer_stats["processed_tokens_per_expert"].sum().item()),
+                65,
+            )
+            self.assertEqual(layer_stats["dropped_tokens"], 0)
+
     def test_token_dropping_only_occurs_after_all_experts_are_full(self) -> None:
         moe = self._make_constant_router_moe(
             num_experts=3,
