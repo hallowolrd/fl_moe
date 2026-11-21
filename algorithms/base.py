@@ -4109,6 +4109,10 @@ SWITCH_VIT_DEFAULT_MODEL_CFG: Dict[str, Any] = {
     "moe_block_indices": [2, 4, 6],
     "routing": "top1",
     "auxiliary_loss": False,
+    "aux_loss_coef": 0.01,
+    "expert_capacity": False,
+    "capacity_factor": 1.25,
+    "token_dropping": False,
     "router_statistics": True,
     "dropout": 0.0,
 }
@@ -4196,11 +4200,13 @@ class SwitchRouter(nn.Module):
 
 class SwitchMoE(nn.Module):
     """
-    Top-1 Switch FFN with token dispatch and no capacity constraint.
+    Top-1 Switch FFN with optional capacity and overflow handling.
 
-    Every token is sent to exactly one expert. No token is dropped. The selected
-    router probability scales the selected expert output, preserving a gradient
-    path from the task loss into the router without an auxiliary loss.
+    When capacity is enabled, tokens first try their highest-probability expert.
+    Overflow tokens then try their remaining experts in descending router
+    probability order. If every expert is full, tokens are dropped only when
+    token_dropping=True; otherwise the configuration must guarantee enough
+    aggregate capacity for every token.
     """
 
     def __init__(
@@ -4210,13 +4216,37 @@ class SwitchMoE(nn.Module):
         num_experts: int,
         dropout: float = 0.0,
         collect_router_statistics: bool = True,
+        auxiliary_loss: bool = False,
+        aux_loss_coef: float = 0.01,
+        expert_capacity: bool = False,
+        capacity_factor: float = 1.25,
+        token_dropping: bool = False,
     ) -> None:
         super().__init__()
         if num_experts <= 0:
             raise ValueError("num_experts 必须是正整数。")
+        if not math.isfinite(float(aux_loss_coef)) or float(aux_loss_coef) < 0.0:
+            raise ValueError("aux_loss_coef 必须是非负有限数。")
+        if not math.isfinite(float(capacity_factor)) or float(capacity_factor) <= 0.0:
+            raise ValueError("capacity_factor 必须是正有限数。")
+        if token_dropping and not expert_capacity:
+            raise ValueError(
+                "token_dropping=True 时必须同时启用 expert_capacity。"
+            )
+        if expert_capacity and not token_dropping and capacity_factor < 1.0:
+            raise ValueError(
+                "启用容量限制但关闭 Token Dropping 时，capacity_factor "
+                "必须 >= 1.0，以保证总容量足以容纳全部 Token。"
+            )
 
         self.num_experts = int(num_experts)
         self.collect_router_statistics = bool(collect_router_statistics)
+        self.auxiliary_loss = bool(auxiliary_loss)
+        self.aux_loss_coef = float(aux_loss_coef)
+        self.expert_capacity = bool(expert_capacity)
+        self.capacity_factor = float(capacity_factor)
+        self.token_dropping = bool(token_dropping)
+
         self.router = SwitchRouter(
             hidden_dim=hidden_dim,
             num_experts=self.num_experts,
@@ -4230,10 +4260,100 @@ class SwitchMoE(nn.Module):
             for expert_id in range(self.num_experts)
         })
 
+    def _assign_experts_with_capacity(
+        self,
+        router_probabilities: torch.Tensor,
+        top1_experts: torch.Tensor,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Assign tokens in preference rounds while respecting per-expert capacity.
+
+        Tokens preserve their flattened input order within each expert's queue.
+        A token advances to its next-best expert only when its current candidate
+        has no remaining capacity.
+        """
+        num_tokens = int(top1_experts.numel())
+        capacity = int(math.ceil(
+            (num_tokens / self.num_experts) * self.capacity_factor
+        ))
+
+        # Force rank zero to be exactly the Top-1 choice returned by torch.max.
+        # This also avoids inconsistent tie-breaking between argmax and argsort.
+        remaining_probabilities = router_probabilities.clone()
+        remaining_probabilities.scatter_(
+            1,
+            top1_experts.unsqueeze(1),
+            float("-inf"),
+        )
+        remaining_order = torch.argsort(
+            remaining_probabilities,
+            dim=-1,
+            descending=True,
+        )
+        routing_order = torch.cat(
+            (top1_experts.unsqueeze(1), remaining_order),
+            dim=1,
+        )
+
+        assigned_experts = torch.full_like(top1_experts, -1)
+        expert_loads = [0 for _ in range(self.num_experts)]
+        active_indices = torch.arange(
+            num_tokens,
+            device=top1_experts.device,
+            dtype=torch.long,
+        )
+
+        for preference_rank in range(self.num_experts):
+            if active_indices.numel() == 0:
+                break
+
+            proposed_experts = routing_order.index_select(
+                0,
+                active_indices,
+            )[:, preference_rank]
+            accepted_mask = torch.zeros(
+                active_indices.numel(),
+                dtype=torch.bool,
+                device=active_indices.device,
+            )
+
+            for expert_id in range(self.num_experts):
+                candidate_positions = torch.nonzero(
+                    proposed_experts == expert_id,
+                    as_tuple=False,
+                ).flatten()
+                if candidate_positions.numel() == 0:
+                    continue
+
+                remaining_capacity = capacity - expert_loads[expert_id]
+                if remaining_capacity <= 0:
+                    continue
+
+                accepted_positions = candidate_positions[:remaining_capacity]
+                accepted_indices = active_indices.index_select(
+                    0,
+                    accepted_positions,
+                )
+                assigned_experts[accepted_indices] = expert_id
+                expert_loads[expert_id] += int(accepted_indices.numel())
+                accepted_mask[accepted_positions] = True
+
+            # Keep rejected tokens in their original relative order for the
+            # next preference round.
+            active_indices = active_indices[~accepted_mask]
+
+        if active_indices.numel() > 0 and not self.token_dropping:
+            raise RuntimeError(
+                "No-Token-Left-Behind 路由未能分配全部 Token；"
+                "请检查 capacity_factor 和专家容量配置。"
+            )
+
+        return assigned_experts, capacity
+
     def forward(
         self,
         inputs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> Tuple[torch.Tensor, Dict[str, Any], Optional[torch.Tensor]]:
         if inputs.ndim != 3:
             raise ValueError(
                 "SwitchMoE 输入必须是 [batch, tokens, hidden_dim]，"
@@ -4242,17 +4362,45 @@ class SwitchMoE(nn.Module):
 
         batch_size, token_count, hidden_dim = inputs.shape
         flat_tokens = inputs.reshape(batch_size * token_count, hidden_dim)
+        num_tokens = int(flat_tokens.shape[0])
+        if num_tokens == 0:
+            raise ValueError("SwitchMoE 不支持空 Token 输入。")
 
         router_probabilities, top1_probabilities, top1_experts = self.router(
             flat_tokens
         )
 
-        # Dispatch each token to only its selected expert. index_copy is
-        # differentiable with respect to expert outputs and selected gate values.
+        if self.expert_capacity:
+            assigned_experts, capacity = self._assign_experts_with_capacity(
+                router_probabilities,
+                top1_experts,
+            )
+        else:
+            assigned_experts = top1_experts
+            capacity = None
+
+        # The auxiliary loss uses the original Top-1 choices, before capacity
+        # overflow rerouting, and the mean router probabilities for this layer.
+        aux_loss: Optional[torch.Tensor] = None
+        if self.auxiliary_loss:
+            first_choice_counts = torch.bincount(
+                top1_experts,
+                minlength=self.num_experts,
+            ).to(dtype=router_probabilities.dtype)
+            expert_fraction = first_choice_counts / float(num_tokens)
+            mean_router_probability = router_probabilities.mean(dim=0)
+            aux_loss = (
+                self.aux_loss_coef
+                * self.num_experts
+                * torch.sum(expert_fraction * mean_router_probability)
+            )
+
+        # Dispatch every successfully assigned token exactly once. Tokens left
+        # unassigned after all preference rounds are dropped only when enabled.
         flat_outputs = torch.zeros_like(flat_tokens)
         for expert_id, expert in enumerate(self.experts.values()):
             token_indices = torch.nonzero(
-                top1_experts == expert_id,
+                assigned_experts == expert_id,
                 as_tuple=False,
             ).flatten()
             if token_indices.numel() == 0:
@@ -4260,10 +4408,10 @@ class SwitchMoE(nn.Module):
 
             expert_inputs = flat_tokens.index_select(0, token_indices)
             expert_outputs = expert(expert_inputs)
-            gate = top1_probabilities.index_select(
-                0,
+            gate = router_probabilities[
                 token_indices,
-            ).to(dtype=expert_outputs.dtype).unsqueeze(-1)
+                expert_id,
+            ].to(dtype=expert_outputs.dtype).unsqueeze(-1)
             flat_outputs = flat_outputs.index_copy(
                 0,
                 token_indices,
@@ -4278,14 +4426,38 @@ class SwitchMoE(nn.Module):
                 top1_experts,
                 minlength=self.num_experts,
             )
+            processed_tokens_per_expert = torch.bincount(
+                assigned_experts[assigned_experts >= 0],
+                minlength=self.num_experts,
+            )
+            rerouted_mask = (
+                (assigned_experts >= 0)
+                & (assigned_experts != top1_experts)
+            )
+            dropped_mask = assigned_experts < 0
             stats = {
+                # Backward-compatible meaning: original Top-1 demand per expert.
                 "tokens_per_expert": tokens_per_expert,
                 "router_prob_sum": router_probabilities.sum(dim=0),
                 "top1_prob_sum": top1_probabilities.sum(),
-                "num_tokens": int(top1_experts.numel()),
+                "num_tokens": num_tokens,
+                # Actual dispatch after capacity and overflow handling.
+                "processed_tokens_per_expert": processed_tokens_per_expert,
+                "rerouted_tokens": int(rerouted_mask.sum().item()),
+                "dropped_tokens": int(dropped_mask.sum().item()),
             }
+            if capacity is not None:
+                stats["overflow_tokens_per_expert"] = (
+                    tokens_per_expert - capacity
+                ).clamp_min(0)
+                stats["capacity_per_expert"] = [capacity] * self.num_experts
+            else:
+                stats["overflow_tokens_per_expert"] = torch.zeros_like(
+                    tokens_per_expert
+                )
+                stats["capacity_per_expert"] = None
 
-        return outputs, stats
+        return outputs, stats, aux_loss
 
 
 class SwitchTransformerBlock(nn.Module):
@@ -4300,6 +4472,11 @@ class SwitchTransformerBlock(nn.Module):
         use_moe: bool,
         dropout: float = 0.0,
         collect_router_statistics: bool = True,
+        auxiliary_loss: bool = False,
+        aux_loss_coef: float = 0.01,
+        expert_capacity: bool = False,
+        capacity_factor: float = 1.25,
+        token_dropping: bool = False,
     ) -> None:
         super().__init__()
         self.use_moe = bool(use_moe)
@@ -4320,6 +4497,11 @@ class SwitchTransformerBlock(nn.Module):
                 num_experts=num_experts,
                 dropout=dropout,
                 collect_router_statistics=collect_router_statistics,
+                auxiliary_loss=auxiliary_loss,
+                aux_loss_coef=aux_loss_coef,
+                expert_capacity=expert_capacity,
+                capacity_factor=capacity_factor,
+                token_dropping=token_dropping,
             )
         else:
             self.mlp = SwitchFeedForward(
@@ -4331,7 +4513,7 @@ class SwitchTransformerBlock(nn.Module):
     def forward(
         self,
         inputs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> Tuple[torch.Tensor, Dict[str, Any], Optional[torch.Tensor]]:
         normalized = self.norm1(inputs)
         attention_outputs, _ = self.attention(
             normalized,
@@ -4342,12 +4524,13 @@ class SwitchTransformerBlock(nn.Module):
         outputs = inputs + self.attention_dropout(attention_outputs)
 
         if self.use_moe:
-            mlp_outputs, router_stats = self.mlp(self.norm2(outputs))
+            mlp_outputs, router_stats, aux_loss = self.mlp(self.norm2(outputs))
         else:
             mlp_outputs = self.mlp(self.norm2(outputs))
             router_stats = {}
+            aux_loss = None
 
-        return outputs + mlp_outputs, router_stats
+        return outputs + mlp_outputs, router_stats, aux_loss
 
 
 class SwitchViT(nn.Module):
@@ -4375,6 +4558,11 @@ class SwitchViT(nn.Module):
         moe_block_indices: Sequence[int] = (2, 4, 6),
         dropout: float = 0.0,
         router_statistics: bool = True,
+        auxiliary_loss: bool = False,
+        aux_loss_coef: float = 0.01,
+        expert_capacity: bool = False,
+        capacity_factor: float = 1.25,
+        token_dropping: bool = False,
     ) -> None:
         super().__init__()
 
@@ -4459,6 +4647,11 @@ class SwitchViT(nn.Module):
                 use_moe=(block_index in normalized_moe_blocks),
                 dropout=dropout,
                 collect_router_statistics=router_statistics,
+                auxiliary_loss=auxiliary_loss,
+                aux_loss_coef=aux_loss_coef,
+                expert_capacity=expert_capacity,
+                capacity_factor=capacity_factor,
+                token_dropping=token_dropping,
             )
             for block_index in range(1, transformer_layers + 1)
         ])
@@ -4504,21 +4697,29 @@ class SwitchViT(nn.Module):
         outputs = self.pos_dropout(outputs + self.pos_embed)
 
         moe_stats: Dict[str, Any] = {}
+        aux_loss_by_layer: Dict[str, torch.Tensor] = {}
         for block_index, block in enumerate(self.blocks, start=1):
-            outputs, layer_stats = block(outputs)
+            outputs, layer_stats, layer_aux_loss = block(outputs)
+            layer_name = f"blocks.{block_index - 1}.mlp"
             if layer_stats:
                 # Use the same module path as the expert parameters, allowing
                 # per-layer diagnostics to line up with federated param groups.
-                layer_name = f"blocks.{block_index - 1}.mlp"
                 moe_stats[layer_name] = layer_stats
+            if layer_aux_loss is not None:
+                aux_loss_by_layer[layer_name] = layer_aux_loss
 
         cls_features = self.norm(outputs[:, 0])
         logits = self.head(cls_features)
+        aux_loss = (
+            torch.stack(list(aux_loss_by_layer.values())).sum()
+            if aux_loss_by_layer
+            else None
+        )
 
         return ModelOutput(
             logits=logits,
-            aux_loss=None,
-            aux_loss_by_layer={},
+            aux_loss=aux_loss,
+            aux_loss_by_layer=aux_loss_by_layer,
             moe_stats=moe_stats,
         )
 
@@ -4529,9 +4730,31 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
 
     if str(model_cfg.get("routing", "top1")).strip().lower() != "top1":
         raise ValueError("当前 SwitchViT 仅实现 Top-1 Routing。")
-    if bool(model_cfg.get("auxiliary_loss", False)):
+    auxiliary_loss = model_cfg.get("auxiliary_loss", False)
+    expert_capacity = model_cfg.get("expert_capacity", False)
+    token_dropping = model_cfg.get("token_dropping", False)
+    for option_name, option_value in (
+        ("auxiliary_loss", auxiliary_loss),
+        ("expert_capacity", expert_capacity),
+        ("token_dropping", token_dropping),
+    ):
+        if not isinstance(option_value, bool):
+            raise TypeError(f"{option_name} 必须是 bool，当前值：{option_value!r}")
+
+    aux_loss_coef = float(model_cfg.get("aux_loss_coef", 0.01))
+    capacity_factor = float(model_cfg.get("capacity_factor", 1.25))
+    if not math.isfinite(aux_loss_coef) or aux_loss_coef < 0.0:
+        raise ValueError("aux_loss_coef 必须是非负有限数。")
+    if not math.isfinite(capacity_factor) or capacity_factor <= 0.0:
+        raise ValueError("capacity_factor 必须是正有限数。")
+    if token_dropping and not expert_capacity:
         raise ValueError(
-            "SwitchViT Auxiliary Loss 当前按实验约定关闭，暂不支持开启。"
+            "token_dropping=True 时必须同时启用 expert_capacity。"
+        )
+    if expert_capacity and not token_dropping and capacity_factor < 1.0:
+        raise ValueError(
+            "启用 expert_capacity 且关闭 token_dropping 时，"
+            "capacity_factor 必须 >= 1.0。"
         )
 
     num_experts = int(_cfg_get(cfg, "num_experts", 4))
@@ -4551,6 +4774,11 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
         moe_block_indices=model_cfg["moe_block_indices"],
         dropout=float(model_cfg.get("dropout", 0.0)),
         router_statistics=bool(model_cfg.get("router_statistics", True)),
+        auxiliary_loss=auxiliary_loss,
+        aux_loss_coef=aux_loss_coef,
+        expert_capacity=expert_capacity,
+        capacity_factor=capacity_factor,
+        token_dropping=token_dropping,
     )
 
 
