@@ -213,6 +213,57 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 ("cifar100", "resnet_cifar", "legacy_run_name"),
             )
 
+    def test_method_options_are_recorded_without_algorithm_name_checks(self) -> None:
+        orthogonal_options = {
+            "stiefel_blocks": {
+                "layer_0": {
+                    "parameter_patterns": [
+                        "blocks.0.moe.experts.expert_0.wi.weight"
+                    ]
+                }
+            }
+        }
+        cfg = base.load_embedded_config(
+            method_overrides={
+                "agg": {
+                    "non_expert": {"method": "uniform"},
+                    "expert": {"method": "custom_expert_method"},
+                },
+                # Legacy method-owned root options remain supported.
+                "orthogonal": orthogonal_options,
+                "custom_extension": {"scale": 0.25},
+                # New method-owned options use the generic namespace.
+                "method_config": {
+                    "routing": {"capacity_factor": 1.25},
+                },
+            }
+        )
+
+        record = base._build_config_record(cfg)
+        self.assertEqual(
+            record["aggregation"]["method_config"],
+            {
+                "orthogonal": orthogonal_options,
+                "custom_extension": {"scale": 0.25},
+                "routing": {"capacity_factor": 1.25},
+            },
+        )
+        self.assertNotIn(
+            "optimizer",
+            record["aggregation"]["method_config"],
+        )
+        self.assertNotIn(
+            "model_cfg",
+            record["aggregation"]["method_config"],
+        )
+
+    def test_method_config_must_be_a_mapping(self) -> None:
+        cfg = base.load_embedded_config().to_dict()
+        cfg["method_config"] = ["not", "a", "mapping"]
+
+        with self.assertRaises(base.ConfigError):
+            base._validate_config(cfg)
+
     def test_plot_keeps_multiple_runs_of_the_same_method(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
