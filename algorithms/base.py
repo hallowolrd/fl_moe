@@ -4542,6 +4542,17 @@ def count_tensors_by_group(groups: ParamGroups) -> Dict[str, int]:
             int(expert_id): len(names)
             for expert_id, names in groups.expert_by_id.items()
         },
+        "expert_by_moe_layer": {
+            layer_name: len(names)
+            for layer_name, names in groups.expert_by_moe_layer.items()
+        },
+        "expert_by_layer_and_id": {
+            layer_name: {
+                int(expert_id): len(names)
+                for expert_id, names in expert_groups.items()
+            }
+            for layer_name, expert_groups in groups.expert_by_layer_and_id.items()
+        },
     }
 
 
@@ -4581,6 +4592,25 @@ def count_numel_by_group(
                 only_floating=only_floating,
             )
             for expert_id, names in groups.expert_by_id.items()
+        },
+        "expert_by_moe_layer": {
+            layer_name: _count_numel(
+                state_dict=state_dict,
+                names=names,
+                only_floating=only_floating,
+            )
+            for layer_name, names in groups.expert_by_moe_layer.items()
+        },
+        "expert_by_layer_and_id": {
+            layer_name: {
+                int(expert_id): _count_numel(
+                    state_dict=state_dict,
+                    names=names,
+                    only_floating=only_floating,
+                )
+                for expert_id, names in expert_groups.items()
+            }
+            for layer_name, expert_groups in groups.expert_by_layer_and_id.items()
         },
     }
 
