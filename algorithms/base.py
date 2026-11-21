@@ -4552,7 +4552,8 @@ class RoundResult:
     每一轮联邦训练结束后的结果摘要。
 
     各类数据按职责分别保存：
-        train_metrics: 客户端本地训练指标的样本数加权平均。
+        train_metrics: 客户端本地训练指标的样本数加权平均，
+            包含总训练损失、分类损失、辅助损失和准确率。
         test_metrics: 服务器全局模型的测试集指标。
         aggregation_info: non_expert / expert 聚合结果与算法诊断。
         client_diagnostics: 每个客户端的完整轻量诊断信息。
@@ -7027,7 +7028,7 @@ class FLServer:
 
         每行包含：
             1. 客户端样本数
-            2. 客户端本地 train_loss / train_acc
+            2. 客户端本地总损失、分类损失、辅助损失和准确率
             3. non_expert 聚合权重
             4. expert 聚合权重
         """
