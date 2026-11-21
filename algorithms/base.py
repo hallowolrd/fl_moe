@@ -4390,6 +4390,21 @@ class SwitchViT(nn.Module):
         )
         if min(in_channels, image_height, image_width) <= 0:
             raise ValueError(f"非法 input_shape：{input_shape}")
+        if min(
+            transformer_layers,
+            hidden_dim,
+            attention_heads,
+            patch_size,
+            expert_hidden_dim,
+            num_experts,
+            num_classes,
+        ) <= 0:
+            raise ValueError(
+                "transformer_layers、hidden_dim、attention_heads、patch_size、"
+                "expert_hidden_dim、num_experts 和 num_classes 必须为正整数。"
+            )
+        if not 0.0 <= float(dropout) < 1.0:
+            raise ValueError(f"dropout 必须位于 [0, 1)，当前值：{dropout}")
         if image_height % patch_size != 0 or image_width % patch_size != 0:
             raise ValueError(
                 f"图像尺寸 {(image_height, image_width)} 必须能被 "
@@ -4400,8 +4415,6 @@ class SwitchViT(nn.Module):
                 f"hidden_dim={hidden_dim} 必须能被 "
                 f"attention_heads={attention_heads} 整除。"
             )
-        if transformer_layers <= 0 or num_classes <= 0:
-            raise ValueError("transformer_layers 和 num_classes 必须为正整数。")
 
         normalized_moe_blocks = tuple(int(index) for index in moe_block_indices)
         if (
@@ -4523,8 +4536,6 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
 
     num_experts = int(_cfg_get(cfg, "num_experts", 4))
     input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
-    if isinstance(input_shape, ConfigNode):
-        input_shape = tuple(input_shape.to_dict().values())
     if not isinstance(input_shape, (tuple, list)):
         raise TypeError("input_shape 必须是包含 channels、height、width 的序列。")
 
