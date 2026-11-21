@@ -4444,18 +4444,20 @@ class SwitchMoE(nn.Module):
                 # Actual dispatch after capacity and overflow handling.
                 "processed_tokens_per_expert": processed_tokens_per_expert,
                 "rerouted_tokens": int(rerouted_mask.sum().item()),
+                "rerouted_tokens_per_expert": torch.bincount(
+                    assigned_experts[rerouted_mask],
+                    minlength=self.num_experts,
+                ),
                 "dropped_tokens": int(dropped_mask.sum().item()),
             }
             if capacity is not None:
                 stats["overflow_tokens_per_expert"] = (
                     tokens_per_expert - capacity
                 ).clamp_min(0)
-                stats["capacity_per_expert"] = [capacity] * self.num_experts
             else:
                 stats["overflow_tokens_per_expert"] = torch.zeros_like(
                     tokens_per_expert
                 )
-                stats["capacity_per_expert"] = None
 
         return outputs, stats, aux_loss
 
