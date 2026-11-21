@@ -351,6 +351,10 @@ class MultiLayerParamGroupTests(unittest.TestCase):
             )
         )
 
+        root_name = "experts.expert_0.wi.weight"
+        self.assertEqual(base.get_expert_id_from_name(root_name), 0)
+        self.assertEqual(base.get_moe_layer_from_name(root_name), "<root>")
+
     def test_root_level_experts_have_explicit_root_layer_key(self) -> None:
         model = TinyRootExperts()
 
