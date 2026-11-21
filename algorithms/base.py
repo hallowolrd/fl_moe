@@ -6755,6 +6755,18 @@ class FLServer:
             weighted=True,
             default=None,
         )
+        avg_train_task_loss = average_client_metric(
+            client_updates=list(client_updates),
+            metric_name="train_task_loss",
+            weighted=True,
+            default=None,
+        )
+        avg_train_aux_loss = average_client_metric(
+            client_updates=list(client_updates),
+            metric_name="train_aux_loss",
+            weighted=True,
+            default=None,
+        )
         avg_train_acc = average_client_metric(
             client_updates=list(client_updates),
             metric_name="train_acc",
@@ -6763,8 +6775,11 @@ class FLServer:
         )
 
         # 不同职责的数据分别存储，aggregation_info 只包含聚合结果与诊断。
+        # 所有本地训练损失均按实际处理样本数加权。
         train_metrics = {
             "avg_train_loss": avg_train_loss,
+            "avg_train_task_loss": avg_train_task_loss,
+            "avg_train_aux_loss": avg_train_aux_loss,
             "avg_train_acc": avg_train_acc,
         }
         test_metrics = {
@@ -6843,24 +6858,39 @@ class FLServer:
             "avg_train_loss",
             None,
         )
+        avg_train_task_loss = round_result.train_metrics.get(
+            "avg_train_task_loss",
+            None,
+        )
+        avg_train_aux_loss = round_result.train_metrics.get(
+            "avg_train_aux_loss",
+            None,
+        )
         avg_train_acc = round_result.train_metrics.get(
             "avg_train_acc",
             None,
         )
 
-        if avg_train_loss is None:
-            avg_train_loss_text = "nan"
-        else:
-            avg_train_loss_text = f"{avg_train_loss:.4f}"
-
-        if avg_train_acc is None:
-            avg_train_acc_text = "nan"
-        else:
-            avg_train_acc_text = f"{avg_train_acc:.2f}%"
+        avg_train_loss_text = self._format_metric(avg_train_loss, fmt=".4f")
+        avg_train_task_loss_text = self._format_metric(
+            avg_train_task_loss,
+            fmt=".4f",
+        )
+        avg_train_aux_loss_text = self._format_metric(
+            avg_train_aux_loss,
+            fmt=".4f",
+        )
+        avg_train_acc_text = self._format_metric(
+            avg_train_acc,
+            fmt=".2f",
+            suffix="%",
+        )
 
         print(
             f"[Round {round_result.round_id:03d}] "
             f"train_loss={avg_train_loss_text} | "
+            f"task_loss={avg_train_task_loss_text} | "
+            f"aux_loss={avg_train_aux_loss_text} | "
             f"train_acc={avg_train_acc_text} | "
             f"test_loss={round_result.test_metrics['test_loss']:.4f} | "
             f"test_acc={round_result.test_metrics['test_acc']:.2f}% | "
@@ -6880,6 +6910,14 @@ class FLServer:
             "avg_train_loss",
             None,
         )
+        avg_train_task_loss = round_result.train_metrics.get(
+            "avg_train_task_loss",
+            None,
+        )
+        avg_train_aux_loss = round_result.train_metrics.get(
+            "avg_train_aux_loss",
+            None,
+        )
         avg_train_acc = round_result.train_metrics.get(
             "avg_train_acc",
             None,
@@ -6887,6 +6925,14 @@ class FLServer:
 
         avg_train_loss_text = self._format_metric(
             avg_train_loss,
+            fmt=".4f",
+        )
+        avg_train_task_loss_text = self._format_metric(
+            avg_train_task_loss,
+            fmt=".4f",
+        )
+        avg_train_aux_loss_text = self._format_metric(
+            avg_train_aux_loss,
             fmt=".4f",
         )
         avg_train_acc_text = self._format_metric(
@@ -6899,6 +6945,8 @@ class FLServer:
             f"[RoundMetrics] "
             f"round={round_result.round_id} "
             f"train_loss={avg_train_loss_text} "
+            f"task_loss={avg_train_task_loss_text} "
+            f"aux_loss={avg_train_aux_loss_text} "
             f"train_acc={avg_train_acc_text} "
             f"test_loss={round_result.test_metrics['test_loss']:.4f} "
             f"test_acc={round_result.test_metrics['test_acc']:.2f}% "
@@ -7028,6 +7076,14 @@ class FLServer:
                 metrics.get("train_loss", None),
                 fmt=".4f",
             )
+            train_task_loss = self._format_metric(
+                metrics.get("train_task_loss", None),
+                fmt=".4f",
+            )
+            train_aux_loss = self._format_metric(
+                metrics.get("train_aux_loss", None),
+                fmt=".4f",
+            )
             train_acc = self._format_metric(
                 metrics.get("train_acc", None),
                 fmt=".2f",
@@ -7046,6 +7102,8 @@ class FLServer:
                 f"round={round_result.round_id} "
                 f"samples={num_samples} "
                 f"train_loss={train_loss} "
+                f"task_loss={train_task_loss} "
+                f"aux_loss={train_aux_loss} "
                 f"train_acc={train_acc} "
                 f"non_expert_w={non_expert_weight} "
                 f"expert_w={expert_weight}"
@@ -7933,6 +7991,8 @@ def save_round_results_csv(
         round_id
         selected_clients
         avg_train_loss
+        avg_train_task_loss
+        avg_train_aux_loss
         avg_train_acc
         test_loss
         test_acc
@@ -7944,6 +8004,8 @@ def save_round_results_csv(
         "round_id",
         "selected_clients",
         "avg_train_loss",
+        "avg_train_task_loss",
+        "avg_train_aux_loss",
         "avg_train_acc",
         "test_loss",
         "test_acc",
@@ -7969,6 +8031,14 @@ def save_round_results_csv(
                 ),
                 "avg_train_loss": train_metrics.get(
                     "avg_train_loss",
+                    "",
+                ),
+                "avg_train_task_loss": train_metrics.get(
+                    "avg_train_task_loss",
+                    "",
+                ),
+                "avg_train_aux_loss": train_metrics.get(
+                    "avg_train_aux_loss",
                     "",
                 ),
                 "avg_train_acc": train_metrics.get(
