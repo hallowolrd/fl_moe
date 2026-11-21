@@ -38,17 +38,17 @@ class SwitchViTTests(unittest.TestCase):
             "--moe-block-indices", "2", "4", "6",
             "--routing", "top1",
             "--dropout", "0.1",
-            "--auxiliary-loss",
             "--aux-loss-coef", "0.02",
-            "--expert-capacity",
             "--capacity-factor", "1.5",
-            "--no-token-dropping",
-            "--no-router-statistics",
+            "--token-dropping", "False",
+            "--router-statistics", "False",
+            "--data-augmentation", "True",
         ]
         with patch.object(sys, "argv", argv):
             args = base.parse_args()
 
         overrides = base.build_common_cli_overrides(args)
+        self.assertTrue(overrides["data_augmentation"])
         self.assertEqual(
             overrides["model_cfg"],
             {
@@ -60,22 +60,21 @@ class SwitchViTTests(unittest.TestCase):
                 "moe_block_indices": [2, 4, 6],
                 "routing": "top1",
                 "dropout": 0.1,
-                "auxiliary_loss": True,
                 "aux_loss_coef": 0.02,
-                "expert_capacity": True,
                 "capacity_factor": 1.5,
                 "token_dropping": False,
                 "router_statistics": False,
             },
         )
 
-    def test_switch_vit_cli_can_explicitly_disable_boolean_options(self) -> None:
+    def test_switch_vit_cli_accepts_explicit_boolean_values(self) -> None:
         argv = [
             "uniform.py",
-            "--no-auxiliary-loss",
-            "--no-expert-capacity",
-            "--no-token-dropping",
-            "--router-statistics",
+            "--aux-loss-coef", "0",
+            "--capacity-factor", "0",
+            "--token-dropping", "False",
+            "--router-statistics", "True",
+            "--data-augmentation", "False",
         ]
         with patch.object(sys, "argv", argv):
             args = base.parse_args()
@@ -84,12 +83,19 @@ class SwitchViTTests(unittest.TestCase):
         self.assertEqual(
             overrides["model_cfg"],
             {
-                "auxiliary_loss": False,
-                "expert_capacity": False,
+                "aux_loss_coef": 0.0,
+                "capacity_factor": 0.0,
                 "token_dropping": False,
                 "router_statistics": True,
             },
         )
+        self.assertFalse(overrides["data_augmentation"])
+
+    def test_switch_vit_cli_rejects_invalid_boolean_values(self) -> None:
+        argv = ["uniform.py", "--token-dropping", "sometimes"]
+        with patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit):
+                base.parse_args()
 
     def test_switch_vit_cli_omitted_options_preserve_config_defaults(self) -> None:
         with patch.object(sys, "argv", ["uniform.py"]):
@@ -221,7 +227,6 @@ class SwitchViTTests(unittest.TestCase):
         cfg = {
             **self.cfg,
             "model_cfg": {
-                "auxiliary_loss": True,
                 "aux_loss_coef": 0.01,
             },
         }
@@ -262,7 +267,6 @@ class SwitchViTTests(unittest.TestCase):
             hidden_dim=4,
             expert_hidden_dim=8,
             num_experts=num_experts,
-            expert_capacity=True,
             capacity_factor=capacity_factor,
             token_dropping=token_dropping,
         )
@@ -302,7 +306,6 @@ class SwitchViTTests(unittest.TestCase):
         cfg = {
             **self.cfg,
             "model_cfg": {
-                "expert_capacity": True,
                 "capacity_factor": 1.0,
                 "token_dropping": False,
             },
@@ -351,17 +354,16 @@ class SwitchViTTests(unittest.TestCase):
             base.build_switch_vit_model({
                 **self.cfg,
                 "model_cfg": {
-                    "expert_capacity": True,
                     "capacity_factor": 0.5,
                     "token_dropping": False,
                 },
             })
 
-        with self.assertRaisesRegex(ValueError, "expert_capacity"):
+        with self.assertRaisesRegex(ValueError, "capacity_factor"):
             base.build_switch_vit_model({
                 **self.cfg,
                 "model_cfg": {
-                    "expert_capacity": False,
+                    "capacity_factor": 0.0,
                     "token_dropping": True,
                 },
             })
