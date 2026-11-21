@@ -4225,9 +4225,11 @@ class SwitchMoE(nn.Module):
         super().__init__()
         if num_experts <= 0:
             raise ValueError("num_experts 必须是正整数。")
-        if not math.isfinite(float(aux_loss_coef)) or float(aux_loss_coef) < 0.0:
+        aux_loss_coef = float(aux_loss_coef)
+        capacity_factor = float(capacity_factor)
+        if not math.isfinite(aux_loss_coef) or aux_loss_coef < 0.0:
             raise ValueError("aux_loss_coef 必须是非负有限数。")
-        if not math.isfinite(float(capacity_factor)) or float(capacity_factor) <= 0.0:
+        if not math.isfinite(capacity_factor) or capacity_factor <= 0.0:
             raise ValueError("capacity_factor 必须是正有限数。")
         if token_dropping and not expert_capacity:
             raise ValueError(
@@ -4289,7 +4291,7 @@ class SwitchMoE(nn.Module):
             remaining_probabilities,
             dim=-1,
             descending=True,
-        )
+        )[:, : self.num_experts - 1]
         routing_order = torch.cat(
             (top1_experts.unsqueeze(1), remaining_order),
             dim=1,
@@ -4544,7 +4546,7 @@ class SwitchViT(nn.Module):
       - 4x4 patches + CLS token = 65 tokens for 32x32 images
       - MoE FFNs in blocks 2, 4, and 6; dense FFNs in blocks 1, 3, and 5
       - 4 experts per MoE layer, each with hidden size 1024
-      - Top-1 routing, no capacity limit, no token dropping, no auxiliary loss
+      - Top-1 routing; auxiliary loss, capacity, and token dropping are disabled by default
     """
 
     def __init__(
