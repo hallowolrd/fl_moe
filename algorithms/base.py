@@ -2018,6 +2018,56 @@ def _get_model_delta(update: Any) -> Mapping[str, torch.Tensor]:
 # ============================================================================
 
 
+@dataclass
+class ModelOutput:
+    """
+    模型前向传播的统一输出接口。
+
+    logits:
+        分类任务输出，形状通常为 [batch_size, num_classes]。
+
+    aux_loss:
+        已经完成层内/层间加权的辅助损失标量。
+        模型负责计算辅助损失及其权重，联邦训练框架只负责将其加入 task loss。
+
+    aux_loss_by_layer:
+        可选的逐层辅助损失，主要用于后续诊断；不参与二次加权。
+
+    moe_stats:
+        可选的 MoE 路由统计。应当是轻量统计信息，不应保存计算图。
+    """
+
+    logits: torch.Tensor
+    aux_loss: Optional[torch.Tensor] = None
+    aux_loss_by_layer: Dict[str, torch.Tensor] = field(default_factory=dict)
+    moe_stats: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not torch.is_tensor(self.logits):
+            raise TypeError("ModelOutput.logits 必须是 torch.Tensor。")
+
+        if self.aux_loss is not None and not torch.is_tensor(self.aux_loss):
+            raise TypeError("ModelOutput.aux_loss 必须是 torch.Tensor 或 None。")
+
+        if not isinstance(self.aux_loss_by_layer, Mapping):
+            raise TypeError("ModelOutput.aux_loss_by_layer 必须是 Mapping。")
+
+        if not isinstance(self.moe_stats, Mapping):
+            raise TypeError("ModelOutput.moe_stats 必须是 Mapping。")
+
+        self.aux_loss_by_layer = dict(self.aux_loss_by_layer)
+        self.moe_stats = dict(self.moe_stats)
+
+
+@dataclass(frozen=True)
+class ModelLoss:
+    """一次前向传播对应的分类损失、辅助损失和总损失。"""
+
+    total_loss: torch.Tensor
+    task_loss: torch.Tensor
+    aux_loss: torch.Tensor
+
+
 @dataclass(frozen=True)
 class EvalResult:
     """
@@ -2177,14 +2227,11 @@ def extract_logits(outputs: Any) -> torch.Tensor:
     """
     从模型输出中提取 logits。
 
-    支持：
+    保留旧接口，兼容：
         1. 直接返回 logits tensor
         2. 返回对象，且对象有 .logits
         3. 返回 dict，且 dict["logits"]
         4. 返回 tuple/list，默认第一个元素是 logits
-
-    这样可以兼容：
-        logits = model(x)
     """
     if torch.is_tensor(outputs):
         return outputs
@@ -2216,6 +2263,94 @@ def extract_logits(outputs: Any) -> torch.Tensor:
 
     raise TypeError(
         f"无法从模型输出中提取 logits，输出类型：{type(outputs)}"
+    )
+
+
+def extract_model_output(outputs: Any) -> ModelOutput:
+    """
+    将新旧模型的前向输出统一转换为 ModelOutput。
+
+    旧模型只返回 Tensor、Tuple 或仅包含 logits 的 Dict 时，
+    aux_loss 自动视为 None，不改变原有训练行为。
+    """
+    if isinstance(outputs, ModelOutput):
+        return outputs
+
+    logits = extract_logits(outputs)
+    aux_loss = None
+    aux_loss_by_layer: Mapping[str, torch.Tensor] = {}
+    moe_stats: Mapping[str, Any] = {}
+
+    if isinstance(outputs, Mapping):
+        aux_loss = outputs.get("aux_loss")
+        aux_loss_by_layer = outputs.get("aux_loss_by_layer", {})
+        moe_stats = outputs.get("moe_stats", {})
+    elif hasattr(outputs, "logits"):
+        aux_loss = getattr(outputs, "aux_loss", None)
+        aux_loss_by_layer = getattr(outputs, "aux_loss_by_layer", {})
+        moe_stats = getattr(outputs, "moe_stats", {})
+
+    if aux_loss_by_layer is None:
+        aux_loss_by_layer = {}
+    if moe_stats is None:
+        moe_stats = {}
+
+    return ModelOutput(
+        logits=logits,
+        aux_loss=aux_loss,
+        aux_loss_by_layer=aux_loss_by_layer,
+        moe_stats=moe_stats,
+    )
+
+
+def compute_model_loss(
+    outputs: Any,
+    targets: torch.Tensor,
+    criterion: nn.Module,
+) -> ModelLoss:
+    """
+    统一计算模型训练损失。
+
+    total_loss = task_loss + aux_loss
+
+    aux_loss 必须是模型返回的最终加权标量。框架不再对它乘权重，
+    避免模型层和联邦训练层重复加权。没有辅助损失时使用与 task_loss
+    同设备、同 dtype 的零标量，保证普通分类模型行为不变。
+    """
+    model_output = extract_model_output(outputs)
+    task_loss = criterion(model_output.logits, targets)
+
+    if not torch.is_tensor(task_loss):
+        raise TypeError("criterion 必须返回 torch.Tensor。")
+    if task_loss.numel() != 1:
+        raise ValueError(
+            "criterion 必须返回标量损失；"
+            f"当前 task_loss shape={tuple(task_loss.shape)}"
+        )
+    task_loss = task_loss.reshape(())
+
+    if model_output.aux_loss is None:
+        aux_loss = task_loss.new_zeros(())
+    else:
+        aux_loss = model_output.aux_loss
+        if aux_loss.numel() != 1:
+            raise ValueError(
+                "ModelOutput.aux_loss 必须是标量；"
+                f"当前 aux_loss shape={tuple(aux_loss.shape)}"
+            )
+        if not aux_loss.is_floating_point():
+            raise TypeError("ModelOutput.aux_loss 必须是浮点 Tensor。")
+        if aux_loss.device != task_loss.device:
+            raise ValueError(
+                "task_loss 和 aux_loss 必须位于同一设备；"
+                f"task_loss={task_loss.device}, aux_loss={aux_loss.device}"
+            )
+        aux_loss = aux_loss.reshape(())
+
+    return ModelLoss(
+        total_loss=task_loss + aux_loss,
+        task_loss=task_loss,
+        aux_loss=aux_loss,
     )
 
 
@@ -4596,13 +4731,19 @@ class ClientTrainStats:
     train_acc: float
     num_samples: int
     num_batches: int
+    avg_task_loss: float = 0.0
+    avg_aux_loss: float = 0.0
 
     def to_metrics(self) -> Dict[str, float]:
         """
         转成 ClientUpdate.metrics 使用的普通 dict。
+
+        train_loss 保持为总损失，新增 task/aux 分项便于分析 MoE 训练行为。
         """
         return {
             "train_loss": float(self.avg_loss),
+            "train_task_loss": float(self.avg_task_loss),
+            "train_aux_loss": float(self.avg_aux_loss),
             "train_acc": float(self.train_acc),
             "num_batches": float(self.num_batches),
             "num_processed_samples": float(self.num_samples),
@@ -5037,6 +5178,8 @@ def train_local_model(
     model.train()
 
     total_loss = 0.0
+    total_task_loss = 0.0
+    total_aux_loss = 0.0
     total_correct = 0
     total_samples = 0
     total_batches = 0
@@ -5054,10 +5197,14 @@ def train_local_model(
         optimizer.zero_grad(set_to_none=True)
 
         outputs = model(images)
-        logits = extract_logits(outputs)
-
-        loss = criterion(logits, targets)
-        loss.backward()
+        model_output = extract_model_output(outputs)
+        loss_output = compute_model_loss(
+            outputs=model_output,
+            targets=targets,
+            criterion=criterion,
+        )
+        logits = model_output.logits
+        loss_output.total_loss.backward()
 
         if grad_clip is not None and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -5069,7 +5216,9 @@ def train_local_model(
 
         batch_size = int(targets.size(0))
 
-        total_loss += float(loss.item()) * batch_size
+        total_loss += float(loss_output.total_loss.item()) * batch_size
+        total_task_loss += float(loss_output.task_loss.item()) * batch_size
+        total_aux_loss += float(loss_output.aux_loss.item()) * batch_size
         total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
         total_samples += batch_size
         total_batches += 1
@@ -5077,14 +5226,13 @@ def train_local_model(
     if total_samples <= 0:
         raise ValueError("客户端本地训练没有处理任何样本。")
 
-    avg_loss = total_loss / total_samples
-    train_acc = 100.0 * total_correct / total_samples
-
     return ClientTrainStats(
-        avg_loss=avg_loss,
-        train_acc=train_acc,
+        avg_loss=total_loss / total_samples,
+        train_acc=100.0 * total_correct / total_samples,
         num_samples=total_samples,
         num_batches=total_batches,
+        avg_task_loss=total_task_loss / total_samples,
+        avg_aux_loss=total_aux_loss / total_samples,
     )
 
 
@@ -5243,6 +5391,8 @@ def train_local_model_with_expert_strategy(
     strategy.on_train_start(context)
 
     total_loss = 0.0
+    total_task_loss = 0.0
+    total_aux_loss = 0.0
     total_correct = 0
     total_samples = 0
     total_batches = 0
@@ -5252,7 +5402,14 @@ def train_local_model_with_expert_strategy(
         epoch: int,
         batch_index: int,
     ) -> None:
-        nonlocal total_loss, total_correct, total_samples, total_batches
+        nonlocal (
+            total_loss,
+            total_task_loss,
+            total_aux_loss,
+            total_correct,
+            total_samples,
+            total_batches,
+        )
 
         images, targets = unpack_batch(batch)
         images = images.to(device, non_blocking=True)
@@ -5262,9 +5419,14 @@ def train_local_model_with_expert_strategy(
         model.zero_grad(set_to_none=True)
 
         outputs = model(images)
-        logits = extract_logits(outputs)
-        loss = criterion(logits, targets)
-        loss.backward()
+        model_output = extract_model_output(outputs)
+        loss_output = compute_model_loss(
+            outputs=model_output,
+            targets=targets,
+            criterion=criterion,
+        )
+        logits = model_output.logits
+        loss_output.total_loss.backward()
 
         if grad_clip is not None and grad_clip > 0:
             handles_expert_grad_clip = strategy.handles_expert_grad_clip
@@ -5292,7 +5454,7 @@ def train_local_model_with_expert_strategy(
                 images=images,
                 targets=targets,
                 logits=logits,
-                loss=loss,
+                loss=loss_output.total_loss,
             )
         )
 
@@ -5303,7 +5465,9 @@ def train_local_model_with_expert_strategy(
         optimizer.step()
 
         batch_size = int(targets.size(0))
-        total_loss += float(loss.item()) * batch_size
+        total_loss += float(loss_output.total_loss.item()) * batch_size
+        total_task_loss += float(loss_output.task_loss.item()) * batch_size
+        total_aux_loss += float(loss_output.aux_loss.item()) * batch_size
         total_correct += int(logits.argmax(dim=1).eq(targets).sum().item())
         total_samples += batch_size
         total_batches += 1
@@ -5336,6 +5500,8 @@ def train_local_model_with_expert_strategy(
         train_acc=100.0 * total_correct / total_samples,
         num_samples=total_samples,
         num_batches=total_batches,
+        avg_task_loss=total_task_loss / total_samples,
+        avg_aux_loss=total_aux_loss / total_samples,
     )
     return ExpertClientTrainResult(
         stats=stats,
