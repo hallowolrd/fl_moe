@@ -259,7 +259,6 @@ from typing import (
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 from PIL import Image
@@ -312,10 +311,6 @@ def normalize_dataset_name(dataset_name: str) -> str:
     """Normalize common dataset spelling variants to one canonical name."""
     key = str(dataset_name).strip().lower()
     return DATASET_ALIASES.get(key, key)
-
-SUPPORTED_MODELS = {
-    "sparse_moe_classifier",
-}
 
 
 class ConfigError(Exception):
@@ -426,12 +421,9 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "batch_size": 64,
     "test_batch_size": 64,
     "num_workers": 2,
-    "model": "sparse_moe_classifier",
-    "model_cfg": {
-        "backbone": "resnet_cifar",
-    },
+    "model": "switch_vit",
+    "model_cfg": {},
     "num_experts": 4,
-    "topk": 2,
     "optimizer": {
         "type": "sgd",
         "lr": 0.01,
@@ -460,7 +452,6 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "save_config": True,
         "save_results_csv": True,
         "progress_bar": True,
-        "collect_expert_usage": True,
     },
 }
 
@@ -582,35 +573,9 @@ def _build_config_record(
     model_record: Dict[str, Any] = {}
     if raw.get("model") is not None:
         model_record["architecture"] = copy.deepcopy(raw["model"])
-
     model_cfg = as_mapping(raw.get("model_cfg"))
-    if model_cfg.get("backbone") is not None:
-        model_record["backbone"] = copy.deepcopy(model_cfg["backbone"])
-    for key in ("in_channels", "image_size"):
-        if key in model_cfg:
-            model_record[key] = copy.deepcopy(model_cfg[key])
-
-    moe_record: Dict[str, Any] = {}
-    hidden_dim = model_cfg.get(
-        "moe_hidden_dim",
-        model_cfg.get("hidden_dim", 512),
-    )
-    if hidden_dim is not None:
-        moe_record["hidden_dim"] = copy.deepcopy(hidden_dim)
-
-    for source_key, record_key in (
-        ("num_experts", "experts"),
-        ("topk", "top_k"),
-    ):
-        value = raw.get(source_key)
-        if value is not None:
-            moe_record[record_key] = copy.deepcopy(value)
-
-    if bool(model_cfg.get("renormalize_topk_probs", False)):
-        moe_record["renormalize_topk_probs"] = True
-
-    if moe_record:
-        model_record["moe"] = moe_record
+    if model_cfg:
+        model_record["config"] = copy.deepcopy(model_cfg)
     if model_record:
         record["model"] = model_record
 
@@ -718,7 +683,6 @@ def _build_config_record(
             "save_config",
             "save_results_csv",
             "progress_bar",
-            "collect_expert_usage",
         )
         if bool(logging_cfg.get(key, False))
     }
@@ -1160,7 +1124,7 @@ def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
     """
     Validate the intentionally small public logging configuration surface.
 
-    Only four logging options remain configurable. Legacy/fixed behavior keys
+    Only three logging options remain configurable. Legacy/fixed behavior keys
     are rejected explicitly so stale YAML files cannot silently change the
     framework's fixed logging behavior.
     """
@@ -1178,7 +1142,6 @@ def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
         "log_client_metrics",
         "log_agg_weights",
         "compact_uniform_weights",
-        "expert_usage_max_batches",
     }
     configured_deprecated = sorted(
         set(logging_cfg.keys()).intersection(deprecated_keys)
@@ -1195,7 +1158,6 @@ def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
         "save_config",
         "save_results_csv",
         "progress_bar",
-        "collect_expert_usage",
     }
     unsupported_keys = sorted(set(logging_cfg.keys()) - supported_keys)
     if unsupported_keys:
@@ -1222,21 +1184,11 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     model = cfg.get("model")
-    if model not in SUPPORTED_MODELS:
-        raise ConfigError(
-            f"不支持的模型：{model}。"
-            f"当前支持：{sorted(SUPPORTED_MODELS)}"
-        )
-
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigError("model 必须是非空字符串。")
     model_cfg = cfg.get("model_cfg", {})
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
-    backbone = str(model_cfg.get("backbone", "resnet_cifar")).lower().strip()
-    if backbone not in BACKBONE_BUILDERS:
-        raise ConfigError(
-            f"不支持的 backbone：{backbone}。"
-            f"当前支持：{sorted(BACKBONE_BUILDERS.keys())}"
-        )
 
     agg_cfg = cfg.get("agg", {})
     non_expert_method = agg_cfg.get("non_expert", {}).get("method")
@@ -1270,7 +1222,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_positive_int(cfg, "test_batch_size")
     _require_non_negative_int(cfg, "num_workers")
     _require_positive_int(cfg, "num_experts")
-    _require_positive_int(cfg, "topk")
 
     server_evidence_cfg = cfg.get("server_evidence", {})
     if not isinstance(server_evidence_cfg, Mapping):
@@ -1296,12 +1247,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             "server_evidence.batch_size 必须是正整数，"
             f"当前值：{server_evidence_batch_size}"
-        )
-
-    if int(cfg["topk"]) > int(cfg["num_experts"]):
-        raise ConfigError(
-            f"topk 不能大于 num_experts："
-            f"topk={cfg['topk']}, num_experts={cfg['num_experts']}"
         )
 
     frac = float(cfg.get("frac"))
@@ -2240,10 +2185,6 @@ def extract_logits(outputs: Any) -> torch.Tensor:
 
     这样可以兼容：
         logits = model(x)
-
-    也可以兼容：
-        output = model(x, return_router_info=True)
-        logits = output.logits
     """
     if torch.is_tensor(outputs):
         return outputs
@@ -3821,877 +3762,50 @@ def _infer_pin_memory(cfg: Any) -> bool:
 
 # ============================================================================
 # 8. 模型定义与构建（Model）
-# 8.1 Backbone 定义与注册
-# Backbone definitions and registry
+# Model components and assembly
+#
+# 本阶段已清理旧模型实现。
+# 后续在本文件内部按 Backbone + MoE + Task Head + Model 的结构重建。
+# 当前不注册具体模型，因此训练入口会在 build_model() 处明确报错。
 # ============================================================================
-
-
-class BasicBlock(nn.Module):
-    """
-    CIFAR 风格 ResNet BasicBlock。
-
-    结构：
-        Conv3x3 -> ReLU -> Conv3x3 -> Residual -> ReLU
-
-    说明：
-        这是 联邦专家方法 对齐版 no-BN block。
-        不使用 BatchNorm，避免 non-IID FL 中 BN running_mean /
-        running_var 在客户端聚合后产生统计失配。
-
-    这个 block 比 torchvision 默认 ResNet 更适合 CIFAR 小图，
-    因为前面的 stem 不会过早大幅下采样。
-    """
-
-    expansion = 1
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int = 1,
-    ) -> None:
-        super().__init__()
-
-        self.conv1 = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            bias=False,
-        )
-
-        # 联邦专家方法 对齐版：不使用 BatchNorm。
-        # 保留 bn1 名字并设为 Identity，避免改动 forward 逻辑。
-        self.bn1 = nn.Identity()
-
-        self.conv2 = nn.Conv2d(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-        )
-
-        # 联邦专家方法 对齐版：不使用 BatchNorm。
-        # 保留 bn2 名字并设为 Identity，避免改动 forward 逻辑。
-        self.bn2 = nn.Identity()
-
-        self.relu = nn.ReLU(inplace=True)
-
-        # 当通道数或空间尺寸变化时，用 1x1 Conv 对齐残差分支。
-        # 联邦专家方法 对齐版：shortcut 中同样不使用 BatchNorm。
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1,
-                    stride=stride,
-                    bias=False,
-                ),
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = out + self.shortcut(x)
-        out = self.relu(out)
-        return out
-
-
-class ResNetBackbone(nn.Module):
-    """
-    ResNet 图像特征提取器。
-
-    输入：
-        x: [B, C, H, W]
-
-    输出：
-        feat: [B, 512]
-
-    说明：
-    - 对 CIFAR10 / CIFAR100 这类 32x32 小图，stem 使用 stride=1。
-    - 对 TinyImageNet 这类更大图，stem 使用 stride=2。
-    - 最后通过 AdaptiveAvgPool2d(1) 得到单个全局特征向量。
-    - 联邦专家方法 对齐版不使用 BatchNorm。
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 3,
-        image_size: int = 32,
-    ) -> None:
-        super().__init__()
-
-        stem_stride = 1 if int(image_size) <= 32 else 2
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                64,
-                kernel_size=3,
-                stride=stem_stride,
-                padding=1,
-                bias=False,
-            ),
-            # 联邦专家方法 对齐版：stem 中不使用 BatchNorm。
-            nn.ReLU(inplace=True),
-        )
-
-        self.layer1 = self._make_layer(64, 64, stride=1)
-        self.layer2 = self._make_layer(64, 128, stride=2)
-        self.layer3 = self._make_layer(128, 256, stride=2)
-        self.layer4 = self._make_layer(256, 512, stride=2)
-
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.feat_dim = 512
-
-    @staticmethod
-    def _make_layer(
-        in_channels: int,
-        out_channels: int,
-        stride: int,
-    ) -> nn.Sequential:
-        """
-        每个 stage 使用两个 BasicBlock。
-        第一个 block 负责必要的下采样，第二个 block 保持尺寸。
-        """
-        return nn.Sequential(
-            BasicBlock(in_channels, out_channels, stride=stride),
-            BasicBlock(out_channels, out_channels, stride=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.pool(x)
-        x = x.flatten(1)
-        return x
-
-
-
-class ViTTinyBlock(nn.Module):
-    """Pre-norm Transformer encoder block for the small-image ViT-Tiny."""
-
-    def __init__(
-        self,
-        embed_dim: int = 192,
-        num_heads: int = 3,
-        mlp_ratio: float = 4.0,
-    ) -> None:
-        super().__init__()
-
-        hidden_dim = int(round(embed_dim * mlp_ratio))
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=0.0,
-            batch_first=True,
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, embed_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normed = self.norm1(x)
-        attn_out, _ = self.attn(
-            normed,
-            normed,
-            normed,
-            need_weights=False,
-        )
-        x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class ViTTinyBackbone(nn.Module):
-    """
-    ViT-Tiny adapted for the small image sizes used by this project.
-
-    The Transformer scale follows the common ViT/DeiT-Tiny recipe:
-        embed_dim=192, depth=12, num_heads=3, mlp_ratio=4.
-
-    Patch size is dataset-size aware:
-        image_size <= 32 -> patch_size=4
-        image_size > 32  -> patch_size=8
-
-    The model is trained from scratch. Positional embeddings are created for
-    the fixed input resolution of each experiment, so no runtime interpolation
-    is needed for the current dataset pipeline.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 3,
-        image_size: int = 32,
-        embed_dim: int = 192,
-        depth: int = 12,
-        num_heads: int = 3,
-        mlp_ratio: float = 4.0,
-    ) -> None:
-        super().__init__()
-
-        image_size = int(image_size)
-        patch_size = 4 if image_size <= 32 else 8
-        if image_size % patch_size != 0:
-            raise ValueError(
-                "ViT-Tiny 要求 image_size 能被 patch_size 整除："
-                f"image_size={image_size}, patch_size={patch_size}"
-            )
-
-        self.image_size = image_size
-        self.patch_size = int(patch_size)
-        self.embed_dim = int(embed_dim)
-        self.feat_dim = int(embed_dim)
-
-        self.patch_embed = nn.Conv2d(
-            in_channels,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-            padding=0,
-            bias=True,
-        )
-
-        grid_size = image_size // patch_size
-        self.num_patches = int(grid_size * grid_size)
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_patches + 1, embed_dim)
-        )
-
-        self.blocks = nn.ModuleList(
-            [
-                ViTTinyBlock(
-                    embed_dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 4:
-            raise ValueError(
-                f"ViT-Tiny 期望输入为 [B, C, H, W]，当前 shape={tuple(x.shape)}"
-            )
-        if x.size(-2) != self.image_size or x.size(-1) != self.image_size:
-            raise ValueError(
-                "ViT-Tiny 当前实验使用固定输入尺寸："
-                f"expected={self.image_size}x{self.image_size}, "
-                f"actual={x.size(-2)}x{x.size(-1)}"
-            )
-
-        x = self.patch_embed(x)
-        x = x.flatten(2).transpose(1, 2)
-
-        cls_token = self.cls_token.expand(x.size(0), -1, -1)
-        x = torch.cat([cls_token, x], dim=1)
-        x = x + self.pos_embed
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.norm(x)
-        return x[:, 0]
-
-
-
-# -------------------------
-# Backbone builders / registry
-# -------------------------
-
-BackboneBuilder = Callable[..., nn.Module]
-DEFAULT_BACKBONE_NAME = "resnet_cifar"
-MOE_FEATURE_DIM = 512
-
-
-def build_resnet_cifar_backbone(
-    *,
-    in_channels: int = 3,
-    image_size: int = 32,
-) -> ResNetBackbone:
-    """Build the current no-BN CIFAR-style ResNet backbone."""
-    return ResNetBackbone(
-        in_channels=in_channels,
-        image_size=image_size,
-    )
-
-
-
-def build_vit_tiny_backbone(
-    *,
-    in_channels: int = 3,
-    image_size: int = 32,
-) -> ViTTinyBackbone:
-    """Build the small-image ViT-Tiny backbone from scratch."""
-    return ViTTinyBackbone(
-        in_channels=in_channels,
-        image_size=image_size,
-    )
-
-
-
-BACKBONE_BUILDERS: Dict[str, BackboneBuilder] = {
-    DEFAULT_BACKBONE_NAME: build_resnet_cifar_backbone,
-    "vit_tiny": build_vit_tiny_backbone,
-}
-
-
-def build_backbone(
-    backbone_name: str,
-    *,
-    in_channels: int = 3,
-    image_size: int = 32,
-) -> nn.Module:
-    """Build a registered backbone."""
-    name = str(backbone_name).lower().strip()
-    if name not in BACKBONE_BUILDERS:
-        raise ValueError(
-            f"不支持的 backbone：{name}。"
-            f"当前支持：{sorted(BACKBONE_BUILDERS.keys())}"
-        )
-    backbone = BACKBONE_BUILDERS[name](
-        in_channels=int(in_channels), image_size=int(image_size)
-    )
-    if not hasattr(backbone, "feat_dim"):
-        raise ValueError(f"backbone {name!r} 缺少 feat_dim 属性。")
-    feat_dim=int(getattr(backbone,"feat_dim"))
-    if feat_dim<=0: raise ValueError(f"backbone {name!r} 的 feat_dim 必须大于 0。")
-    return backbone
-
-
-def list_supported_backbones() -> List[str]:
-    return sorted(BACKBONE_BUILDERS.keys())
-
-
-# ============================================================================
-# 8.2 Sparse MoE 模型结构
-# Sparse MoE model
-# ============================================================================
-
-
-@dataclass(frozen=True)
-class SparseMoEClassifierOutput:
-    """
-    SparseMoEClassifier 的可选输出结构。
-
-    默认训练时不需要这个结构，直接返回 logits 即可。
-    当需要分析 router / expert usage 时，可以设置 return_router_info=True。
-    """
-
-    logits: torch.Tensor
-    router_info: Dict[str, Any]
-
-
-class ExpertFFN(nn.Module):
-    """
-    单个 expert。
-
-    这里 expert 内部直接输出分类 logits 的一部分：
-        feature -> Linear -> ReLU -> Linear -> num_classes
-
-    因此这个模型里“分类头”是在 expert 内部的。
-    聚合 expert 参数时，会同时聚合每个 expert 的 fc1 和 fc2。
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-    ) -> None:
-        super().__init__()
-
-        self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, out_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = F.relu(x, inplace=False)
-        x = self.fc2(x)
-        return x
-
-
-class TopKGating(nn.Module):
-    """
-    标准 Top-K 路由器。
-
-    输入：
-        x: [B, in_dim]
-
-    输出：
-        weights: [B, num_experts]
-            只有 top-k expert 位置非零。
-            默认保持原始 softmax 概率，不重新归一化。
-        topk_indices: [B, topk]
-            每个样本选中的 expert id。
-        router_probs: [B, num_experts]
-            softmax 后的完整路由概率。
-        router_logits: [B, num_experts]
-            router 原始 logits。
-
-    注意：
-    - 不加乘法噪声。
-    - 不加负载均衡 loss。
-    - 不加 router entropy / diversity / consistency 正则。
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        num_experts: int,
-        topk: int,
-        renormalize_topk_probs: bool = False,
-    ) -> None:
-        super().__init__()
-
-        if num_experts <= 0:
-            raise ValueError(f"num_experts 必须大于 0，当前值：{num_experts}")
-        if topk <= 0:
-            raise ValueError(f"topk 必须大于 0，当前值：{topk}")
-        if topk > num_experts:
-            raise ValueError(
-                f"topk 不能大于 num_experts，当前 topk={topk}, "
-                f"num_experts={num_experts}"
-            )
-
-        self.in_dim = int(in_dim)
-        self.num_experts = int(num_experts)
-        self.topk = int(topk)
-        self.renormalize_topk_probs = bool(renormalize_topk_probs)
-
-        self.gate = nn.Linear(in_dim, num_experts, bias=False)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if x.dim() != 2:
-            raise ValueError(f"TopKGating 期望输入为 [B, D]，当前 shape={tuple(x.shape)}")
-
-        router_logits = self.gate(x)
-        router_probs = F.softmax(router_logits.float(), dim=-1)
-
-        topk_probs, topk_indices = torch.topk(
-            router_probs,
-            k=self.topk,
-            dim=-1,
-        )
-
-        if self.renormalize_topk_probs:
-            topk_probs = topk_probs / topk_probs.sum(
-                dim=-1,
-                keepdim=True,
-            ).clamp_min(1e-12)
-
-        weights = torch.zeros_like(router_probs)
-        weights.scatter_(dim=1, index=topk_indices, src=topk_probs)
-        weights = weights.to(dtype=x.dtype)
-
-        return weights, topk_indices, router_probs, router_logits
-
-
-class SparseMoEHead(nn.Module):
-    """
-    稀疏 MoE 分类头。
-
-    输入：
-        x: [B, feat_dim]
-
-    输出：
-        logits: [B, num_classes]
-
-    计算方式：
-    1. router 为每个样本选择 top-k 个 expert。
-    2. 遍历 expert。
-    3. 只把被该 expert 选中的样本送入该 expert。
-    4. 用 router 权重加权 expert 输出。
-    5. 所有被选中的 expert 输出累加成最终 logits。
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        num_classes: int,
-        num_experts: int,
-        topk: int,
-        renormalize_topk_probs: bool = False,
-    ) -> None:
-        super().__init__()
-
-        self.in_dim = int(in_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.num_classes = int(num_classes)
-        self.num_experts = int(num_experts)
-        self.topk = int(topk)
-
-        self.gating = TopKGating(
-            in_dim=in_dim,
-            num_experts=num_experts,
-            topk=topk,
-            renormalize_topk_probs=renormalize_topk_probs,
-        )
-
-        # 这个命名很重要：
-        # 参数名会包含 moe_head.experts.<expert_id>....
-        # 这样现有 param_groups / 方法证据 逻辑更容易识别 expert 参数。
-        self.experts = nn.ModuleList(
-            [
-                ExpertFFN(
-                    in_dim=in_dim,
-                    hidden_dim=hidden_dim,
-                    out_dim=num_classes,
-                )
-                for _ in range(num_experts)
-            ]
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_router_info: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if x.dim() != 2:
-            raise ValueError(f"SparseMoEHead 期望输入为 [B, D]，当前 shape={tuple(x.shape)}")
-
-        weights, topk_indices, router_probs, router_logits = self.gating(x)
-
-        batch_size = x.size(0)
-        logits = torch.zeros(
-            batch_size,
-            self.num_classes,
-            device=x.device,
-            dtype=x.dtype,
-        )
-
-        # 真稀疏计算：每个 expert 只处理路由到自己的样本。
-        for expert_id, expert in enumerate(self.experts):
-            selected_mask = topk_indices == expert_id
-            token_mask = selected_mask.any(dim=-1)
-
-            if not token_mask.any():
-                continue
-
-            expert_input = x[token_mask]
-            expert_output = expert(expert_input)
-
-            selected_weights = weights[token_mask, expert_id]
-            logits[token_mask] = logits[token_mask] + (
-                expert_output * selected_weights.unsqueeze(-1)
-            )
-
-        if not return_router_info:
-            return logits
-
-        # 以下信息只用于诊断，不参与训练 loss。
-        expert_one_hot = F.one_hot(
-            topk_indices,
-            num_classes=self.num_experts,
-        ).to(dtype=torch.float32)
-
-        expert_counts = expert_one_hot.sum(dim=(0, 1))
-        sample_expert_counts = expert_one_hot.sum(dim=1)
-
-        density = expert_counts / max(float(batch_size * self.topk), 1.0)
-        density_proxy = router_probs.mean(dim=0)
-        aux_loss = self.num_experts * torch.sum(
-            density.to(router_probs.device) * density_proxy
-        )
-
-        router_info = {
-            "aux_loss": aux_loss,
-            "expert_counts": expert_counts.to(x.device),
-            "sample_expert_counts": sample_expert_counts.to(x.device),
-            "selected_experts": topk_indices,
-            "topk_probs": torch.gather(router_probs, dim=1, index=topk_indices).to(
-                dtype=x.dtype
-            ),
-            "router_probs": router_probs.to(dtype=x.dtype),
-            "router_logits": router_logits.to(dtype=x.dtype),
-        }
-
-        return logits, router_info
-
-
-class SparseMoEClassifier(nn.Module):
-    """
-    Backbone + Sparse MoE Head 分类模型。
-
-    整体结构：
-        image
-          -> selected backbone
-          -> backbone_adapter -> fixed feature [B, 512]
-          -> SparseMoEHead
-          -> logits [B, num_classes]
-
-    为了让 backbone 对照实验中的 router / expert 参数规模保持一致，
-    当前支持的 backbone 都在进入 MoE 前统一成 512 维：
-        resnet_cifar: 512 -> Identity
-        vit_tiny: 192 -> Linear(192, 512)
-
-    backbone / backbone_adapter / router 都属于 non_expert 参数；
-    只有 experts.<id> 属于 expert 参数。
-    """
-
-    def __init__(
-        self,
-        num_classes: int,
-        num_experts: int = 4,
-        topk: int = 2,
-        in_channels: int = 3,
-        image_size: int = 32,
-        moe_hidden_dim: int = 512,
-        renormalize_topk_probs: bool = False,
-        backbone_name: str = DEFAULT_BACKBONE_NAME,
-    ) -> None:
-        super().__init__()
-
-        if num_classes <= 0:
-            raise ValueError(f"num_classes 必须大于 0，当前值：{num_classes}")
-
-        self.num_classes = int(num_classes)
-        self.num_experts = int(num_experts)
-        self.topk = int(topk)
-        self.in_channels = int(in_channels)
-        self.image_size = int(image_size)
-        self.moe_hidden_dim = int(moe_hidden_dim)
-
-        self.backbone_name = str(backbone_name).lower().strip()
-        self.backbone = build_backbone(
-            backbone_name=self.backbone_name,
-            in_channels=in_channels,
-            image_size=image_size,
-        )
-
-        raw_feat_dim = int(self.backbone.feat_dim)
-        if raw_feat_dim == MOE_FEATURE_DIM:
-            # Keep the existing ResNet numerical path exactly unchanged.
-            self.backbone_adapter = nn.Identity()
-        else:
-            self.backbone_adapter = nn.Linear(
-                raw_feat_dim,
-                MOE_FEATURE_DIM,
-            )
-
-        self.moe_head = SparseMoEHead(
-            in_dim=MOE_FEATURE_DIM,
-            hidden_dim=moe_hidden_dim,
-            num_classes=num_classes,
-            num_experts=num_experts,
-            topk=topk,
-            renormalize_topk_probs=renormalize_topk_probs,
-        )
-
-        self._init_extra_weights()
-
-    def _init_extra_weights(self) -> None:
-        """
-        初始化 Linear 层。
-
-        no-BN 版本中，卷积层使用 PyTorch 默认初始化；
-        这里额外对 Linear 做 Xavier 初始化，让 router 和 expert 更稳定一点。
-        """
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_router_info: bool = False,
-    ) -> torch.Tensor | SparseMoEClassifierOutput:
-        feat = self.backbone(x)
-        feat = self.backbone_adapter(feat)
-
-        if not return_router_info:
-            logits = self.moe_head(
-                feat,
-                return_router_info=False,
-            )
-            return logits
-
-        logits, router_info = self.moe_head(
-            feat,
-            return_router_info=True,
-        )
-
-        return SparseMoEClassifierOutput(
-            logits=logits,
-            router_info=router_info,
-        )
-
-
-def build_sparse_moe_classifier_from_cfg(cfg: Any) -> SparseMoEClassifier:
-    """
-    根据 cfg 构建 SparseMoEClassifier。
-
-    推荐配置示例：
-
-    model: sparse_moe_classifier
-    num_experts: 4
-    topk: 2
-
-    model_cfg:
-      in_channels: 3
-      image_size: 32
-      moe_hidden_dim: 512
-      renormalize_topk_probs: false
-
-    说明：
-    - num_classes 优先从 cfg.num_classes 读取。
-    - in_channels / image_size 会优先从 cfg.input_shape 推断。
-    - model_cfg 里的 in_channels / image_size 可以覆盖默认值。
-    """
-
-    model_cfg = _cfg_get(cfg, "model_cfg", {})
-
-    input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
-    if input_shape is None:
-        input_shape = (3, 32, 32)
-
-    default_in_channels = int(input_shape[0])
-    default_image_size = int(input_shape[1])
-
-    # 兼容两种写法：
-    # 1. model_cfg.moe_hidden_dim
-    # 2. model_cfg.hidden_dim
-    # 如果都没写，默认使用原始 moefedavg.py 里的 512。
-    default_moe_hidden_dim = _cfg_get(
-        model_cfg,
-        "hidden_dim",
-        512,
-    )
-
-    return SparseMoEClassifier(
-        num_classes=int(_cfg_get(cfg, "num_classes")),
-        num_experts=int(_cfg_get(cfg, "num_experts", 4)),
-        topk=int(_cfg_get(cfg, "topk", 2)),
-        in_channels=int(
-            _cfg_get(
-                model_cfg,
-                "in_channels",
-                default_in_channels,
-            )
-        ),
-        image_size=int(
-            _cfg_get(
-                model_cfg,
-                "image_size",
-                default_image_size,
-            )
-        ),
-        moe_hidden_dim=int(
-            _cfg_get(
-                model_cfg,
-                "moe_hidden_dim",
-                default_moe_hidden_dim,
-            )
-        ),
-        renormalize_topk_probs=bool(
-            _cfg_get(
-                model_cfg,
-                "renormalize_topk_probs",
-                False,
-            )
-        ),
-        backbone_name=str(
-            _cfg_get(
-                model_cfg,
-                "backbone",
-                DEFAULT_BACKBONE_NAME,
-            )
-        ),
-    )
-
-
-# ============================================================================
-# 8.3 模型注册、构建与参数量统计
-# Bundled from models/build.py
-# ============================================================================
-
 
 ModelBuilder = Callable[[Any], nn.Module]
 
-
-MODEL_BUILDERS: Dict[str, ModelBuilder] = {
-    "sparse_moe_classifier": build_sparse_moe_classifier_from_cfg,
-}
+# 具体模型完成实现后，在这里注册：
+# MODEL_BUILDERS["switch_vit"] = build_switch_vit_from_cfg
+MODEL_BUILDERS: Dict[str, ModelBuilder] = {}
 
 
 def build_model(cfg: Any) -> nn.Module:
-    """
-    根据配置创建模型。
-
-    配置示例：
-        model: sparse_moe_classifier
-
-    当前支持：
-        sparse_moe_classifier
-
-    后续扩展其他模型时，只需要：
-        1. 新增模型文件
-        2. 写一个 build_xxx_from_cfg(cfg)
-        3. 在 MODEL_BUILDERS 里注册
-    """
+    """根据配置创建已注册模型。"""
     model_name = get_model_name(cfg)
-
     if model_name not in MODEL_BUILDERS:
-        supported = ", ".join(list_supported_models())
+        supported = list_supported_models()
+        if not supported:
+            raise RuntimeError(
+                "当前没有已注册的模型。旧 Backbone / Sparse MoE 实现已清理；"
+                "请在完成 Backbone + MoE + Task Head + Model 组装后注册新模型。"
+            )
         raise ValueError(
             f"不支持的模型名称：{model_name}。"
             f"当前支持：{supported}"
         )
-
-    model = MODEL_BUILDERS[model_name](cfg)
-    return model
+    return MODEL_BUILDERS[model_name](cfg)
 
 
 def get_model_name(cfg: Any) -> str:
-    """
-    从配置中读取模型名称。
-
-    支持：
-        cfg.model
-        cfg.get("model")
-    """
+    """从配置对象或 Mapping 中读取模型名称。"""
     model_name = _cfg_get(cfg, "model", None)
-
     if model_name is None:
         raise ValueError("配置中缺少 model 字段。")
-
     model_name = str(model_name).lower().strip()
     if not model_name:
         raise ValueError("配置中的 model 字段不能为空。")
-
     return model_name
 
 
 def list_supported_models() -> List[str]:
-    """
-    返回当前支持的模型名称列表。
-    """
+    """返回当前已注册的模型名称。"""
     return sorted(MODEL_BUILDERS.keys())
 
 
@@ -4699,43 +3813,20 @@ def count_parameters(
     model: nn.Module,
     trainable_only: bool = False,
 ) -> int:
-    """
-    统计模型参数量。
-
-    参数：
-        trainable_only:
-            如果为 True，只统计 requires_grad=True 的参数。
-            如果为 False，统计所有参数。
-    """
+    """统计模型参数量。"""
     total = 0
-
     for param in model.parameters():
         if trainable_only and not param.requires_grad:
             continue
         total += int(param.numel())
-
     return total
 
 
 def summarize_model(model: nn.Module) -> Dict[str, int]:
-    """
-    返回模型参数量摘要。
-
-    输出：
-        {
-            "total_params": ...,
-            "trainable_params": ...
-        }
-    """
+    """返回模型总参数量和可训练参数量。"""
     return {
-        "total_params": count_parameters(
-            model=model,
-            trainable_only=False,
-        ),
-        "trainable_params": count_parameters(
-            model=model,
-            trainable_only=True,
-        ),
+        "total_params": count_parameters(model=model, trainable_only=False),
+        "trainable_params": count_parameters(model=model, trainable_only=True),
     }
 
 
@@ -5253,7 +4344,6 @@ class ClientUpdate:
 
     # 预留扩展字段
     # 后面可以放：
-    # expert_usage
     # method-specific evidence / statistics
     # method_evidence
     # method_evidence_summary
@@ -5774,64 +4864,6 @@ class FLClient:
             stats = train_result.stats
             algorithm_payload = train_result.algorithm_payload
 
-        # ------------------------------------------------------------
-        # 可选：采集当前客户端本地模型的 expert usage。
-        #
-        # 统计含义：
-        #     本地训练结束后，local_model 在该客户端训练数据上，
-        #     每个 expert 被 top-k router 选中了多少次。
-        #
-        # 注意：
-        #     统计使用相同的数据集和训练变换，但用独立 DataLoader，
-        #     避免诊断遍历干扰后续训练的随机数状态。
-        #     方法级 evidence 统计才使用 evidence_loader。
-        #
-        #     topk=2 时，一个样本会贡献 2 次 expert 激活。
-        #     所以 expert_counts 的总和通常约等于 num_samples * topk。
-        # ------------------------------------------------------------
-        expert_usage = None
-        if bool(_cfg_get(self.cfg, "logging.collect_expert_usage", True)):
-            # Use a separate loader so logging cannot advance the training
-            # loader's sampler or persistent workers' augmentation RNG.
-            usage_loader = DataLoader(
-                self.train_loader.dataset,
-                batch_size=self.train_loader.batch_size,
-                shuffle=True,
-                num_workers=self.train_loader.num_workers,
-                pin_memory=self.train_loader.pin_memory,
-                drop_last=self.train_loader.drop_last,
-                collate_fn=self.train_loader.collate_fn,
-                worker_init_fn=self.train_loader.worker_init_fn,
-                generator=build_torch_generator(
-                    int(_cfg_get(self.cfg, "seed", 0))
-                    + 200000
-                    + self.client_id
-                    + 1000000 * int(round_id)
-                ),
-                persistent_workers=False,
-            )
-
-            # With num_workers=0, random transforms run in the main process.
-            # Protect Python/NumPy/PyTorch RNG states even on failure.
-            python_rng_state = random.getstate()
-            numpy_rng_state = np.random.get_state()
-            try:
-                with torch.random.fork_rng(
-                    devices=(
-                        list(range(torch.cuda.device_count()))
-                        if torch.cuda.is_available() else []
-                    ),
-                ):
-                    expert_usage = collect_expert_usage(
-                        model=local_model,
-                        train_loader=usage_loader,
-                        device=self.device,
-                        cfg=self.cfg,
-                    )
-            finally:
-                random.setstate(python_rng_state)
-                np.random.set_state(numpy_rng_state)
-
         method_extra: Dict[str, Any] = {}
         if self.expert_evidence_collector is not None:
             collected_extra = self.expert_evidence_collector(
@@ -5900,7 +4932,6 @@ class FLClient:
                     if self.expert_client_training_strategy is not None
                     else None
                 ),
-                "expert_usage": expert_usage,
                 **method_extra,
             },
             algorithm_payload=algorithm_payload,
@@ -6310,223 +5341,6 @@ def train_local_model_with_expert_strategy(
         stats=stats,
         algorithm_payload=_detach_algorithm_payload_to_cpu(dict(payload)),
     )
-
-
-@torch.inference_mode()
-def collect_expert_usage(
-    model: nn.Module,
-    train_loader: DataLoader,
-    device: torch.device,
-    cfg: Any,
-) -> Dict[str, Any]:
-    """
-    统计一个客户端本地模型的 expert 使用情况。
-
-    统计时机：
-        本地训练结束后。
-
-    统计数据：
-        当前客户端自己的 train_loader。
-
-    输出字段：
-        num_samples:
-            实际用于统计的样本数。
-
-        num_batches:
-            实际用于统计的 batch 数。
-
-        num_experts:
-            expert 总数。
-
-        topk:
-            每个样本激活的 expert 数。
-
-        total_activations:
-            expert 总激活次数。
-            通常约等于 num_samples * topk。
-
-        expert_counts:
-            每个 expert 被选中的次数。
-
-        expert_fraction:
-            每个 expert 被选中的比例。
-
-        active_experts:
-            至少被选中过一次的 expert 数。
-
-        dead_experts:
-            本次统计中完全没有被选中的 expert id。
-
-        supported:
-            当前模型是否支持 return_router_info=True。
-
-    注意：
-        这个函数只做前向统计，不更新模型参数。
-    """
-    # 固定遍历完整客户端数据集，不再提供 max_batches 配置。
-    max_batches = 0
-    num_experts = int(_cfg_get(cfg, "num_experts", 0))
-    topk = int(_cfg_get(cfg, "topk", 2))
-
-    if num_experts <= 0:
-        return {
-            "supported": False,
-            "reason": "num_experts <= 0",
-        }
-
-    old_training = bool(model.training)
-    model.eval()
-
-    expert_counts = torch.zeros(
-        num_experts,
-        dtype=torch.float64,
-        device="cpu",
-    )
-
-    total_samples = 0
-    total_batches = 0
-
-    supported = True
-    unsupported_reason = ""
-
-    try:
-        for batch_index, batch in enumerate(train_loader):
-            if max_batches > 0 and batch_index >= max_batches:
-                break
-
-            images, targets = unpack_batch(batch)
-            images = images.to(device, non_blocking=True)
-
-            try:
-                outputs = model(
-                    images,
-                    return_router_info=True,
-                )
-            except TypeError as exc:
-                # Only treat the missing keyword argument as a legacy-model
-                # compatibility case. Re-raise TypeErrors raised inside forward().
-                if "unexpected keyword argument 'return_router_info'" not in str(exc):
-                    raise
-                supported = False
-                unsupported_reason = (
-                    "model does not support return_router_info=True: "
-                    f"{exc}"
-                )
-                break
-
-            router_info = extract_router_info(outputs)
-            if router_info is None:
-                supported = False
-                unsupported_reason = "model output does not contain router_info"
-                break
-
-            batch_expert_counts = router_info.get("expert_counts", None)
-            if batch_expert_counts is None:
-                supported = False
-                unsupported_reason = "router_info does not contain expert_counts"
-                break
-
-            batch_expert_counts = batch_expert_counts.detach().to(
-                device="cpu",
-                dtype=torch.float64,
-            )
-
-            if batch_expert_counts.numel() != num_experts:
-                supported = False
-                unsupported_reason = (
-                    "expert_counts length mismatch: "
-                    f"expected={num_experts}, actual={batch_expert_counts.numel()}"
-                )
-                break
-
-            expert_counts += batch_expert_counts.reshape(-1)
-
-            total_samples += int(images.size(0))
-            total_batches += 1
-
-    finally:
-        if old_training:
-            model.train()
-        else:
-            model.eval()
-
-    if not supported:
-        return {
-            "supported": False,
-            "reason": unsupported_reason,
-        }
-
-    total_activations = float(expert_counts.sum().item())
-
-    if total_activations > 0:
-        expert_fraction_tensor = expert_counts / total_activations
-    else:
-        expert_fraction_tensor = torch.zeros_like(expert_counts)
-
-    expert_counts_dict = {
-        int(expert_id): int(expert_counts[expert_id].item())
-        for expert_id in range(num_experts)
-    }
-
-    expert_fraction_dict = {
-        int(expert_id): float(expert_fraction_tensor[expert_id].item())
-        for expert_id in range(num_experts)
-    }
-
-    dead_experts = [
-        int(expert_id)
-        for expert_id, count in expert_counts_dict.items()
-        if count <= 0
-    ]
-
-    active_experts = int(num_experts - len(dead_experts))
-
-    return {
-        "supported": True,
-        "num_samples": int(total_samples),
-        "num_batches": int(total_batches),
-        "max_batches": int(max_batches),
-        "num_experts": int(num_experts),
-        "topk": int(topk),
-        "total_activations": int(total_activations),
-        "expert_counts": expert_counts_dict,
-        "expert_fraction": expert_fraction_dict,
-        "active_experts": int(active_experts),
-        "dead_experts": dead_experts,
-    }
-
-
-def extract_router_info(outputs: Any) -> Optional[Mapping[str, Any]]:
-    """
-    从模型输出中提取 router_info。
-
-    兼容几种常见输出：
-        1. dataclass / object: outputs.router_info
-        2. dict: outputs["router_info"]
-        3. tuple/list: outputs[1] 是 router_info
-
-    当前 resnet_sparse_moe_head 在 return_router_info=True 时，
-    返回对象里包含 .router_info。
-    """
-    if hasattr(outputs, "router_info"):
-        router_info = outputs.router_info
-        if isinstance(router_info, Mapping):
-            return router_info
-        return None
-
-    if isinstance(outputs, Mapping):
-        router_info = outputs.get("router_info", None)
-        if isinstance(router_info, Mapping):
-            return router_info
-        return None
-
-    if isinstance(outputs, (tuple, list)) and len(outputs) >= 2:
-        router_info = outputs[1]
-        if isinstance(router_info, Mapping):
-            return router_info
-        return None
-
-    return None
 
 
 def build_criterion(cfg: Any) -> nn.Module:
@@ -7955,7 +6769,6 @@ class FLServer:
             client_diag: Dict[str, Any] = {
                 "num_samples": int(update.num_samples),
                 "metrics": dict(update.metrics or {}),
-                "expert_usage": extra.get("expert_usage", None),
             }
             if self.method_client_diagnostics_builder is not None:
                 method_diag = self.method_client_diagnostics_builder(update)
@@ -8009,7 +6822,6 @@ class FLServer:
             2. 客户端本地 train_loss / train_acc
             3. non_expert 聚合权重
             4. expert 聚合权重
-            5. expert_usage
         """
         client_diagnostics = round_result.client_diagnostics
         if not isinstance(client_diagnostics, Mapping):
@@ -8069,10 +6881,6 @@ class FLServer:
                 self._get_weight_for_client(expert_weights, client_id)
             )
 
-            expert_usage_text = self._format_expert_usage(
-                item.get("expert_usage", None)
-            )
-
             self._write_log_only(
                 f"[Client][{client_id}] "
                 f"round={round_result.round_id} "
@@ -8080,8 +6888,7 @@ class FLServer:
                 f"train_loss={train_loss} "
                 f"train_acc={train_acc} "
                 f"non_expert_w={non_expert_weight} "
-                f"expert_w={expert_weight} "
-                f"{expert_usage_text}"
+                f"expert_w={expert_weight}"
             )
 
     def _extract_aggregation_info(
@@ -8379,122 +7186,6 @@ class FLServer:
 
         return None
 
-    def _format_expert_usage(
-        self,
-        expert_usage: Any,
-    ) -> str:
-        """
-        格式化客户端 expert usage。
-
-        输出示例：
-            expert_active=4/4 expert_total=9600 expert_counts={0:2400,1:2381,2:2410,3:2409} expert_frac={0:0.250,1:0.248,2:0.251,3:0.251}
-
-        如果没有采集：
-            expert_usage=none
-
-        如果模型不支持：
-            expert_usage=unsupported(reason=...)
-        """
-        if expert_usage is None:
-            return "expert_usage=none"
-
-        if not isinstance(expert_usage, Mapping):
-            return f"expert_usage={self._compact_log_value(expert_usage)}"
-
-        supported = bool(expert_usage.get("supported", True))
-        if not supported:
-            reason = expert_usage.get("reason", "unknown")
-            return (
-                "expert_usage=unsupported"
-                f"(reason={self._compact_log_value(reason, max_chars=160)})"
-            )
-
-        num_experts = expert_usage.get(
-            "num_experts",
-            _cfg_get(self.cfg, "num_experts", "unknown"),
-        )
-        active_experts = expert_usage.get("active_experts", "unknown")
-        total_activations = expert_usage.get("total_activations", "unknown")
-        expert_counts = expert_usage.get("expert_counts", None)
-        expert_fraction = expert_usage.get("expert_fraction", None)
-        dead_experts = expert_usage.get("dead_experts", [])
-
-        counts_text = self._format_int_mapping(expert_counts)
-        fraction_text = self._format_float_mapping(
-            expert_fraction,
-            precision=3,
-        )
-
-        return (
-            f"expert_active={active_experts}/{num_experts} "
-            f"expert_total={total_activations} "
-            f"expert_counts={counts_text} "
-            f"expert_frac={fraction_text} "
-            f"dead={self._format_client_ids(dead_experts)}"
-        )
-
-    @staticmethod
-    def _format_int_mapping(value: Any) -> str:
-        """
-        格式化 int 映射。
-
-        输出：
-            {0:120,1:130}
-        """
-        if not isinstance(value, Mapping):
-            return "none"
-
-        items = []
-        for key, item_value in value.items():
-            try:
-                items.append((int(key), int(item_value)))
-            except (TypeError, ValueError):
-                return repr(value)
-
-        items = sorted(
-            items,
-            key=lambda item: item[0],
-        )
-
-        body = ",".join(
-            f"{key}:{item_value}"
-            for key, item_value in items
-        )
-        return "{" + body + "}"
-
-    @staticmethod
-    def _format_float_mapping(
-        value: Any,
-        *,
-        precision: int,
-    ) -> str:
-        """
-        格式化 float 映射。
-
-        输出：
-            {0:0.250,1:0.248}
-        """
-        if not isinstance(value, Mapping):
-            return "none"
-
-        items = []
-        for key, item_value in value.items():
-            try:
-                items.append((int(key), float(item_value)))
-            except (TypeError, ValueError):
-                return repr(value)
-
-        items = sorted(
-            items,
-            key=lambda item: item[0],
-        )
-
-        body = ",".join(
-            f"{key}:{item_value:.{precision}f}"
-            for key, item_value in items
-        )
-        return "{" + body + "}"
-
     @staticmethod
     def _compact_log_value(
         value: Any,
@@ -8659,7 +7350,7 @@ MethodCliOverridesBuilder = Callable[[argparse.Namespace], Mapping[str, Any]]
 def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FL + MoE training entrypoint")
     parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
-    parser.add_argument("--model", type=str, choices=sorted(SUPPORTED_MODELS), default=None, help="模型名称；显式 CLI 参数优先于配置文件。")
+    parser.add_argument("--model", type=str, default=None, help="模型名称；显式 CLI 参数优先于配置文件。")
     parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
     augmentation_group = parser.add_mutually_exclusive_group()
     augmentation_group.add_argument(
@@ -8707,10 +7398,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--test-batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--backbone", choices=list_supported_backbones(), default=None)
     parser.add_argument("--num-experts", type=int, default=None)
-    parser.add_argument("--topk", type=int, default=None)
-    parser.add_argument("--moe-hidden-dim", type=int, default=None, help="MoE 专家隐藏层维度；覆盖配置文件中的 model_cfg.moe_hidden_dim。")
     parser.add_argument("--optimizer", dest="optimizer_type", choices=("sgd","adam","adamw"), default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--momentum", type=float, default=None)
@@ -8732,7 +7420,7 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         "model":"model","data_root":"data_root","num_clients":"num_clients","frac":"frac",
         "rounds":"rounds","local_epochs":"local_epochs","local_steps":"local_steps","batch_size":"batch_size",
         "test_batch_size":"test_batch_size","num_workers":"num_workers","num_experts":"num_experts",
-        "topk":"topk","seed":"seed","device":"device","output_dir":"output_dir","run_name":"run_name",
+        "seed":"seed","device":"device","output_dir":"output_dir","run_name":"run_name",
     }
     for arg_name,config_key in top_level.items():
         value=getattr(args,arg_name,None)
@@ -8766,10 +7454,6 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         info=DATASET_INFO.get(dataset)
         if info is not None:
             overrides["input_shape"]=tuple(info["input_shape"])
-    backbone=getattr(args,"backbone",None)
-    if backbone is not None: overrides.setdefault("model_cfg",{})["backbone"]=backbone
-    moe_hidden_dim=getattr(args,"moe_hidden_dim",None)
-    if moe_hidden_dim is not None: overrides.setdefault("model_cfg",{})["moe_hidden_dim"]=moe_hidden_dim
     opt={}
     for an,ck in (("optimizer_type","type"),("lr","lr"),("momentum","momentum"),("weight_decay","weight_decay")):
         v=getattr(args,an,None)
