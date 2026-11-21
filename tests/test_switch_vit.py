@@ -50,6 +50,11 @@ class SwitchViTTests(unittest.TestCase):
             )
 
         self.assertEqual(model.pos_embed.shape[1], 65)
+        for block_index in (1, 3, 5):
+            moe = model.blocks[block_index].mlp
+            self.assertFalse(moe.auxiliary_loss)
+            self.assertFalse(moe.expert_capacity)
+            self.assertFalse(moe.token_dropping)
         parameter_count = base.count_parameters(model)
         self.assertEqual(parameter_count, 9_504_278)
 
@@ -140,13 +145,125 @@ class SwitchViTTests(unittest.TestCase):
             self.assertEqual(set(experts), {0, 1, 2, 3})
             self.assertTrue(all(experts[expert_id] for expert_id in range(4)))
 
-    def test_auxiliary_loss_cannot_be_enabled_yet(self) -> None:
+    def test_auxiliary_loss_can_be_enabled_and_is_added_to_task_loss(self) -> None:
         cfg = {
             **self.cfg,
-            "model_cfg": {"auxiliary_loss": True},
+            "model_cfg": {
+                "auxiliary_loss": True,
+                "aux_loss_coef": 0.01,
+            },
         }
-        with self.assertRaisesRegex(ValueError, "Auxiliary Loss"):
-            base.build_switch_vit_model(cfg)
+        model = base.build_switch_vit_model(cfg)
+        images = torch.randn(2, 3, 32, 32)
+        targets = torch.tensor([1, 4])
+
+        output = model(images)
+
+        self.assertIsNotNone(output.aux_loss)
+        self.assertGreater(float(output.aux_loss.detach().item()), 0.0)
+        self.assertEqual(
+            set(output.aux_loss_by_layer),
+            {"blocks.1.mlp", "blocks.3.mlp", "blocks.5.mlp"},
+        )
+        losses = base.compute_model_loss(
+            output,
+            targets,
+            torch.nn.CrossEntropyLoss(),
+        )
+        self.assertTrue(torch.allclose(
+            losses.total_loss,
+            losses.task_loss + losses.aux_loss,
+        ))
+        losses.total_loss.backward()
+        for block_index in (1, 3, 5):
+            router_grad = model.blocks[block_index].mlp.router.projection.weight.grad
+            self.assertIsNotNone(router_grad)
+            self.assertGreater(float(router_grad.abs().sum().item()), 0.0)
+
+    def _make_constant_router_moe(
+        self,
+        num_experts: int,
+        capacity_factor: float,
+        token_dropping: bool,
+    ) -> base.SwitchMoE:
+        moe = base.SwitchMoE(
+            hidden_dim=4,
+            expert_hidden_dim=8,
+            num_experts=num_experts,
+            expert_capacity=True,
+            capacity_factor=capacity_factor,
+            token_dropping=token_dropping,
+        )
+        with torch.no_grad():
+            moe.router.projection.weight.zero_()
+            # Every token prefers expert_0, then expert_1, then expert_2, etc.
+            moe.router.projection.bias.copy_(
+                torch.arange(num_experts, 0, -1, dtype=torch.float32)
+            )
+        return moe
+
+    def test_capacity_reroutes_overflow_across_all_experts_without_dropping(self) -> None:
+        moe = self._make_constant_router_moe(
+            num_experts=3,
+            capacity_factor=1.0,
+            token_dropping=False,
+        )
+        inputs = torch.randn(1, 9, 4)
+
+        outputs, stats, aux_loss = moe(inputs)
+
+        self.assertEqual(tuple(outputs.shape), (1, 9, 4))
+        self.assertIsNone(aux_loss)
+        self.assertEqual(stats["tokens_per_expert"].tolist(), [9, 0, 0])
+        self.assertEqual(
+            stats["processed_tokens_per_expert"].tolist(),
+            [3, 3, 3],
+        )
+        self.assertEqual(stats["rerouted_tokens"], 6)
+        self.assertEqual(stats["dropped_tokens"], 0)
+        self.assertEqual(
+            stats["rerouted_tokens_per_expert"].tolist(),
+            [0, 3, 3],
+        )
+
+    def test_token_dropping_only_occurs_after_all_experts_are_full(self) -> None:
+        moe = self._make_constant_router_moe(
+            num_experts=3,
+            capacity_factor=0.5,
+            token_dropping=True,
+        )
+        inputs = torch.randn(1, 8, 4)
+
+        outputs, stats, _ = moe(inputs)
+
+        self.assertEqual(tuple(outputs.shape), (1, 8, 4))
+        self.assertEqual(
+            stats["processed_tokens_per_expert"].tolist(),
+            [2, 2, 2],
+        )
+        self.assertEqual(stats["rerouted_tokens"], 4)
+        self.assertEqual(stats["dropped_tokens"], 2)
+        self.assertEqual(int(stats["overflow_tokens_per_expert"].sum().item()), 6)
+
+    def test_capacity_and_token_dropping_configuration_validation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "capacity_factor"):
+            base.build_switch_vit_model({
+                **self.cfg,
+                "model_cfg": {
+                    "expert_capacity": True,
+                    "capacity_factor": 0.5,
+                    "token_dropping": False,
+                },
+            })
+
+        with self.assertRaisesRegex(ValueError, "expert_capacity"):
+            base.build_switch_vit_model({
+                **self.cfg,
+                "model_cfg": {
+                    "expert_capacity": False,
+                    "token_dropping": True,
+                },
+            })
 
 
 if __name__ == "__main__":
