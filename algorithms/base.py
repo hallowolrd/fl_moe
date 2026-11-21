@@ -323,14 +323,16 @@ class ConfigNode:
     """
     轻量级配置对象。
 
-    支持两种读取方式：
+    支持属性读取：
         cfg.dataset
         cfg.agg.non_expert.method
         cfg.agg.expert.method
+        cfg.method_config
 
     也支持路径读取：
         cfg.get("agg.non_expert.method", "uniform")
         cfg.get("agg.expert.method", "uniform")
+        cfg.get("method_config.some_option")
     """
 
     def __init__(self, data: Mapping[str, Any]):
@@ -434,6 +436,9 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "non_expert": {"method": "uniform"},
         "expert": {"method": "uniform"},
     },
+    # Opaque options owned by the selected method/plugin. The base framework
+    # validates only the mapping container and does not interpret its contents.
+    "method_config": {},
     "seed": EMBEDDED_DEFAULT_SEED,
     "deterministic": True,
     "device": "auto",
@@ -511,6 +516,53 @@ def load_config(
     if method_validator is not None:
         method_validator(raw_cfg)
     return ConfigNode(raw_cfg)
+
+
+def _build_method_config_record(
+    raw: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """
+    Collect method-owned options without interpreting method names or semantics.
+
+    New configurations should place plugin-specific options under the generic
+    top-level method_config mapping. For backward compatibility, unknown
+    top-level keys from older method configurations are also retained here.
+
+    Shared framework keys and derived/input-alias keys are excluded.
+    """
+    framework_keys = set(EMBEDDED_BASE_CONFIG)
+    framework_keys.update(
+        {
+            "alpha",  # legacy alias for partition.dirichlet.alpha
+            "data_augmentation",
+            "grad_clip",
+            "include",
+            "input_shape",  # derived from the dataset unless explicitly set
+            "lr",  # rejected legacy optimizer aliases
+            "momentum",
+            "num_classes",  # derived from the dataset unless explicitly set
+            "partition_method",  # legacy alias for partition.method
+            "run_dir",  # derived from output_dir and run_name
+            "weight_decay",
+        }
+    )
+
+    # Preserve legacy method-specific root keys without naming any algorithm.
+    method_config = {
+        key: copy.deepcopy(value)
+        for key, value in raw.items()
+        if key not in framework_keys
+    }
+
+    explicit_method_config = raw.get("method_config", {})
+    if explicit_method_config is None:
+        explicit_method_config = {}
+    if not isinstance(explicit_method_config, Mapping):
+        raise ConfigError("method_config 必须是 dict。")
+
+    # The explicit generic namespace takes precedence over legacy root keys.
+    method_config.update(copy.deepcopy(dict(explicit_method_config)))
+    return method_config
 
 
 def _build_config_record(
@@ -638,11 +690,11 @@ def _build_config_record(
     if expert_cfg.get("method") is not None:
         aggregation_record["expert"] = copy.deepcopy(expert_cfg["method"])
 
-    # Include geometry settings only for an active orthogonal expert method.
-    expert_method_name = str(expert_cfg.get("method", "")).lower()
-    orthogonal_cfg = as_mapping(raw.get("orthogonal"))
-    if orthogonal_cfg and "orthogonal" in expert_method_name:
-        aggregation_record["orthogonal"] = copy.deepcopy(dict(orthogonal_cfg))
+    # Method/plugin options are opaque to the shared framework. The record
+    # preserves them generically and does not branch on the selected method.
+    method_config = _build_method_config_record(raw)
+    if method_config:
+        aggregation_record["method_config"] = method_config
 
     if aggregation_record:
         record["aggregation"] = aggregation_record
@@ -1189,6 +1241,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     model_cfg = cfg.get("model_cfg", {})
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
+
+    method_config = cfg.get("method_config", {})
+    if not isinstance(method_config, Mapping):
+        raise ConfigError("method_config 必须是 dict。")
 
     agg_cfg = cfg.get("agg", {})
     non_expert_method = agg_cfg.get("non_expert", {}).get("method")
@@ -4708,8 +4764,8 @@ class ClientUpdate:
 
     这个结构是 client 和 server 之间的统一接口。
 
-    后面无论是 FedAvg、ExpertFedAvg、方法插件、history filter、Bayes，
-    都尽量往这个结构里扩展，而不是让 client.py 和 server.py 互相强耦合。
+    后续新增的聚合方法、训练策略和诊断插件都应复用这个结构，
+    而不是让 client.py 和 server.py 互相强耦合。
     """
 
     # 客户端编号
@@ -4743,7 +4799,7 @@ class ClientUpdate:
     extra: Dict[str, Any] = field(default_factory=dict)
 
     # 专家算法专属载荷，例如 Gradient Stream；不与轻量诊断 extra 混用。
-    # model_delta 仍保留，用于 non_expert 的 FedAvg 更新。
+    # model_delta 仍保留，用于 non_expert 的常规参数聚合。
     algorithm_payload: Dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
@@ -5079,8 +5135,8 @@ class ExpertClientTrainingStrategy(ABC):
         """
         策略是否已在本地更新专家参数，并要求框架把专家参数差一并上传。
 
-        普通 Delta 聚合算法（例如 FedAvg Orthogonal）返回 True；
-        由 algorithm_payload 承载专家更新的算法（例如 RFedAGS）保持 False。
+        若策略要求框架通过 model_delta 上传专家参数差分，则返回 True；
+        若策略通过 algorithm_payload 上传专家更新，则保持 False。
         """
         return False
 
