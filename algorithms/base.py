@@ -4042,7 +4042,15 @@ class ParamGroups:
             "num_non_expert": len(self.non_expert),
             "num_expert": len(self.expert),
             "num_experts_found": len(self.expert_by_id),
+            "num_expert_instances_found": sum(
+                len(expert_groups)
+                for expert_groups in self.expert_by_layer_and_id.values()
+            ),
             "num_moe_layers_found": len(self.expert_by_moe_layer),
+            "num_experts_by_moe_layer": {
+                layer_name: len(expert_groups)
+                for layer_name, expert_groups in self.expert_by_layer_and_id.items()
+            },
             "num_params_by_expert": {
                 int(expert_id): len(names)
                 for expert_id, names in self.expert_by_id.items()
@@ -4217,9 +4225,9 @@ def validate_param_groups(
         1. all 是否覆盖 state_dict 所有 key
         2. non_expert 和 expert 是否有重叠
         3. non_expert + expert 是否刚好覆盖 all
-        4. expert_by_id 是否和 expert 一致
+        4. expert_by_id、expert_by_moe_layer 和 expert_by_layer_and_id 是否一致
         5. 如果 strict=True，要求至少找到一个 expert 参数
-        6. 如果传入 expected_num_experts，则检查 expert id 数量
+        6. 如果传入 expected_num_experts，则逐层检查专家编号是否完整
     """
     state_names = set(state_dict.keys())
     all_names = set(groups.all)
@@ -4294,6 +4302,11 @@ def validate_param_groups(
         raise ValueError(
             "expert_by_moe_layer 和 expert 参数组不一致。"
             f" missing={missing[:10]}, extra={extra[:10]}"
+        )
+
+    if set(groups.expert_by_moe_layer) != set(groups.expert_by_layer_and_id):
+        raise ValueError(
+            "expert_by_moe_layer 和 expert_by_layer_and_id 的 MoE 层集合不一致。"
         )
 
     # 验证 MoE 层 + expert id 二级分组。
@@ -4530,7 +4543,7 @@ def build_federated_optimization_groups(
     )
 
 
-def count_tensors_by_group(groups: ParamGroups) -> Dict[str, int]:
+def count_tensors_by_group(groups: ParamGroups) -> Dict[str, Any]:
     """
     统计每个参数组包含多少个 tensor。
     """
