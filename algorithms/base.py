@@ -4273,6 +4273,63 @@ def validate_param_groups(
             f" missing={missing[:10]}, extra={extra[:10]}"
         )
 
+    # 验证按 MoE 层分组：每个专家参数必须归属到正确的 MoE 模块。
+    expert_by_layer_names = set()
+    for layer_name, names in groups.expert_by_moe_layer.items():
+        if not isinstance(layer_name, str) or not layer_name:
+            raise ValueError(f"MoE 层名称必须是非空字符串：{layer_name!r}")
+
+        for name in names:
+            parsed_layer = get_moe_layer_from_name(name)
+            if parsed_layer != layer_name:
+                raise ValueError(
+                    f"expert_by_moe_layer 分组错误：参数 {name} 被放到 "
+                    f"{layer_name!r}，但解析结果是 {parsed_layer!r}。"
+                )
+            expert_by_layer_names.add(name)
+
+    if expert_by_layer_names != expert_names:
+        missing = sorted(expert_names - expert_by_layer_names)
+        extra = sorted(expert_by_layer_names - expert_names)
+        raise ValueError(
+            "expert_by_moe_layer 和 expert 参数组不一致。"
+            f" missing={missing[:10]}, extra={extra[:10]}"
+        )
+
+    # 验证 MoE 层 + expert id 二级分组。
+    expert_by_layer_and_id_names = set()
+    for layer_name, expert_groups in groups.expert_by_layer_and_id.items():
+        if layer_name not in groups.expert_by_moe_layer:
+            raise ValueError(
+                "expert_by_layer_and_id 包含未知 MoE 层："
+                f"{layer_name!r}"
+            )
+
+        for expert_id, names in expert_groups.items():
+            if expert_id < 0:
+                raise ValueError(
+                    f"expert_id 不能小于 0，当前值：{expert_id}"
+                )
+
+            for name in names:
+                parsed_layer = get_moe_layer_from_name(name)
+                parsed_expert_id = get_expert_id_from_name(name)
+                if parsed_layer != layer_name or parsed_expert_id != expert_id:
+                    raise ValueError(
+                        "expert_by_layer_and_id 分组错误："
+                        f"参数 {name} 被放到 ({layer_name!r}, {expert_id})，"
+                        f"实际解析结果为 ({parsed_layer!r}, {parsed_expert_id!r})。"
+                    )
+                expert_by_layer_and_id_names.add(name)
+
+    if expert_by_layer_and_id_names != expert_names:
+        missing = sorted(expert_names - expert_by_layer_and_id_names)
+        extra = sorted(expert_by_layer_and_id_names - expert_names)
+        raise ValueError(
+            "expert_by_layer_and_id 和 expert 参数组不一致。"
+            f" missing={missing[:10]}, extra={extra[:10]}"
+        )
+
     if strict and len(expert_names) == 0:
         raise ValueError(
             "没有找到任何 expert 参数。"
@@ -4295,6 +4352,16 @@ def validate_param_groups(
                 "模型中找到的 expert id 和期望不一致。"
                 f" found={found_expert_ids}, expected={expected_expert_ids}"
             )
+
+        # 多层 MoE 必须逐层检查，不能让某一层缺失的专家被其他层掩盖。
+        if strict:
+            for layer_name, expert_groups in groups.expert_by_layer_and_id.items():
+                layer_expert_ids = sorted(expert_groups.keys())
+                if layer_expert_ids != expected_expert_ids:
+                    raise ValueError(
+                        f"MoE 层 {layer_name!r} 的 expert id 与期望不一致。"
+                        f" found={layer_expert_ids}, expected={expected_expert_ids}"
+                    )
 
 
 @dataclass(frozen=True)
