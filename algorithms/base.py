@@ -4383,6 +4383,18 @@ class FederatedOptimizationGroups:
     expert_parameters: List[str]
     buffers: List[str] = field(default_factory=list)
     frozen_parameters: List[str] = field(default_factory=list)
+    expert_state_names_by_moe_layer: Dict[str, List[str]] = field(
+        default_factory=dict
+    )
+    expert_state_names_by_layer_and_id: Dict[str, Dict[int, List[str]]] = field(
+        default_factory=dict
+    )
+    expert_parameters_by_moe_layer: Dict[str, List[str]] = field(
+        default_factory=dict
+    )
+    expert_parameters_by_layer_and_id: Dict[str, Dict[int, List[str]]] = field(
+        default_factory=dict
+    )
 
     @property
     def expert_parameter_names(self) -> List[str]:
@@ -4394,6 +4406,20 @@ class FederatedOptimizationGroups:
             "num_expert_parameters": len(self.expert_parameters),
             "num_buffers": len(self.buffers),
             "num_frozen_parameters": len(self.frozen_parameters),
+            "num_moe_layers": len(self.expert_parameters_by_moe_layer),
+            "num_expert_parameters_by_moe_layer": {
+                layer_name: len(names)
+                for layer_name, names in self.expert_parameters_by_moe_layer.items()
+            },
+            "num_expert_parameters_by_layer_and_id": {
+                layer_name: {
+                    int(expert_id): len(names)
+                    for expert_id, names in expert_groups.items()
+                }
+                for layer_name, expert_groups in (
+                    self.expert_parameters_by_layer_and_id.items()
+                )
+            },
         }
 
 
@@ -4461,6 +4487,35 @@ def build_federated_optimization_groups(
     if set(non_expert_parameters) & set(expert_parameters):
         raise ValueError("non_expert 与 expert 参数分组发生重叠。")
 
+    expert_state_names_by_moe_layer = {
+        layer_name: list(names)
+        for layer_name, names in param_groups.expert_by_moe_layer.items()
+    }
+    expert_state_names_by_layer_and_id = {
+        layer_name: {
+            expert_id: list(names)
+            for expert_id, names in expert_groups.items()
+        }
+        for layer_name, expert_groups in param_groups.expert_by_layer_and_id.items()
+    }
+
+    trainable_name_set = set(trainable_names)
+    expert_parameters_by_moe_layer = {
+        layer_name: [
+            name for name in names if name in trainable_name_set
+        ]
+        for layer_name, names in param_groups.expert_by_moe_layer.items()
+    }
+    expert_parameters_by_layer_and_id = {
+        layer_name: {
+            expert_id: [
+                name for name in names if name in trainable_name_set
+            ]
+            for expert_id, names in expert_groups.items()
+        }
+        for layer_name, expert_groups in param_groups.expert_by_layer_and_id.items()
+    }
+
     return FederatedOptimizationGroups(
         non_expert_state_names=list(param_groups.non_expert),
         expert_state_names=list(param_groups.expert),
@@ -4468,6 +4523,10 @@ def build_federated_optimization_groups(
         expert_parameters=expert_parameters,
         buffers=buffers,
         frozen_parameters=frozen_names,
+        expert_state_names_by_moe_layer=expert_state_names_by_moe_layer,
+        expert_state_names_by_layer_and_id=expert_state_names_by_layer_and_id,
+        expert_parameters_by_moe_layer=expert_parameters_by_moe_layer,
+        expert_parameters_by_layer_and_id=expert_parameters_by_layer_and_id,
     )
 
 
