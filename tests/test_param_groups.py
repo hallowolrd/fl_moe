@@ -64,6 +64,39 @@ class TinyRootExperts(nn.Module):
         )
 
 
+class TinySwitchMoE(nn.Module):
+    """Switch-style MoE whose experts are stored in a ModuleDict."""
+
+    def __init__(self, num_experts: int = 4) -> None:
+        super().__init__()
+        self.router = nn.Linear(4, num_experts)
+        self.experts = nn.ModuleDict(
+            {
+                f"expert_{expert_id}": TinyExpert()
+                for expert_id in range(num_experts)
+            }
+        )
+
+
+class TinySwitchBlock(nn.Module):
+    def __init__(self, num_experts: int = 4) -> None:
+        super().__init__()
+        self.mlp = TinySwitchMoE(num_experts=num_experts)
+
+
+class TinySwitchMultiLayerMoE(nn.Module):
+    def __init__(self, expert_counts: tuple[int, ...] = (4, 4)) -> None:
+        super().__init__()
+        self.backbone = nn.Linear(4, 4)
+        self.blocks = nn.ModuleList(
+            [
+                TinySwitchBlock(num_experts=count)
+                for count in expert_counts
+            ]
+        )
+        self.classifier = nn.Linear(4, 2)
+
+
 class MultiLayerParamGroupTests(unittest.TestCase):
     def test_single_layer_keeps_legacy_expert_groups(self) -> None:
         model = TinySingleLayerMoE(num_experts=4)
@@ -245,6 +278,77 @@ class MultiLayerParamGroupTests(unittest.TestCase):
         self.assertEqual(
             summary["tensor_counts"]["expert_by_moe_layer"],
             tensor_counts["expert_by_moe_layer"],
+        )
+
+    def test_switch_transformer_module_dict_experts_are_grouped_by_layer_and_id(self) -> None:
+        model = TinySwitchMultiLayerMoE(expert_counts=(4, 4))
+
+        groups = base.build_param_groups(
+            model,
+            expected_num_experts=4,
+            strict=True,
+        )
+        optimization_groups = base.build_federated_optimization_groups(
+            model,
+            param_groups=groups,
+            strict=True,
+        )
+
+        expected_layers = {
+            "blocks.0.mlp",
+            "blocks.1.mlp",
+        }
+        self.assertEqual(set(groups.expert_by_moe_layer), expected_layers)
+        self.assertEqual(
+            set(groups.expert_by_layer_and_id["blocks.0.mlp"]),
+            {0, 1, 2, 3},
+        )
+        self.assertEqual(
+            set(groups.expert_by_layer_and_id["blocks.1.mlp"]),
+            {0, 1, 2, 3},
+        )
+
+        for layer_name in expected_layers:
+            for expert_id in range(4):
+                names = groups.expert_by_layer_and_id[layer_name][expert_id]
+                self.assertTrue(names)
+                self.assertTrue(
+                    all(
+                        name.startswith(
+                            f"{layer_name}.experts.expert_{expert_id}."
+                        )
+                        for name in names
+                    )
+                )
+
+        grouped_trainable_names = {
+            name
+            for layer_groups in (
+                optimization_groups.expert_parameters_by_layer_and_id.values()
+            )
+            for names in layer_groups.values()
+            for name in names
+        }
+        self.assertEqual(
+            grouped_trainable_names,
+            set(optimization_groups.expert_parameters),
+        )
+        self.assertIn("blocks.0.mlp.router.weight", groups.non_expert)
+
+    def test_expert_name_parsers_support_switch_transformer_module_dict_keys(self) -> None:
+        name = (
+            "encoder.block.0.layer.1.mlp."
+            "experts.expert_3.wi.weight"
+        )
+        self.assertEqual(base.get_expert_id_from_name(name), 3)
+        self.assertEqual(
+            base.get_moe_layer_from_name(name),
+            "encoder.block.0.layer.1.mlp",
+        )
+        self.assertIsNone(
+            base.get_expert_id_from_name(
+                "encoder.block.0.layer.1.mlp.router.classifier.weight"
+            )
         )
 
     def test_root_level_experts_have_explicit_root_layer_key(self) -> None:
