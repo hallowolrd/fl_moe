@@ -49,9 +49,9 @@ class SwitchViTTests(unittest.TestCase):
                 ["expert_0", "expert_1", "expert_2", "expert_3"],
             )
 
+        self.assertEqual(model.pos_embed.shape[1], 65)
         parameter_count = base.count_parameters(model)
-        self.assertGreater(parameter_count, 9_400_000)
-        self.assertLess(parameter_count, 9_600_000)
+        self.assertEqual(parameter_count, 9_504_278)
 
     def test_forward_top1_dispatch_and_router_statistics(self) -> None:
         model = base.build_switch_vit_model(self.cfg)
