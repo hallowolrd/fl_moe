@@ -52,9 +52,12 @@ class _ExpertAuxLossModel(nn.Module):
     def forward(self, inputs):
         features = self.backbone(inputs)
         logits = self.experts[0](features)
+        aux_loss = self.aux_scale.square()
         return base.ModelOutput(
             logits=logits,
-            aux_loss=self.aux_scale.square(),
+            aux_loss=aux_loss,
+            aux_loss_by_layer={"layer_0": aux_loss},
+            moe_stats={"layer_0": {"tokens_per_expert": [1, 1]}},
         )
 
 
@@ -176,6 +179,11 @@ class ModelOutputAndAuxLossTests(unittest.TestCase):
         )
 
         self.assertGreater(stats.avg_aux_loss, 0.0)
+        self.assertGreater(stats.avg_aux_loss_by_layer["layer_1"], 0.0)
+        self.assertEqual(
+            stats.moe_stats["layer_1"]["tokens_per_expert"],
+            [4, 2],
+        )
         self.assertAlmostEqual(
             stats.avg_loss,
             stats.avg_task_loss + stats.avg_aux_loss,
@@ -228,11 +236,46 @@ class ModelOutputAndAuxLossTests(unittest.TestCase):
         )
 
         self.assertGreater(result.stats.avg_aux_loss, 0.0)
+        self.assertGreater(result.stats.avg_aux_loss_by_layer["layer_0"], 0.0)
+        self.assertEqual(
+            result.stats.moe_stats["layer_0"]["tokens_per_expert"],
+            [2, 2],
+        )
         self.assertAlmostEqual(
             result.stats.avg_loss,
             result.stats.avg_task_loss + result.stats.avg_aux_loss,
             places=6,
         )
+
+    def test_flclient_uploads_layer_losses_and_moe_stats(self) -> None:
+        inputs = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.5]]
+        )
+        targets = torch.tensor([0, 1, 0, 1])
+        loader = DataLoader(
+            TensorDataset(inputs, targets),
+            batch_size=2,
+            shuffle=False,
+        )
+        client = base.FLClient(
+            client_id=3,
+            train_loader=loader,
+            cfg={"local_epochs": 1, "local_steps": None},
+            device="cpu",
+        )
+        update = client.train(
+            global_model=_AuxLossModel(),
+            round_id=1,
+        )
+
+        self.assertIn("layer_1", update.avg_aux_loss_by_layer)
+        self.assertEqual(
+            update.moe_stats["layer_1"]["tokens_per_expert"],
+            [4, 2],
+        )
+        summary = update.summary()
+        self.assertIn("layer_1", summary["avg_aux_loss_by_layer_keys"])
+        self.assertIn("layer_1", summary["moe_stats_keys"])
 
     def test_evaluation_uses_classification_loss_only(self) -> None:
         inputs = torch.tensor([[1.0, 0.0], [0.0, 1.0]])

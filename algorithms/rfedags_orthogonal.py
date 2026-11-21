@@ -1084,9 +1084,10 @@ def build_expert_client_training_strategy(
     )
 
 
-def main() -> int:
+def main(model_builder: base.ModelBuilder | None = None) -> int:
     return base.main(
         expert_aggregator_builder=build_expert_aggregator,
+        model_builder=model_builder,
         embedded_method_config=EMBEDDED_METHOD_CONFIG,
         expert_method_name=ALGORITHM_NAME,
         method_config_defaults=METHOD_CONFIG_DEFAULTS,

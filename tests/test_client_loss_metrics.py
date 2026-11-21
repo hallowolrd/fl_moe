@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import io
 import os
 import sys
@@ -35,6 +36,8 @@ class ClientLossMetricPipelineTests(unittest.TestCase):
                     "train_acc": 80.0,
                     "num_processed_samples": 10.0,
                 },
+                avg_aux_loss_by_layer={"layer_0": 0.1},
+                moe_stats={"layer_0": {"tokens_per_expert": [4, 6]}},
             ),
             base.ClientUpdate(
                 client_id=1,
@@ -48,6 +51,8 @@ class ClientLossMetricPipelineTests(unittest.TestCase):
                     "train_acc": 60.0,
                     "num_processed_samples": 30.0,
                 },
+                avg_aux_loss_by_layer={"layer_0": 0.3},
+                moe_stats={"layer_0": {"tokens_per_expert": [8, 12]}},
             ),
         ]
 
@@ -85,6 +90,11 @@ class ClientLossMetricPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(result.train_metrics["avg_train_loss"], 2.75)
         self.assertAlmostEqual(result.train_metrics["avg_train_task_loss"], 2.5)
         self.assertAlmostEqual(result.train_metrics["avg_train_aux_loss"], 0.25)
+        self.assertAlmostEqual(result.avg_train_aux_loss_by_layer["layer_0"], 0.25)
+        self.assertEqual(
+            result.moe_stats["layer_0"]["tokens_per_expert"],
+            [12, 18],
+        )
 
         # task loss + auxiliary loss must equal the aggregated total loss.
         self.assertAlmostEqual(
@@ -111,6 +121,10 @@ class ClientLossMetricPipelineTests(unittest.TestCase):
             result.client_diagnostics[1]["metrics"]["train_aux_loss"],
             0.3,
         )
+        self.assertEqual(
+            result.client_diagnostics[0]["moe_stats"]["layer_0"]["tokens_per_expert"],
+            [4, 6],
+        )
 
     def test_round_and_client_logs_include_loss_components(self) -> None:
         result = self.make_round_result()
@@ -131,6 +145,9 @@ class ClientLossMetricPipelineTests(unittest.TestCase):
         joined = "\n".join(messages)
         self.assertIn("task_loss=2.5000", joined)
         self.assertIn("aux_loss=0.2500", joined)
+        self.assertIn("[AuxLossByLayer]", joined)
+        self.assertIn("[MoEStats]", joined)
+        self.assertIn("tokens_per_expert", joined)
         self.assertIn("[Client][0]", joined)
         self.assertIn("task_loss=1.0000", joined)
         self.assertIn("aux_loss=0.1000", joined)
@@ -155,6 +172,14 @@ class ClientLossMetricPipelineTests(unittest.TestCase):
         self.assertAlmostEqual(float(rows[0]["avg_train_loss"]), 2.75)
         self.assertAlmostEqual(float(rows[0]["avg_train_task_loss"]), 2.5)
         self.assertAlmostEqual(float(rows[0]["avg_train_aux_loss"]), 0.25)
+        self.assertEqual(
+            json.loads(rows[0]["avg_train_aux_loss_by_layer_json"]),
+            {"layer_0": 0.25},
+        )
+        self.assertEqual(
+            json.loads(rows[0]["moe_stats_json"]),
+            {"layer_0": {"tokens_per_expert": [12, 18]}},
+        )
 
 
 if __name__ == "__main__":

@@ -277,7 +277,7 @@ from tqdm.auto import tqdm
 # =========================
 # 可扩展的合法取值注册区
 # =========================
-# 后续新增数据集、模型时，优先改这里。
+# 后续新增数据集时，优先改这里。
 
 SUPPORTED_DATASETS = {
     "cifar10",
@@ -423,7 +423,6 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "batch_size": 64,
     "test_batch_size": 64,
     "num_workers": 2,
-    "model": "switch_vit",
     "model_cfg": {},
     "num_experts": 4,
     "optimizer": {
@@ -1235,9 +1234,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前支持：{sorted(SUPPORTED_DATASETS)}"
         )
 
-    model = cfg.get("model")
-    if not isinstance(model, str) or not model.strip():
-        raise ConfigError("model 必须是非空字符串。")
     model_cfg = cfg.get("model_cfg", {})
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
@@ -2091,6 +2087,8 @@ class ModelOutput:
 
     moe_stats:
         可选的 MoE 路由统计。应当是轻量统计信息，不应保存计算图。
+        统计值应使用可跨 batch/client 累加的计数或求和量（例如 tokens_per_expert、router_prob_sum）；
+        不要直接传入已经求平均的比例或均值。框架会在客户端和服务端逐级累加。
     """
 
     logits: torch.Tensor
@@ -2408,6 +2406,132 @@ def compute_model_loss(
         task_loss=task_loss,
         aux_loss=aux_loss,
     )
+
+
+def _normalize_moe_stat_value(value: Any, path: str = "moe_stats") -> Any:
+    """Detach runtime MoE statistics and convert them to JSON-safe Python values."""
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu()
+        if tensor.is_complex():
+            raise TypeError(f"{path} 不支持复数 Tensor。")
+        if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+            raise ValueError(f"{path} 包含 NaN 或 Inf。")
+        if tensor.numel() == 1:
+            return tensor.item()
+        return tensor.tolist()
+    if isinstance(value, np.ndarray):
+        return _normalize_moe_stat_value(value.tolist(), path=path)
+    if isinstance(value, np.generic):
+        return _normalize_moe_stat_value(value.item(), path=path)
+    if isinstance(value, Mapping):
+        normalized: Dict[str, Any] = {}
+        for key, item in value.items():
+            safe_key = str(key)
+            if safe_key in normalized:
+                raise ValueError(f"{path} 存在转换后重复的键：{safe_key!r}")
+            normalized[safe_key] = _normalize_moe_stat_value(
+                item, path=f"{path}.{safe_key}"
+            )
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_moe_stat_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} 包含 NaN 或 Inf。")
+        return float(value)
+    raise TypeError(f"{path} 包含不支持的统计类型：{type(value).__name__}")
+
+
+def _normalize_moe_stats(stats: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """Normalize a ModelOutput.moe_stats mapping into detached Python values."""
+    if stats is None:
+        return {}
+    if not isinstance(stats, Mapping):
+        raise TypeError("ModelOutput.moe_stats 必须是 Mapping。")
+    return dict(_normalize_moe_stat_value(stats))
+
+
+def _merge_additive_moe_stats(total: Any, current: Any, path: str = "moe_stats") -> Any:
+    """
+    Sum additive MoE statistics across local batches and clients.
+    Numeric scalars/sequences are summed; repeated string/bool metadata must match.
+    Models should expose counters or sums (e.g. tokens_per_expert, router_prob_sum),
+    not pre-averaged values, in moe_stats.
+    """
+    if total is None:
+        return copy.deepcopy(current)
+    if current is None:
+        return copy.deepcopy(total)
+    if isinstance(total, Mapping) and isinstance(current, Mapping):
+        merged = copy.deepcopy(dict(total))
+        for key, value in current.items():
+            if key in merged:
+                merged[key] = _merge_additive_moe_stats(
+                    merged[key], value, path=f"{path}.{key}"
+                )
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+    if isinstance(total, list) and isinstance(current, list):
+        if len(total) != len(current):
+            raise ValueError(
+                f"{path} 的序列长度在不同 batch/client 间不一致："
+                f"{len(total)} != {len(current)}"
+            )
+        return [
+            _merge_additive_moe_stats(left, right, path=f"{path}[{index}]")
+            for index, (left, right) in enumerate(zip(total, current))
+        ]
+    if (
+        isinstance(total, (int, float)) and not isinstance(total, bool)
+        and isinstance(current, (int, float)) and not isinstance(current, bool)
+    ):
+        value = total + current
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{path} 累加后出现 NaN 或 Inf。")
+        return value
+    if isinstance(total, bool) and isinstance(current, bool) and total == current:
+        return total
+    if isinstance(total, str) and isinstance(current, str) and total == current:
+        return total
+    raise TypeError(
+        f"{path} 在不同 batch/client 间的数据类型或元数据不一致："
+        f"{type(total).__name__} vs {type(current).__name__}"
+    )
+
+
+def _extract_aux_loss_by_layer(values: Mapping[str, Any] | None) -> Dict[str, float]:
+    """Validate and detach per-layer scalar auxiliary losses."""
+    if values is None:
+        return {}
+    if not isinstance(values, Mapping):
+        raise TypeError("ModelOutput.aux_loss_by_layer 必须是 Mapping。")
+    result: Dict[str, float] = {}
+    for key, value in values.items():
+        layer_name = str(key)
+        if torch.is_tensor(value):
+            if value.numel() != 1 or not value.is_floating_point():
+                raise ValueError(
+                    f"aux_loss_by_layer[{layer_name!r}] 必须是浮点标量 Tensor。"
+                )
+            scalar = float(value.detach().cpu().item())
+        elif isinstance(value, np.generic):
+            scalar = float(value.item())
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            scalar = float(value)
+        else:
+            raise TypeError(
+                f"aux_loss_by_layer[{layer_name!r}] 必须是数值或浮点标量 Tensor。"
+            )
+        if not math.isfinite(scalar):
+            raise ValueError(f"aux_loss_by_layer[{layer_name!r}] 包含 NaN 或 Inf。")
+        result[layer_name] = scalar
+    return result
 
 
 def count_correct(
@@ -3952,52 +4076,24 @@ def _infer_pin_memory(cfg: Any) -> bool:
 
 
 # ============================================================================
-# 8. 模型定义与构建（Model）
-# Model components and assembly
-#
-# 本阶段已清理旧模型实现。
-# 后续在本文件内部按 Backbone + MoE + Task Head + Model 的结构重建。
-# 当前不注册具体模型，因此训练入口会在 build_model() 处明确报错。
+# 8. 模型构建与管理（Model）
+# Model construction is supplied by the model package and injected into FL.
 # ============================================================================
 
 ModelBuilder = Callable[[Any], nn.Module]
 
-# 具体模型完成实现后，在这里注册：
-# MODEL_BUILDERS["switch_vit"] = build_switch_vit_from_cfg
-MODEL_BUILDERS: Dict[str, ModelBuilder] = {}
 
-
-def build_model(cfg: Any) -> nn.Module:
-    """根据配置创建已注册模型。"""
-    model_name = get_model_name(cfg)
-    if model_name not in MODEL_BUILDERS:
-        supported = list_supported_models()
-        if not supported:
-            raise RuntimeError(
-                "当前没有已注册的模型。旧 Backbone / Sparse MoE 实现已清理；"
-                "请在完成 Backbone + MoE + Task Head + Model 组装后注册新模型。"
-            )
-        raise ValueError(
-            f"不支持的模型名称：{model_name}。"
-            f"当前支持：{supported}"
+def build_model(cfg: Any, model_builder: ModelBuilder) -> nn.Module:
+    """通过外部注入的 ModelBuilder 创建模型。"""
+    if not callable(model_builder):
+        raise TypeError("model_builder 必须是可调用的模型构建器。")
+    model = model_builder(cfg)
+    if not isinstance(model, nn.Module):
+        raise TypeError(
+            "model_builder 必须返回 torch.nn.Module，"
+            f"当前返回：{type(model).__name__}"
         )
-    return MODEL_BUILDERS[model_name](cfg)
-
-
-def get_model_name(cfg: Any) -> str:
-    """从配置对象或 Mapping 中读取模型名称。"""
-    model_name = _cfg_get(cfg, "model", None)
-    if model_name is None:
-        raise ValueError("配置中缺少 model 字段。")
-    model_name = str(model_name).lower().strip()
-    if not model_name:
-        raise ValueError("配置中的 model 字段不能为空。")
-    return model_name
-
-
-def list_supported_models() -> List[str]:
-    """返回当前已注册的模型名称。"""
-    return sorted(MODEL_BUILDERS.keys())
+    return model
 
 
 def count_parameters(
@@ -4790,6 +4886,12 @@ class ClientUpdate:
     # train_acc
     metrics: Dict[str, float] = field(default_factory=dict)
 
+    # 客户端本地训练期间逐层辅助损失的样本加权平均。
+    avg_aux_loss_by_layer: Dict[str, float] = field(default_factory=dict)
+
+    # 客户端本地训练期间累加的 MoE 运行时统计；字段值必须遵循 ModelOutput 的 additive 约定。
+    moe_stats: Dict[str, Any] = field(default_factory=dict)
+
     # 预留扩展字段
     # 后面可以放：
     # method-specific evidence / statistics
@@ -4816,6 +4918,8 @@ class ClientUpdate:
             "round_id": int(self.round_id),
             "num_samples": int(self.num_samples),
             "metrics": dict(self.metrics),
+            "avg_aux_loss_by_layer_keys": sorted(self.avg_aux_loss_by_layer.keys()),
+            "moe_stats_keys": sorted(self.moe_stats.keys()),
             "extra_keys": sorted(self.extra.keys()),
             "algorithm_payload_keys": sorted(self.algorithm_payload.keys()),
         }
@@ -4870,6 +4974,8 @@ class RoundResult:
         test_metrics: 服务器全局模型的测试集指标。
         aggregation_info: non_expert / expert 聚合结果与算法诊断。
         client_diagnostics: 每个客户端的完整轻量诊断信息。
+        avg_train_aux_loss_by_layer: 按实际处理样本数加权的逐层辅助损失。
+        moe_stats: 客户端上报的可加统计量在本轮内累加。
     """
 
     # 当前轮数
@@ -4892,6 +4998,8 @@ class RoundResult:
 
     # 每个客户端的完整轻量诊断信息
     client_diagnostics: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    avg_train_aux_loss_by_layer: Dict[str, float] = field(default_factory=dict)
+    moe_stats: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为用于 summary.json 的普通字典。"""
@@ -4903,6 +5011,8 @@ class RoundResult:
             "best_acc": float(self.best_acc),
             "aggregation_info": dict(self.aggregation_info),
             "client_diagnostics": dict(self.client_diagnostics),
+            "avg_train_aux_loss_by_layer": dict(self.avg_train_aux_loss_by_layer),
+            "moe_stats": dict(self.moe_stats),
         }
 
 
@@ -5015,6 +5125,51 @@ def average_client_metric(
     return sum(value * weight for value, weight in values) / total_weight
 
 
+def average_client_aux_loss_by_layer(
+    client_updates: Sequence[ClientUpdate],
+) -> Dict[str, float]:
+    """Average per-layer auxiliary losses using processed-sample weights."""
+    weighted_sums: Dict[str, float] = {}
+    total_weights: Dict[str, int] = {}
+    for update in client_updates:
+        if not update.avg_aux_loss_by_layer:
+            continue
+        raw_weight = update.metrics.get("num_processed_samples", update.num_samples)
+        try:
+            weight_float = float(raw_weight)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"客户端 {update.client_id} 的 num_processed_samples 无效：{raw_weight!r}"
+            ) from exc
+        if not math.isfinite(weight_float) or weight_float <= 0 or not weight_float.is_integer():
+            raise ValueError(
+                f"客户端 {update.client_id} 的 num_processed_samples 必须是正整数：{raw_weight!r}"
+            )
+        weight = int(weight_float)
+        for layer_name, raw_value in update.avg_aux_loss_by_layer.items():
+            value = float(raw_value)
+            if not math.isfinite(value):
+                raise ValueError(f"客户端 {update.client_id} 的 {layer_name} 辅助损失非有限。")
+            weighted_sums[layer_name] = weighted_sums.get(layer_name, 0.0) + value * weight
+            total_weights[layer_name] = total_weights.get(layer_name, 0) + weight
+    return {
+        name: weighted_sums[name] / total_weights[name]
+        for name in weighted_sums if total_weights[name] > 0
+    }
+
+
+def aggregate_client_moe_stats(
+    client_updates: Sequence[ClientUpdate],
+) -> Dict[str, Any]:
+    """Sum additive MoE runtime statistics across participating clients."""
+    aggregated: Any = None
+    for update in client_updates:
+        current = _normalize_moe_stats(update.moe_stats)
+        if current:
+            aggregated = _merge_additive_moe_stats(aggregated, current)
+    return {} if aggregated is None else dict(aggregated)
+
+
 # ============================================================================
 # 11. 联邦客户端（FL Client）
 # 包含客户端构建、选择、本地训练及更新信息生成。
@@ -5024,22 +5179,7 @@ def average_client_metric(
 
 @dataclass(frozen=True)
 class ClientTrainStats:
-    """
-    客户端本地训练统计结果。
-
-    avg_loss:
-        本地训练平均 loss。
-
-    train_acc:
-        本地训练准确率，百分比形式。
-
-    num_samples:
-        本地训练实际处理的样本次数，按 batch 访问累计；固定步数模式下可能
-        因重复遍历 DataLoader 而大于客户端数据集规模。
-
-    num_batches:
-        本地训练 batch 数。
-    """
+    """客户端本地训练损失、逐层辅助损失和 MoE 运行时统计。"""
 
     avg_loss: float
     train_acc: float
@@ -5047,13 +5187,11 @@ class ClientTrainStats:
     num_batches: int
     avg_task_loss: float = 0.0
     avg_aux_loss: float = 0.0
+    avg_aux_loss_by_layer: Dict[str, float] = field(default_factory=dict)
+    moe_stats: Dict[str, Any] = field(default_factory=dict)
 
     def to_metrics(self) -> Dict[str, float]:
-        """
-        转成 ClientUpdate.metrics 使用的普通 dict。
-
-        train_loss 保持为总损失，新增 task/aux 分项便于分析 MoE 训练行为。
-        """
+        """转成 ClientUpdate.metrics 使用的标量训练指标。"""
         return {
             "train_loss": float(self.avg_loss),
             "train_task_loss": float(self.avg_task_loss),
@@ -5371,6 +5509,8 @@ class FLClient:
             num_samples=self.num_samples,
             model_delta=model_delta,
             metrics=stats.to_metrics(),
+            avg_aux_loss_by_layer=dict(stats.avg_aux_loss_by_layer),
+            moe_stats=dict(stats.moe_stats),
             extra={
                 "optimizer": get_optimizer_type(self.cfg),
                 "local_epochs": int(local_epochs),
@@ -5495,6 +5635,9 @@ def train_local_model(
     total_loss = 0.0
     total_task_loss = 0.0
     total_aux_loss = 0.0
+    aux_loss_by_layer_sums: Dict[str, float] = {}
+    aux_loss_by_layer_weights: Dict[str, int] = {}
+    moe_stats: Any = None
     total_correct = 0
     total_samples = 0
     total_batches = 0
@@ -5519,6 +5662,20 @@ def train_local_model(
             criterion=criterion,
         )
         logits = model_output.logits
+        batch_size = int(targets.size(0))
+        for layer_name, layer_loss in _extract_aux_loss_by_layer(
+            model_output.aux_loss_by_layer
+        ).items():
+            aux_loss_by_layer_sums[layer_name] = (
+                aux_loss_by_layer_sums.get(layer_name, 0.0) + layer_loss * batch_size
+            )
+            aux_loss_by_layer_weights[layer_name] = (
+                aux_loss_by_layer_weights.get(layer_name, 0) + batch_size
+            )
+        batch_moe_stats = _normalize_moe_stats(model_output.moe_stats)
+        if batch_moe_stats:
+            moe_stats = _merge_additive_moe_stats(moe_stats, batch_moe_stats)
+
         loss_output.total_loss.backward()
 
         if grad_clip is not None and grad_clip > 0:
@@ -5528,8 +5685,6 @@ def train_local_model(
             )
 
         optimizer.step()
-
-        batch_size = int(targets.size(0))
 
         total_loss += float(loss_output.total_loss.item()) * batch_size
         total_task_loss += float(loss_output.task_loss.item()) * batch_size
@@ -5548,6 +5703,11 @@ def train_local_model(
         num_batches=total_batches,
         avg_task_loss=total_task_loss / total_samples,
         avg_aux_loss=total_aux_loss / total_samples,
+        avg_aux_loss_by_layer={
+            name: aux_loss_by_layer_sums[name] / aux_loss_by_layer_weights[name]
+            for name in aux_loss_by_layer_sums if aux_loss_by_layer_weights[name] > 0
+        },
+        moe_stats={} if moe_stats is None else dict(moe_stats),
     )
 
 
@@ -5708,6 +5868,9 @@ def train_local_model_with_expert_strategy(
     total_loss = 0.0
     total_task_loss = 0.0
     total_aux_loss = 0.0
+    aux_loss_by_layer_sums: Dict[str, float] = {}
+    aux_loss_by_layer_weights: Dict[str, int] = {}
+    moe_stats: Any = None
     total_correct = 0
     total_samples = 0
     total_batches = 0
@@ -5717,7 +5880,7 @@ def train_local_model_with_expert_strategy(
         epoch: int,
         batch_index: int,
     ) -> None:
-        nonlocal total_loss, total_task_loss, total_aux_loss
+        nonlocal total_loss, total_task_loss, total_aux_loss, moe_stats
         nonlocal total_correct, total_samples, total_batches
 
         images, targets = unpack_batch(batch)
@@ -5735,6 +5898,20 @@ def train_local_model_with_expert_strategy(
             criterion=criterion,
         )
         logits = model_output.logits
+        batch_size = int(targets.size(0))
+        for layer_name, layer_loss in _extract_aux_loss_by_layer(
+            model_output.aux_loss_by_layer
+        ).items():
+            aux_loss_by_layer_sums[layer_name] = (
+                aux_loss_by_layer_sums.get(layer_name, 0.0) + layer_loss * batch_size
+            )
+            aux_loss_by_layer_weights[layer_name] = (
+                aux_loss_by_layer_weights.get(layer_name, 0) + batch_size
+            )
+        batch_moe_stats = _normalize_moe_stats(model_output.moe_stats)
+        if batch_moe_stats:
+            moe_stats = _merge_additive_moe_stats(moe_stats, batch_moe_stats)
+
         loss_output.total_loss.backward()
 
         if grad_clip is not None and grad_clip > 0:
@@ -5773,7 +5950,6 @@ def train_local_model_with_expert_strategy(
 
         optimizer.step()
 
-        batch_size = int(targets.size(0))
         total_loss += float(loss_output.total_loss.item()) * batch_size
         total_task_loss += float(loss_output.task_loss.item()) * batch_size
         total_aux_loss += float(loss_output.aux_loss.item()) * batch_size
@@ -5811,6 +5987,11 @@ def train_local_model_with_expert_strategy(
         num_batches=total_batches,
         avg_task_loss=total_task_loss / total_samples,
         avg_aux_loss=total_aux_loss / total_samples,
+        avg_aux_loss_by_layer={
+            name: aux_loss_by_layer_sums[name] / aux_loss_by_layer_weights[name]
+            for name in aux_loss_by_layer_sums if aux_loss_by_layer_weights[name] > 0
+        },
+        moe_stats={} if moe_stats is None else dict(moe_stats),
     )
     return ExpertClientTrainResult(
         stats=stats,
@@ -6125,7 +6306,7 @@ class MethodContext:
     device: torch.device
     dataset_name: str
     server_evidence_loader: Optional[DataLoader] = None
-    model_builder: Optional[Callable[[Any], nn.Module]] = None
+    model_builder: Optional[ModelBuilder] = None
     extra: Mapping[str, Any] = field(default_factory=dict)
     global_model: Optional[nn.Module] = None
     param_groups: Optional[ParamGroups] = None
@@ -6594,6 +6775,7 @@ class FLServer:
         method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
         method_context: Optional[MethodContext] = None,
         global_model: Optional[nn.Module] = None,
+        model_builder: Optional[ModelBuilder] = None,
         expert_client_training_strategy_builder: Optional[
             ExpertClientTrainingStrategyBuilder
         ] = None,
@@ -6601,11 +6783,18 @@ class FLServer:
         self.cfg = cfg
         self.device = torch.device(device)
 
-        # 全局模型默认常驻 CPU。
-        # 客户端训练时会 deepcopy 后移动到 GPU。
-        # 服务端评估时临时移动到 GPU，评估后再移回 CPU。
+        # ModelBuilder 优先从显式参数注入，也允许从 MethodContext 传入。
+        effective_model_builder = model_builder
+        if effective_model_builder is None and method_context is not None:
+            effective_model_builder = method_context.model_builder
+
+        # 全局模型默认常驻 CPU；客户端训练时 deepcopy 后移动到 GPU。
         if global_model is None:
-            self.global_model = build_model(cfg)
+            if effective_model_builder is None:
+                raise ValueError(
+                    "FLServer 未收到 global_model 或 model_builder；请通过外部 ModelBuilder 注入模型。"
+                )
+            self.global_model = build_model(cfg, effective_model_builder)
         else:
             self.global_model = global_model
 
@@ -6644,7 +6833,7 @@ class FLServer:
                 device=method_context.device,
                 dataset_name=method_context.dataset_name,
                 server_evidence_loader=method_context.server_evidence_loader,
-                model_builder=method_context.model_builder,
+                model_builder=effective_model_builder,
                 global_model=self.global_model,
                 param_groups=self.param_groups,
                 optimization_groups=self.optimization_groups,
@@ -7101,6 +7290,8 @@ class FLServer:
             "test_acc": float(eval_result.acc),
         }
         client_diagnostics = self._build_client_diagnostics(client_updates)
+        avg_train_aux_loss_by_layer = average_client_aux_loss_by_layer(client_updates)
+        moe_stats = aggregate_client_moe_stats(client_updates)
 
         return RoundResult(
             round_id=int(round_id),
@@ -7110,6 +7301,8 @@ class FLServer:
             best_acc=float(self.train_state.best_acc),
             aggregation_info=dict(aggregation_info),
             client_diagnostics=client_diagnostics,
+            avg_train_aux_loss_by_layer=avg_train_aux_loss_by_layer,
+            moe_stats=moe_stats,
         )
 
     def print_startup_summary(self) -> None:
@@ -7142,7 +7335,11 @@ class FLServer:
                 f"steps={int(local_steps)} (local_epochs ignored)"
             )
         print(f"[Server] frac: {float(_cfg_get(self.cfg, 'frac', 1.0))}")
-        print(f"[Server] model: {_cfg_get(self.cfg, 'model', 'unknown')}")
+        model_type = type(self.global_model)
+        print(
+            "[Server] model_type: "
+            f"{model_type.__module__}.{model_type.__qualname__}"
+        )
         print(
             "[Server] params: "
             f"total={model_summary['total_params']:,}, "
@@ -7278,6 +7475,17 @@ class FLServer:
             round_result=round_result,
         )
 
+        if round_result.avg_train_aux_loss_by_layer:
+            self._write_log_only(
+                f"[AuxLossByLayer] round={round_result.round_id} "
+                f"values={self._compact_log_value(round_result.avg_train_aux_loss_by_layer)}"
+            )
+        if round_result.moe_stats:
+            self._write_log_only(
+                f"[MoEStats] round={round_result.round_id} "
+                f"values={self._compact_log_value(round_result.moe_stats)}"
+            )
+
         # 固定记录每个客户端的诊断信息。
         self._write_client_table_to_log(round_result)
 
@@ -7291,6 +7499,8 @@ class FLServer:
             client_diag: Dict[str, Any] = {
                 "num_samples": int(update.num_samples),
                 "metrics": dict(update.metrics or {}),
+                "avg_aux_loss_by_layer": dict(update.avg_aux_loss_by_layer or {}),
+                "moe_stats": copy.deepcopy(update.moe_stats or {}),
             }
             if self.method_client_diagnostics_builder is not None:
                 method_diag = self.method_client_diagnostics_builder(update)
@@ -7419,6 +7629,8 @@ class FLServer:
                 f"task_loss={train_task_loss} "
                 f"aux_loss={train_aux_loss} "
                 f"train_acc={train_acc} "
+                f"aux_loss_by_layer={self._compact_log_value(item.get('avg_aux_loss_by_layer', {}))} "
+                f"moe_stats={self._compact_log_value(item.get('moe_stats', {}))} "
                 f"non_expert_w={non_expert_weight} "
                 f"expert_w={expert_weight}"
             )
@@ -7777,6 +7989,8 @@ def build_server(
     expert_client_training_strategy_builder: Optional[
         ExpertClientTrainingStrategyBuilder
     ] = None,
+    model_builder: Optional[ModelBuilder] = None,
+    global_model: Optional[nn.Module] = None,
 ) -> FLServer:
     """
     构建 FLServer。
@@ -7798,6 +8012,8 @@ def build_server(
         method_client_diagnostics_builder=method_client_diagnostics_builder,
         method_context=method_context,
         expert_client_training_strategy_builder=expert_client_training_strategy_builder,
+        model_builder=model_builder,
+        global_model=global_model,
     )
 
 
@@ -7882,7 +8098,12 @@ MethodCliOverridesBuilder = Callable[[argparse.Namespace], Mapping[str, Any]]
 def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FL + MoE training entrypoint")
     parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
-    parser.add_argument("--model", type=str, default=None, help="模型名称；显式 CLI 参数优先于配置文件。")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="兼容旧实验配置的模型标签；不参与模型构建，实际模型由 model_builder 注入。",
+    )
     parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
     augmentation_group = parser.add_mutually_exclusive_group()
     augmentation_group.add_argument(
@@ -8018,6 +8239,7 @@ def main(
     expert_client_training_strategy_builder: Optional[
         ExpertClientTrainingStrategyBuilder
     ] = None,
+    model_builder: Optional[ModelBuilder] = None,
 ) -> int:
     """
     训练入口。
@@ -8034,6 +8256,13 @@ def main(
         - tqdm 这类动态进度条只显示在控制台，不写入 train.log。
     """
     args = parse_args(method_cli_argument_registrar=method_cli_argument_registrar)
+
+    if model_builder is None:
+        raise ValueError(
+            "base.main 必须显式传入 model_builder；模型由外部模型模块构建。"
+        )
+    if not callable(model_builder):
+        raise TypeError("model_builder 必须是可调用对象。")
     config_overrides = build_common_cli_overrides(args)
     if method_cli_overrides_builder is not None:
         config_overrides = _deep_merge(base=config_overrides, override=dict(method_cli_overrides_builder(args) or {}))
@@ -8083,6 +8312,7 @@ def main(
                 run_dir=run_dir,
                 expert_aggregator_builder=expert_aggregator_builder,
                 expert_method_name=expert_method_name,
+                model_builder=model_builder,
                 expert_evidence_collector=expert_evidence_collector,
                 method_client_diagnostics_builder=method_client_diagnostics_builder,
                 expert_client_training_strategy_builder=expert_client_training_strategy_builder,
@@ -8102,6 +8332,7 @@ def run_training(
     run_dir: Path,
     expert_aggregator_builder: ExpertAggregatorBuilder,
     expert_method_name: str,
+    model_builder: ModelBuilder,
     expert_evidence_collector: Optional[ExpertEvidenceCollector] = None,
     method_client_diagnostics_builder: Optional[MethodClientDiagnosticsBuilder] = None,
     expert_client_training_strategy_builder: Optional[
@@ -8197,7 +8428,7 @@ def run_training(
         device=device,
         dataset_name=dataset_bundle.name,
         server_evidence_loader=loader_bundle.server_evidence_loader,
-        model_builder=build_model,
+        model_builder=model_builder,
     )
 
     server = build_server(
@@ -8213,6 +8444,7 @@ def run_training(
         method_client_diagnostics_builder=method_client_diagnostics_builder,
         method_context=method_context,
         expert_client_training_strategy_builder=expert_client_training_strategy_builder,
+        model_builder=model_builder,
     )
 
     train_result = server.train()
@@ -8307,6 +8539,8 @@ def save_round_results_csv(
         avg_train_loss
         avg_train_task_loss
         avg_train_aux_loss
+        avg_train_aux_loss_by_layer_json
+        moe_stats_json
         avg_train_acc
         test_loss
         test_acc
@@ -8320,6 +8554,8 @@ def save_round_results_csv(
         "avg_train_loss",
         "avg_train_task_loss",
         "avg_train_aux_loss",
+        "avg_train_aux_loss_by_layer_json",
+        "moe_stats_json",
         "avg_train_acc",
         "test_loss",
         "test_acc",
@@ -8354,6 +8590,16 @@ def save_round_results_csv(
                 "avg_train_aux_loss": train_metrics.get(
                     "avg_train_aux_loss",
                     "",
+                ),
+                "avg_train_aux_loss_by_layer_json": json.dumps(
+                    make_json_safe(item.avg_train_aux_loss_by_layer),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "moe_stats_json": json.dumps(
+                    make_json_safe(item.moe_stats),
+                    ensure_ascii=False,
+                    sort_keys=True,
                 ),
                 "avg_train_acc": train_metrics.get(
                     "avg_train_acc",

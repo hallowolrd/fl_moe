@@ -60,9 +60,13 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 0: {
                     "num_samples": 10,
                     "metrics": {"train_loss": 1.2},
+                    "avg_aux_loss_by_layer": {"layer_0": 0.2},
+                    "moe_stats": {"layer_0": {"tokens_per_expert": [5, 3]}},
                     "expert_usage": None,
                 }
             },
+            avg_train_aux_loss_by_layer={"layer_0": 0.2},
+            moe_stats={"layer_0": {"tokens_per_expert": [5, 3]}},
         )
 
     def make_server_result(self) -> base.ServerTrainResult:
@@ -90,6 +94,8 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 "best_acc",
                 "aggregation_info",
                 "client_diagnostics",
+                "avg_train_aux_loss_by_layer",
+                "moe_stats",
             },
         )
         self.assertNotIn("client_metrics", result)
@@ -160,6 +166,14 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 summary["round_results"][0]["test_metrics"]["test_acc"],
                 45.0,
             )
+            self.assertEqual(
+                summary["round_results"][0]["avg_train_aux_loss_by_layer"],
+                {"layer_0": 0.2},
+            )
+            self.assertEqual(
+                summary["round_results"][0]["moe_stats"]["layer_0"]["tokens_per_expert"],
+                [5, 3],
+            )
 
             with csv_path.open("r", encoding="utf-8", newline="") as file:
                 rows = list(csv.DictReader(file))
@@ -168,6 +182,14 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
             self.assertEqual(json.loads(rows[0]["selected_clients"]), [0, 2])
             self.assertAlmostEqual(float(rows[0]["test_acc"]), 45.0)
             self.assertAlmostEqual(float(rows[0]["test_loss"]), 1.5)
+            self.assertEqual(
+                json.loads(rows[0]["avg_train_aux_loss_by_layer_json"]),
+                {"layer_0": 0.2},
+            )
+            self.assertEqual(
+                json.loads(rows[0]["moe_stats_json"]),
+                {"layer_0": {"tokens_per_expert": [5, 3]}},
+            )
 
     def test_plot_metadata_supports_new_and_legacy_config_formats(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
