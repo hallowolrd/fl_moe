@@ -13,6 +13,8 @@ if str(ALGORITHMS_DIR) not in sys.path:
     sys.path.insert(0, str(ALGORITHMS_DIR))
 
 import base  # noqa: E402
+import fedavg_orthogonal  # noqa: E402
+import rfedags_orthogonal  # noqa: E402
 import torch  # noqa: E402
 
 
@@ -139,6 +141,27 @@ class SwitchViTTests(unittest.TestCase):
         for layer_name, experts in groups.expert_by_layer_and_id.items():
             self.assertEqual(set(experts), {0, 1, 2, 3})
             self.assertTrue(all(experts[expert_id] for expert_id in range(4)))
+
+    def test_orthogonal_algorithms_match_switch_expert_fc1_parameters(self) -> None:
+        model = base.build_switch_vit_model(self.cfg)
+        groups = base.build_param_groups(
+            model=model,
+            expected_num_experts=4,
+            strict=True,
+        )
+
+        for algorithm in (fedavg_orthogonal, rfedags_orthogonal):
+            blocks = algorithm._build_stiefel_parameter_blocks(
+                model=model,
+                expert_parameter_names=groups.expert,
+                block_config=algorithm.DEFAULT_STIEFEL_BLOCKS,
+            )
+            self.assertIn("expert_fc1", blocks)
+            # 3 MoE blocks x 4 experts, one fc1 weight per expert.
+            self.assertEqual(
+                len(blocks["expert_fc1"].parameter_names),
+                12,
+            )
 
     def test_auxiliary_loss_cannot_be_enabled_yet(self) -> None:
         cfg = {
