@@ -3972,9 +3972,13 @@ def summarize_model(model: nn.Module) -> Dict[str, int]:
 # ============================================================================
 
 
-_EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)(?:\.|$)")
-_EXPERT_LAYER_PATTERN = re.compile(
-    r"^(?P<layer>.*?)(?:^|\.)experts\.(?P<expert_id>\d+)(?:\.|$)"
+# Support both ModuleList-style experts.0 and ModuleDict-style
+# experts.expert_0 (used by common Switch Transformer implementations).
+# Keep one parser as the source of truth so expert-id and MoE-layer extraction
+# cannot disagree.
+_EXPERT_PATH_PATTERN = re.compile(
+    r"^(?P<layer>.*?)(?:^|\.)experts\."
+    r"(?P<expert_key>\d+|expert_\d+)(?=\.|$)"
 )
 
 
@@ -4102,11 +4106,12 @@ def build_param_groups_from_state_dict(
     根据 state_dict 构建参数分组。
 
     专家参数识别规则：
-        参数名中出现 experts.<id> 就认为它属于 expert <id>。
+        支持 ModuleList 的 experts.<id>，以及 ModuleDict 的
+        experts.expert_<id>。两种命名统一解析为整数 expert id。
 
     例如：
-        moe.experts.0.fc1.weight -> expert 0
-        head.experts.3.bias      -> expert 3
+        moe.experts.0.fc1.weight                  -> expert 0
+        blocks.0.moe.experts.expert_3.wi.weight   -> expert 3
 
     其他参数都归为 non_expert。
     """
@@ -4177,20 +4182,25 @@ def get_expert_id_from_name(name: str) -> int | None:
     """
     从参数名中解析 expert id。
 
-    匹配规则：
-        experts.<id>
+    支持两种常见容器命名：
+        ModuleList: experts.<id>
+        ModuleDict: experts.expert_<id>
 
     示例：
-        "moe.experts.0.fc.weight" -> 0
-        "experts.3.bias"          -> 3
-        "backbone.conv.weight"    -> None
+        "moe.experts.0.fc.weight"                 -> 0
+        "moe.experts.expert_3.wi.weight"          -> 3
+        "backbone.conv.weight"                    -> None
     """
-    match = _EXPERT_ID_PATTERN.search(name)
+    match = _EXPERT_PATH_PATTERN.match(name)
 
     if match is None:
         return None
 
-    return int(match.group(1))
+    expert_key = match.group("expert_key")
+    if expert_key.startswith("expert_"):
+        expert_key = expert_key[len("expert_"):]
+
+    return int(expert_key)
 
 
 def get_moe_layer_from_name(name: str) -> str | None:
@@ -4198,13 +4208,15 @@ def get_moe_layer_from_name(name: str) -> str | None:
     从专家参数名中解析所属 MoE 模块路径。
 
     示例：
-        "blocks.2.moe.experts.0.fc.weight" -> "blocks.2.moe"
-        "moe_head.experts.3.bias"          -> "moe_head"
-        "experts.0.fc.weight"              -> "<root>"
+        "blocks.2.moe.experts.0.fc.weight"
+            -> "blocks.2.moe"
+        "encoder.block.0.mlp.experts.expert_3.wi.weight"
+            -> "encoder.block.0.mlp"
+        "experts.expert_0.fc.weight" -> "<root>"
 
     对于直接挂在模型根节点的 experts，使用 "<root>" 作为层标识。
     """
-    match = _EXPERT_LAYER_PATTERN.match(name)
+    match = _EXPERT_PATH_PATTERN.match(name)
 
     if match is None:
         return None
@@ -4346,7 +4358,7 @@ def validate_param_groups(
     if strict and len(expert_names) == 0:
         raise ValueError(
             "没有找到任何 expert 参数。"
-            "请确认模型中的 expert 参数名是否包含 experts.<id>。"
+            "请确认模型中的 expert 参数名是否符合 experts.<id> 或 experts.expert_<id>。"
         )
 
     if expected_num_experts is not None:
