@@ -431,10 +431,8 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "expert_hidden_dim": 1024,
         "moe_block_indices": [2, 4, 6],
         "routing": "top1",
-        "auxiliary_loss": False,
-        "aux_loss_coef": 0.01,
-        "expert_capacity": False,
-        "capacity_factor": 1.25,
+        "aux_loss_coef": 0.0,
+        "capacity_factor": 0.0,
         "token_dropping": False,
         "router_statistics": True,
         "dropout": 0.0,
@@ -4220,10 +4218,8 @@ class SwitchMoE(nn.Module):
         num_experts: int,
         dropout: float = 0.0,
         collect_router_statistics: bool = True,
-        auxiliary_loss: bool = False,
-        aux_loss_coef: float = 0.01,
-        expert_capacity: bool = False,
-        capacity_factor: float = 1.25,
+        aux_loss_coef: float = 0.0,
+        capacity_factor: float = 0.0,
         token_dropping: bool = False,
     ) -> None:
         super().__init__()
@@ -4233,11 +4229,13 @@ class SwitchMoE(nn.Module):
         capacity_factor = float(capacity_factor)
         if not math.isfinite(aux_loss_coef) or aux_loss_coef < 0.0:
             raise ValueError("aux_loss_coef 必须是非负有限数。")
-        if not math.isfinite(capacity_factor) or capacity_factor <= 0.0:
-            raise ValueError("capacity_factor 必须是正有限数。")
+        if not math.isfinite(capacity_factor) or capacity_factor < 0.0:
+            raise ValueError("capacity_factor 必须是非负有限数。")
+        expert_capacity = capacity_factor > 0.0
+        auxiliary_loss = aux_loss_coef > 0.0
         if token_dropping and not expert_capacity:
             raise ValueError(
-                "token_dropping=True 时必须同时启用 expert_capacity。"
+                "token_dropping=True 时 capacity_factor 必须大于 0。"
             )
         if expert_capacity and not token_dropping and capacity_factor < 1.0:
             raise ValueError(
@@ -4480,10 +4478,8 @@ class SwitchTransformerBlock(nn.Module):
         use_moe: bool,
         dropout: float = 0.0,
         collect_router_statistics: bool = True,
-        auxiliary_loss: bool = False,
-        aux_loss_coef: float = 0.01,
-        expert_capacity: bool = False,
-        capacity_factor: float = 1.25,
+        aux_loss_coef: float = 0.0,
+        capacity_factor: float = 0.0,
         token_dropping: bool = False,
     ) -> None:
         super().__init__()
@@ -4505,9 +4501,7 @@ class SwitchTransformerBlock(nn.Module):
                 num_experts=num_experts,
                 dropout=dropout,
                 collect_router_statistics=collect_router_statistics,
-                auxiliary_loss=auxiliary_loss,
                 aux_loss_coef=aux_loss_coef,
-                expert_capacity=expert_capacity,
                 capacity_factor=capacity_factor,
                 token_dropping=token_dropping,
             )
@@ -4566,10 +4560,8 @@ class SwitchViT(nn.Module):
         moe_block_indices: Sequence[int] = (2, 4, 6),
         dropout: float = 0.0,
         router_statistics: bool = True,
-        auxiliary_loss: bool = False,
-        aux_loss_coef: float = 0.01,
-        expert_capacity: bool = False,
-        capacity_factor: float = 1.25,
+        aux_loss_coef: float = 0.0,
+        capacity_factor: float = 0.0,
         token_dropping: bool = False,
     ) -> None:
         super().__init__()
@@ -4655,9 +4647,7 @@ class SwitchViT(nn.Module):
                 use_moe=(block_index in normalized_moe_blocks),
                 dropout=dropout,
                 collect_router_statistics=router_statistics,
-                auxiliary_loss=auxiliary_loss,
                 aux_loss_coef=aux_loss_coef,
-                expert_capacity=expert_capacity,
                 capacity_factor=capacity_factor,
                 token_dropping=token_dropping,
             )
@@ -4738,26 +4728,25 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
 
     if str(model_cfg.get("routing", "top1")).strip().lower() != "top1":
         raise ValueError("当前 SwitchViT 仅实现 Top-1 Routing。")
-    auxiliary_loss = model_cfg.get("auxiliary_loss", False)
-    expert_capacity = model_cfg.get("expert_capacity", False)
     token_dropping = model_cfg.get("token_dropping", False)
-    for option_name, option_value in (
-        ("auxiliary_loss", auxiliary_loss),
-        ("expert_capacity", expert_capacity),
-        ("token_dropping", token_dropping),
-    ):
-        if not isinstance(option_value, bool):
-            raise TypeError(f"{option_name} 必须是 bool，当前值：{option_value!r}")
+    router_statistics = model_cfg.get("router_statistics", True)
+    if not isinstance(token_dropping, bool):
+        raise TypeError(f"token_dropping 必须是 bool，当前值：{token_dropping!r}")
+    if not isinstance(router_statistics, bool):
+        raise TypeError(
+            f"router_statistics 必须是 bool，当前值：{router_statistics!r}"
+        )
 
-    aux_loss_coef = float(model_cfg.get("aux_loss_coef", 0.01))
-    capacity_factor = float(model_cfg.get("capacity_factor", 1.25))
+    aux_loss_coef = float(model_cfg.get("aux_loss_coef", 0.0))
+    capacity_factor = float(model_cfg.get("capacity_factor", 0.0))
     if not math.isfinite(aux_loss_coef) or aux_loss_coef < 0.0:
         raise ValueError("aux_loss_coef 必须是非负有限数。")
-    if not math.isfinite(capacity_factor) or capacity_factor <= 0.0:
-        raise ValueError("capacity_factor 必须是正有限数。")
+    if not math.isfinite(capacity_factor) or capacity_factor < 0.0:
+        raise ValueError("capacity_factor 必须是非负有限数。")
+    expert_capacity = capacity_factor > 0.0
     if token_dropping and not expert_capacity:
         raise ValueError(
-            "token_dropping=True 时必须同时启用 expert_capacity。"
+            "token_dropping=True 时 capacity_factor 必须大于 0。"
         )
     if expert_capacity and not token_dropping and capacity_factor < 1.0:
         raise ValueError(
@@ -4781,10 +4770,8 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
         num_experts=num_experts,
         moe_block_indices=model_cfg["moe_block_indices"],
         dropout=float(model_cfg.get("dropout", 0.0)),
-        router_statistics=bool(model_cfg.get("router_statistics", True)),
-        auxiliary_loss=auxiliary_loss,
+        router_statistics=router_statistics,
         aux_loss_coef=aux_loss_coef,
-        expert_capacity=expert_capacity,
         capacity_factor=capacity_factor,
         token_dropping=token_dropping,
     )
@@ -8802,6 +8789,18 @@ MethodCliArgumentRegistrar = Callable[[argparse.ArgumentParser], None]
 MethodCliOverridesBuilder = Callable[[argparse.Namespace], Mapping[str, Any]]
 
 
+def _parse_bool_cli_value(value: str) -> bool:
+    """Parse explicit CLI boolean values such as True/False or true/false."""
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"布尔参数只接受 True/False，当前值：{value!r}"
+    )
+
+
 def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FL + MoE training entrypoint")
     parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
@@ -8812,19 +8811,12 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
         help="兼容旧实验配置的模型标签；不参与模型构建，实际模型由 model_builder 注入。",
     )
     parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
-    augmentation_group = parser.add_mutually_exclusive_group()
-    augmentation_group.add_argument(
+    parser.add_argument(
         "--data-augmentation",
-        dest="data_augmentation",
-        action="store_true",
+        type=_parse_bool_cli_value,
         default=None,
-        help="开启训练集随机数据增强；覆盖配置文件中的 data_augmentation。",
-    )
-    augmentation_group.add_argument(
-        "--no-data-augmentation",
-        dest="data_augmentation",
-        action="store_false",
-        help="关闭训练集随机数据增强；覆盖配置文件中的 data_augmentation。",
+        metavar="True|False",
+        help="是否开启训练集随机数据增强，例如：--data-augmentation False。",
     )
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--num-clients", type=int, default=None)
@@ -8877,71 +8869,32 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--routing", choices=("top1",), default=None)
     parser.add_argument("--dropout", type=float, default=None)
 
-    # Boolean model options use paired flags; None means keep config defaults.
-    auxiliary_loss_group = parser.add_mutually_exclusive_group()
-    auxiliary_loss_group.add_argument(
-        "--auxiliary-loss",
-        dest="auxiliary_loss",
-        action="store_true",
+    # Numeric zero disables these features; positive values enable them.
+    parser.add_argument(
+        "--aux-loss-coef",
+        type=float,
         default=None,
-        help="启用 Switch Transformer 负载均衡辅助损失。",
+        help="Auxiliary Loss 系数；0 表示关闭，正数表示启用。",
     )
-    auxiliary_loss_group.add_argument(
-        "--no-auxiliary-loss",
-        dest="auxiliary_loss",
-        action="store_false",
+    parser.add_argument(
+        "--capacity-factor",
+        type=float,
         default=None,
-        help="关闭 Switch Transformer 负载均衡辅助损失。",
+        help="Expert Capacity 系数；0 表示关闭，正数表示启用。",
     )
-    parser.add_argument("--aux-loss-coef", type=float, default=None)
-
-    expert_capacity_group = parser.add_mutually_exclusive_group()
-    expert_capacity_group.add_argument(
-        "--expert-capacity",
-        dest="expert_capacity",
-        action="store_true",
-        default=None,
-        help="启用 Expert Capacity 限制。",
-    )
-    expert_capacity_group.add_argument(
-        "--no-expert-capacity",
-        dest="expert_capacity",
-        action="store_false",
-        default=None,
-        help="关闭 Expert Capacity 限制。",
-    )
-    parser.add_argument("--capacity-factor", type=float, default=None)
-
-    token_dropping_group = parser.add_mutually_exclusive_group()
-    token_dropping_group.add_argument(
+    parser.add_argument(
         "--token-dropping",
-        dest="token_dropping",
-        action="store_true",
+        type=_parse_bool_cli_value,
         default=None,
-        help="启用容量耗尽后的最终 Token Dropping。",
+        metavar="True|False",
+        help="容量耗尽且所有专家均无法接收 Token 时，是否丢弃 Token。",
     )
-    token_dropping_group.add_argument(
-        "--no-token-dropping",
-        dest="token_dropping",
-        action="store_false",
-        default=None,
-        help="关闭 Token Dropping；溢出 Token 将尝试其他专家。",
-    )
-
-    router_statistics_group = parser.add_mutually_exclusive_group()
-    router_statistics_group.add_argument(
+    parser.add_argument(
         "--router-statistics",
-        dest="router_statistics",
-        action="store_true",
+        type=_parse_bool_cli_value,
         default=None,
-        help="启用 Router 统计。",
-    )
-    router_statistics_group.add_argument(
-        "--no-router-statistics",
-        dest="router_statistics",
-        action="store_false",
-        default=None,
-        help="关闭 Router 统计。",
+        metavar="True|False",
+        help="是否收集 Router 统计。",
     )
 
     parser.add_argument("--optimizer", dest="optimizer_type", choices=("sgd","adam","adamw"), default=None)
@@ -9025,9 +8978,7 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         "moe_block_indices",
         "routing",
         "dropout",
-        "auxiliary_loss",
         "aux_loss_coef",
-        "expert_capacity",
         "capacity_factor",
         "token_dropping",
         "router_statistics",
