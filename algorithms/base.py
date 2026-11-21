@@ -3973,6 +3973,9 @@ def summarize_model(model: nn.Module) -> Dict[str, int]:
 
 
 _EXPERT_ID_PATTERN = re.compile(r"(?:^|\.)experts\.(\d+)(?:\.|$)")
+_EXPERT_LAYER_PATTERN = re.compile(
+    r"^(?P<layer>.*?)(?:^|\.)experts\.(?P<expert_id>\d+)(?:\.|$)"
+)
 
 
 @dataclass(frozen=True)
