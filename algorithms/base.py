@@ -8859,6 +8859,91 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--test-batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
+
+    # SwitchViT architecture options. These are nested under model_cfg.
+    parser.add_argument("--transformer-layers", type=int, default=None)
+    parser.add_argument("--hidden-dim", type=int, default=None)
+    parser.add_argument("--attention-heads", type=int, default=None)
+    parser.add_argument("--patch-size", type=int, default=None)
+    parser.add_argument("--expert-hidden-dim", type=int, default=None)
+    parser.add_argument(
+        "--moe-block-indices",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="BLOCK",
+        help="使用 MoE FFN 的 Transformer Block 编号，例如：--moe-block-indices 2 4 6。",
+    )
+    parser.add_argument("--routing", choices=("top1",), default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+
+    # Boolean model options use paired flags; None means keep config defaults.
+    auxiliary_loss_group = parser.add_mutually_exclusive_group()
+    auxiliary_loss_group.add_argument(
+        "--auxiliary-loss",
+        dest="auxiliary_loss",
+        action="store_true",
+        default=None,
+        help="启用 Switch Transformer 负载均衡辅助损失。",
+    )
+    auxiliary_loss_group.add_argument(
+        "--no-auxiliary-loss",
+        dest="auxiliary_loss",
+        action="store_false",
+        default=None,
+        help="关闭 Switch Transformer 负载均衡辅助损失。",
+    )
+    parser.add_argument("--aux-loss-coef", type=float, default=None)
+
+    expert_capacity_group = parser.add_mutually_exclusive_group()
+    expert_capacity_group.add_argument(
+        "--expert-capacity",
+        dest="expert_capacity",
+        action="store_true",
+        default=None,
+        help="启用 Expert Capacity 限制。",
+    )
+    expert_capacity_group.add_argument(
+        "--no-expert-capacity",
+        dest="expert_capacity",
+        action="store_false",
+        default=None,
+        help="关闭 Expert Capacity 限制。",
+    )
+    parser.add_argument("--capacity-factor", type=float, default=None)
+
+    token_dropping_group = parser.add_mutually_exclusive_group()
+    token_dropping_group.add_argument(
+        "--token-dropping",
+        dest="token_dropping",
+        action="store_true",
+        default=None,
+        help="启用容量耗尽后的最终 Token Dropping。",
+    )
+    token_dropping_group.add_argument(
+        "--no-token-dropping",
+        dest="token_dropping",
+        action="store_false",
+        default=None,
+        help="关闭 Token Dropping；溢出 Token 将尝试其他专家。",
+    )
+
+    router_statistics_group = parser.add_mutually_exclusive_group()
+    router_statistics_group.add_argument(
+        "--router-statistics",
+        dest="router_statistics",
+        action="store_true",
+        default=None,
+        help="启用 Router 统计。",
+    )
+    router_statistics_group.add_argument(
+        "--no-router-statistics",
+        dest="router_statistics",
+        action="store_false",
+        default=None,
+        help="关闭 Router 统计。",
+    )
+
     parser.add_argument("--optimizer", dest="optimizer_type", choices=("sgd","adam","adamw"), default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--momentum", type=float, default=None)
@@ -8929,6 +9014,30 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         server_evidence["batch_size"] = server_evidence_batch_size
     if server_evidence:
         overrides["server_evidence"] = server_evidence
+
+    model_cfg_overrides: Dict[str, Any] = {}
+    model_cfg_cli_fields = (
+        "transformer_layers",
+        "hidden_dim",
+        "attention_heads",
+        "patch_size",
+        "expert_hidden_dim",
+        "moe_block_indices",
+        "routing",
+        "dropout",
+        "auxiliary_loss",
+        "aux_loss_coef",
+        "expert_capacity",
+        "capacity_factor",
+        "token_dropping",
+        "router_statistics",
+    )
+    for field_name in model_cfg_cli_fields:
+        value = getattr(args, field_name, None)
+        if value is not None:
+            model_cfg_overrides[field_name] = value
+    if model_cfg_overrides:
+        overrides["model_cfg"] = model_cfg_overrides
 
     return overrides
 
