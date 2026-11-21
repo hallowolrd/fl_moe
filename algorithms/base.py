@@ -5173,7 +5173,8 @@ def train_local_model(
     训练一个客户端本地模型。
 
     local_steps 优先于 local_epochs；为 None 时按完整 epoch 训练。
-    这里的训练 loss 只有 CrossEntropyLoss，不加入辅助损失或正则项。
+    总训练损失由分类损失和模型提供的辅助损失组成。
+    普通模型没有 aux_loss 时，训练行为等价于原来的 CrossEntropyLoss 路径。
     """
     model.train()
 
@@ -5402,14 +5403,8 @@ def train_local_model_with_expert_strategy(
         epoch: int,
         batch_index: int,
     ) -> None:
-        nonlocal (
-            total_loss,
-            total_task_loss,
-            total_aux_loss,
-            total_correct,
-            total_samples,
-            total_batches,
-        )
+        nonlocal total_loss, total_task_loss, total_aux_loss
+        nonlocal total_correct, total_samples, total_batches
 
         images, targets = unpack_batch(batch)
         images = images.to(device, non_blocking=True)
