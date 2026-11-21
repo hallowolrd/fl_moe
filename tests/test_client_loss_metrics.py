@@ -93,6 +93,16 @@ class ClientLossMetricPipelineTests(unittest.TestCase):
             + result.train_metrics["avg_train_aux_loss"],
         )
 
+        serialized = result.to_dict()
+        self.assertAlmostEqual(
+            serialized["train_metrics"]["avg_train_task_loss"],
+            2.5,
+        )
+        self.assertAlmostEqual(
+            serialized["train_metrics"]["avg_train_aux_loss"],
+            0.25,
+        )
+
         self.assertEqual(
             result.client_diagnostics[0]["metrics"]["train_task_loss"],
             1.0,
