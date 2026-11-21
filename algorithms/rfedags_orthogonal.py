@@ -324,16 +324,14 @@ PAYLOAD_VERSION = 2
 
 DEFAULT_STIEFEL_BLOCKS = {
     "expert_fc1": {
-        "parameter_patterns": ["moe_head.experts.*.fc1.weight"],
+        "parameter_patterns": [
+            "blocks.*.mlp.experts.*.fc1.weight",
+            "moe_head.experts.*.fc1.weight",
+        ],
     }
 }
 
 METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
-    "model": "sparse_moe_classifier",
-    "model_cfg": {
-        "backbone": "resnet_cifar",
-        "moe_hidden_dim": 128,
-    },
     "optimizer": {
         "type": "sgd",
         "lr": 0.01,
