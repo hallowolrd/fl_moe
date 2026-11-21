@@ -13,11 +13,11 @@ ALGORITHMS_DIR = ROOT / "algorithms"
 if str(ALGORITHMS_DIR) not in sys.path:
     sys.path.insert(0, str(ALGORITHMS_DIR))
 
+import base  # noqa: E402
+
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
-
-import base  # noqa: E402
 import fedavg_orthogonal  # noqa: E402
 import rfedags_orthogonal  # noqa: E402
 
