@@ -4777,9 +4777,11 @@ class ClientUpdate:
     # 客户端训练集的数据规模，用于联邦聚合权重；不是本轮实际访问次数。
     num_samples: int
 
-    # 本地模型相对全局模型的参数变化量。
-    # 普通训练路径包含完整 state_dict；启用专家训练策略时只包含 non_expert
-    # state_dict（包括对应 buffer），专家算法数据通过 algorithm_payload 上传。
+    # 本地模型相对全局模型的可聚合浮点 state_dict 差分。
+    # 普通训练路径包含全部可聚合浮点状态；启用专家训练策略时由策略契约决定：
+    # includes_expert_parameters_in_model_delta=True 时包含专家与非专家状态，
+    # False 时只包含 non_expert 状态，专家更新通过 algorithm_payload 上传。
+    # 非浮点 state（例如 BatchNorm.num_batches_tracked）不进入 model_delta。
     model_delta: TensorDict
 
     # 客户端本地训练指标
