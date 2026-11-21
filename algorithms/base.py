@@ -4107,15 +4107,30 @@ def build_param_groups_from_state_dict(
     non_expert_names: List[str] = []
     expert_names: List[str] = []
     expert_by_id: Dict[int, List[str]] = {}
+    expert_by_moe_layer: Dict[str, List[str]] = {}
+    expert_by_layer_and_id: Dict[str, Dict[int, List[str]]] = {}
 
     for name in all_names:
         expert_id = get_expert_id_from_name(name)
 
         if expert_id is None:
             non_expert_names.append(name)
-        else:
-            expert_names.append(name)
-            expert_by_id.setdefault(expert_id, []).append(name)
+            continue
+
+        moe_layer = get_moe_layer_from_name(name)
+        if moe_layer is None:
+            raise ValueError(
+                "无法从专家参数名解析 MoE 层路径："
+                f"{name!r}"
+            )
+
+        expert_names.append(name)
+        expert_by_id.setdefault(expert_id, []).append(name)
+        expert_by_moe_layer.setdefault(moe_layer, []).append(name)
+        expert_by_layer_and_id.setdefault(moe_layer, {}).setdefault(
+            expert_id,
+            [],
+        ).append(name)
 
     groups = ParamGroups(
         all=all_names,
@@ -4124,6 +4139,19 @@ def build_param_groups_from_state_dict(
         expert_by_id={
             expert_id: names
             for expert_id, names in sorted(expert_by_id.items())
+        },
+        expert_by_moe_layer={
+            layer_name: names
+            for layer_name, names in sorted(expert_by_moe_layer.items())
+        },
+        expert_by_layer_and_id={
+            layer_name: {
+                expert_id: names
+                for expert_id, names in sorted(expert_groups.items())
+            }
+            for layer_name, expert_groups in sorted(
+                expert_by_layer_and_id.items()
+            )
         },
     )
 
@@ -4155,6 +4183,25 @@ def get_expert_id_from_name(name: str) -> int | None:
         return None
 
     return int(match.group(1))
+
+
+def get_moe_layer_from_name(name: str) -> str | None:
+    """
+    从专家参数名中解析所属 MoE 模块路径。
+
+    示例：
+        "blocks.2.moe.experts.0.fc.weight" -> "blocks.2.moe"
+        "moe_head.experts.3.bias"          -> "moe_head"
+        "experts.0.fc.weight"              -> "<root>"
+
+    对于直接挂在模型根节点的 experts，使用 "<root>" 作为层标识。
+    """
+    match = _EXPERT_LAYER_PATTERN.match(name)
+
+    if match is None:
+        return None
+
+    return match.group("layer") or "<root>"
 
 
 def validate_param_groups(
