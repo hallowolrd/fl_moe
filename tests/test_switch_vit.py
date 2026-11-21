@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("PYTHONHASHSEED", "0")
 
@@ -25,6 +26,77 @@ class SwitchViTTests(unittest.TestCase):
             "input_shape": (3, 32, 32),
             "model_cfg": {},
         }
+
+    def test_switch_vit_cli_options_map_to_model_cfg(self) -> None:
+        argv = [
+            "uniform.py",
+            "--transformer-layers", "8",
+            "--hidden-dim", "384",
+            "--attention-heads", "6",
+            "--patch-size", "4",
+            "--expert-hidden-dim", "1536",
+            "--moe-block-indices", "2", "4", "6",
+            "--routing", "top1",
+            "--dropout", "0.1",
+            "--auxiliary-loss",
+            "--aux-loss-coef", "0.02",
+            "--expert-capacity",
+            "--capacity-factor", "1.5",
+            "--no-token-dropping",
+            "--no-router-statistics",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = base.parse_args()
+
+        overrides = base.build_common_cli_overrides(args)
+        self.assertEqual(
+            overrides["model_cfg"],
+            {
+                "transformer_layers": 8,
+                "hidden_dim": 384,
+                "attention_heads": 6,
+                "patch_size": 4,
+                "expert_hidden_dim": 1536,
+                "moe_block_indices": [2, 4, 6],
+                "routing": "top1",
+                "dropout": 0.1,
+                "auxiliary_loss": True,
+                "aux_loss_coef": 0.02,
+                "expert_capacity": True,
+                "capacity_factor": 1.5,
+                "token_dropping": False,
+                "router_statistics": False,
+            },
+        )
+
+    def test_switch_vit_cli_can_explicitly_disable_boolean_options(self) -> None:
+        argv = [
+            "uniform.py",
+            "--no-auxiliary-loss",
+            "--no-expert-capacity",
+            "--no-token-dropping",
+            "--router-statistics",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = base.parse_args()
+
+        overrides = base.build_common_cli_overrides(args)
+        self.assertEqual(
+            overrides["model_cfg"],
+            {
+                "auxiliary_loss": False,
+                "expert_capacity": False,
+                "token_dropping": False,
+                "router_statistics": True,
+            },
+        )
+
+    def test_switch_vit_cli_omitted_options_preserve_config_defaults(self) -> None:
+        with patch.object(sys, "argv", ["uniform.py"]):
+            args = base.parse_args()
+
+        overrides = base.build_common_cli_overrides(args)
+        self.assertNotIn("model_cfg", overrides)
 
     def test_default_architecture_and_parameter_count(self) -> None:
         model = base.build_switch_vit_model(self.cfg)
