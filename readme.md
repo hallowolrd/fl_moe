@@ -8,9 +8,7 @@ conda activate fl_moe
 CUDA_VISIBLE_DEVICES=1 python algorithms/uniform.py \
   --dataset cifar10 \
   --dirichlet-sample-balance balanced \
-  --backbone resnet_cifar \
-  --model sparse_moe_classifier \
-  --moe-hidden-dim 128 \
+  --model switch_vit \
   --lr 0.01 \
   --momentum 0 \
   --weight-decay 0 \
