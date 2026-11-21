@@ -3994,23 +3994,26 @@ class ParamGroups:
         所有 expert 参数名。
 
     expert_by_id:
-        每个 expert 单独对应的参数名。
-        例如：
-            {
-                0: ["moe.experts.0.fc.weight", ...],
-                1: ["moe.experts.1.fc.weight", ...],
-            }
+        跨 MoE 层按 expert id 汇总的参数名，保留原有接口。
+
+    expert_by_moe_layer:
+        按 MoE 模块路径分组的专家参数名。
+
+    expert_by_layer_and_id:
+        按 MoE 模块路径和 expert id 二级分组的专家参数名。
     """
 
     all: List[str]
     non_expert: List[str]
     expert: List[str]
     expert_by_id: Dict[int, List[str]] = field(default_factory=dict)
+    expert_by_moe_layer: Dict[str, List[str]] = field(default_factory=dict)
+    expert_by_layer_and_id: Dict[str, Dict[int, List[str]]] = field(
+        default_factory=dict
+    )
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        转成普通 dict，方便写日志或调试。
-        """
+        """转成普通 dict，方便写日志或调试。"""
         return {
             "all": list(self.all),
             "non_expert": list(self.non_expert),
@@ -4019,20 +4022,41 @@ class ParamGroups:
                 int(expert_id): list(names)
                 for expert_id, names in self.expert_by_id.items()
             },
+            "expert_by_moe_layer": {
+                str(layer_name): list(names)
+                for layer_name, names in self.expert_by_moe_layer.items()
+            },
+            "expert_by_layer_and_id": {
+                str(layer_name): {
+                    int(expert_id): list(names)
+                    for expert_id, names in expert_groups.items()
+                }
+                for layer_name, expert_groups in self.expert_by_layer_and_id.items()
+            },
         }
 
     def summary(self) -> Dict[str, Any]:
-        """
-        返回轻量摘要，不包含完整参数名列表。
-        """
+        """返回轻量摘要，不包含完整参数名列表。"""
         return {
             "num_all": len(self.all),
             "num_non_expert": len(self.non_expert),
             "num_expert": len(self.expert),
             "num_experts_found": len(self.expert_by_id),
+            "num_moe_layers_found": len(self.expert_by_moe_layer),
             "num_params_by_expert": {
                 int(expert_id): len(names)
                 for expert_id, names in self.expert_by_id.items()
+            },
+            "num_params_by_moe_layer": {
+                str(layer_name): len(names)
+                for layer_name, names in self.expert_by_moe_layer.items()
+            },
+            "num_params_by_layer_and_id": {
+                str(layer_name): {
+                    int(expert_id): len(names)
+                    for expert_id, names in expert_groups.items()
+                }
+                for layer_name, expert_groups in self.expert_by_layer_and_id.items()
             },
         }
 
