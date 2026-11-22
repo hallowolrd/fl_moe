@@ -278,6 +278,52 @@ class SwitchViTTests(unittest.TestCase):
             )
         return moe
 
+    def test_switch_moe_constructor_validates_boolean_options(self) -> None:
+        common = {
+            "hidden_dim": 4,
+            "expert_hidden_dim": 8,
+            "num_experts": 2,
+        }
+        for field in ("collect_router_statistics", "token_dropping"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(TypeError, field):
+                    base.SwitchMoE(**common, **{field: 1})
+
+    def test_switch_moe_constructor_validates_numeric_and_capacity_options(self) -> None:
+        common = {
+            "hidden_dim": 4,
+            "expert_hidden_dim": 8,
+            "num_experts": 2,
+        }
+        for field in ("aux_loss_coef", "capacity_factor"):
+            for value in (-0.1, float("inf"), float("nan")):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(ValueError, field):
+                        base.SwitchMoE(**common, **{field: value})
+
+        with self.assertRaisesRegex(ValueError, "capacity_factor"):
+            base.SwitchMoE(
+                **common,
+                capacity_factor=0.0,
+                token_dropping=True,
+            )
+        with self.assertRaisesRegex(ValueError, "capacity_factor"):
+            base.SwitchMoE(
+                **common,
+                capacity_factor=0.5,
+                token_dropping=False,
+            )
+
+    def test_switch_vit_builder_relies_on_switch_moe_boolean_validation(self) -> None:
+        for field in ("token_dropping", "router_statistics"):
+            with self.subTest(field=field):
+                cfg = {
+                    **self.cfg,
+                    "model_cfg": {field: 1},
+                }
+                with self.assertRaisesRegex(TypeError, field):
+                    base.build_switch_vit_model(cfg)
+
     def test_capacity_reroutes_overflow_across_all_experts_without_dropping(self) -> None:
         moe = self._make_constant_router_moe(
             num_experts=3,

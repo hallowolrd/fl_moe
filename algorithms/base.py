@@ -4541,6 +4541,16 @@ class SwitchMoE(nn.Module):
         super().__init__()
         if num_experts <= 0:
             raise ValueError("num_experts 必须是正整数。")
+        if type(collect_router_statistics) is not bool:
+            raise TypeError(
+                "collect_router_statistics 必须是 bool，"
+                f"当前值：{collect_router_statistics!r}"
+            )
+        if type(token_dropping) is not bool:
+            raise TypeError(
+                f"token_dropping 必须是 bool，当前值：{token_dropping!r}"
+            )
+
         aux_loss_coef = float(aux_loss_coef)
         capacity_factor = float(capacity_factor)
         if not math.isfinite(aux_loss_coef) or aux_loss_coef < 0.0:
@@ -4560,12 +4570,12 @@ class SwitchMoE(nn.Module):
             )
 
         self.num_experts = int(num_experts)
-        self.collect_router_statistics = bool(collect_router_statistics)
-        self.auxiliary_loss = bool(auxiliary_loss)
-        self.aux_loss_coef = float(aux_loss_coef)
-        self.expert_capacity = bool(expert_capacity)
-        self.capacity_factor = float(capacity_factor)
-        self.token_dropping = bool(token_dropping)
+        self.collect_router_statistics = collect_router_statistics
+        self.auxiliary_loss = auxiliary_loss
+        self.aux_loss_coef = aux_loss_coef
+        self.expert_capacity = expert_capacity
+        self.capacity_factor = capacity_factor
+        self.token_dropping = token_dropping
 
         self.router = SwitchRouter(
             hidden_dim=hidden_dim,
@@ -5043,31 +5053,12 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
 
     if str(model_cfg.get("routing", "top1")).strip().lower() != "top1":
         raise ValueError("当前 SwitchViT 仅实现 Top-1 Routing。")
-    token_dropping = model_cfg.get("token_dropping", False)
-    router_statistics = model_cfg.get("router_statistics", True)
-    if not isinstance(token_dropping, bool):
-        raise TypeError(f"token_dropping 必须是 bool，当前值：{token_dropping!r}")
-    if not isinstance(router_statistics, bool):
-        raise TypeError(
-            f"router_statistics 必须是 bool，当前值：{router_statistics!r}"
-        )
 
-    aux_loss_coef = float(model_cfg.get("aux_loss_coef", 0.0))
-    capacity_factor = float(model_cfg.get("capacity_factor", 0.0))
-    if not math.isfinite(aux_loss_coef) or aux_loss_coef < 0.0:
-        raise ValueError("aux_loss_coef 必须是非负有限数。")
-    if not math.isfinite(capacity_factor) or capacity_factor < 0.0:
-        raise ValueError("capacity_factor 必须是非负有限数。")
-    expert_capacity = capacity_factor > 0.0
-    if token_dropping and not expert_capacity:
-        raise ValueError(
-            "token_dropping=True 时 capacity_factor 必须大于 0。"
-        )
-    if expert_capacity and not token_dropping and capacity_factor < 1.0:
-        raise ValueError(
-            "启用 expert_capacity 且关闭 token_dropping 时，"
-            "capacity_factor 必须 >= 1.0。"
-        )
+    # MoE 自身的选项约束由 SwitchMoE.__init__ 统一负责。
+    token_dropping = model_cfg["token_dropping"]
+    router_statistics = model_cfg["router_statistics"]
+    aux_loss_coef = model_cfg["aux_loss_coef"]
+    capacity_factor = model_cfg["capacity_factor"]
 
     num_experts = int(_cfg_get(cfg, "num_experts", 4))
     input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
