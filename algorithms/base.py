@@ -816,6 +816,9 @@ def _set_reserved_run_info(
         cfg.run_name = run_name
         cfg.run_dir = str(run_dir)
         run_cfg = cfg.get("run")
+        if run_cfg is None:
+            run_cfg = ConfigNode({})
+            cfg.run = run_cfg
         if not isinstance(run_cfg, ConfigNode):
             raise ConfigError("run 必须是配置节点。")
         run_cfg._directory_reserved = True
@@ -832,6 +835,8 @@ def _set_reserved_run_info(
         cfg["run"] = run_cfg
     if not isinstance(run_cfg, MutableMapping):
         raise ConfigError("run 必须是可修改的 dict。")
+    if "run" not in cfg:
+        cfg["run"] = run_cfg
     run_cfg["_directory_reserved"] = True
 
 
@@ -863,6 +868,16 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
         unique_name = run_cfg.get("unique_name", True)
         auto_generated = run_cfg.get("_auto_generated", False)
         directory_reserved = run_cfg.get("_directory_reserved", False)
+
+    if has_run_identity and not isinstance(cfg, (ConfigNode, MutableMapping)):
+        raise ConfigError("原子分配实验目录时，配置对象必须可修改。")
+    if (
+        isinstance(cfg, ConfigNode)
+        and has_run_identity
+        and cfg.get("run") is not None
+        and not isinstance(cfg.get("run"), ConfigNode)
+    ):
+        raise ConfigError("run 必须是 dict。")
 
     if not isinstance(overwrite, bool):
         raise ConfigError(
