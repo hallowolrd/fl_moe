@@ -532,13 +532,12 @@ def _build_method_config_record(
     raw: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """
-    Collect method-owned options without interpreting method names or semantics.
+    收集算法专属配置，不解析具体算法名称或其内部语义。
 
-    New configurations should place plugin-specific options under the generic
-    top-level method_config mapping. For backward compatibility, unknown
-    top-level keys from older method configurations are also retained here.
+    新配置应将插件专属选项放入顶层通用配置 method_config。
+    为兼容旧配置，未知的顶层字段也会保留在该映射中。
 
-    Shared framework keys and derived/input-alias keys are excluded.
+    公共框架字段以及派生字段、输入别名字段不会被收集。
     """
     framework_keys = set(EMBEDDED_BASE_CONFIG)
     framework_keys.update(
@@ -579,11 +578,11 @@ def _build_config_record(
     cfg: ConfigNode | Mapping[str, Any],
 ) -> Dict[str, Any]:
     """
-    Build a human-readable experiment record.
+    构建便于阅读的实验配置记录。
 
-    This is intentionally a presentation format, not a training input schema.
-    It groups effective settings, omits derived/runtime-only metadata, and
-    hides optional features that are not enabled.
+    此格式仅用于展示，不作为训练配置输入结构。
+    记录按功能分组展示最终生效的配置，省略派生信息和仅运行时使用的元数据，
+    并隐藏未启用的可选功能。
     """
     if isinstance(cfg, ConfigNode):
         raw = cfg.to_dict()
@@ -768,10 +767,10 @@ def save_config(
     output_path: str | Path,
 ) -> None:
     """
-    Save a grouped, human-readable experiment record.
+    保存按功能分组的实验配置记录。
 
-    The generated config_used.yaml is a record for inspection, not a
-    configuration file intended to be passed back to the training loader.
+    生成的 config_used.yaml 用于查看和复现实验记录，
+    不作为再次传入训练配置加载器的输入文件。
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -809,8 +808,8 @@ RUN_OUTPUT_FILENAMES = (
 
 def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
     """
-    Create the experiment directory and reset framework-owned outputs when
-    run.overwrite=True. Files not owned by the runner are preserved.
+    创建实验目录，并在 run.overwrite=True 时重置由框架管理的输出文件。
+    不属于实验运行器管理范围的用户文件会被保留。
     """
     if isinstance(cfg, ConfigNode):
         run_dir = Path(cfg.run_dir)
@@ -1184,11 +1183,11 @@ def _infer_num_classes(dataset: str) -> int:
 
 def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
     """
-    Validate the intentionally small public logging configuration surface.
+    校验范围受控的公共日志配置项。
 
-    Only three logging options remain configurable. Legacy/fixed behavior keys
-    are rejected explicitly so stale YAML files cannot silently change the
-    framework's fixed logging behavior.
+    目前只有三个日志选项允许通过配置修改。
+    对旧版配置中已固定或不再支持的字段显式报错，
+    避免过期 YAML 文件静默改变框架的固定日志行为。
     """
     logging_cfg = cfg.get("logging", {})
     if not isinstance(logging_cfg, Mapping):
@@ -2466,10 +2465,11 @@ def _normalize_moe_stats(stats: Mapping[str, Any] | None) -> Dict[str, Any]:
 
 def _merge_additive_moe_stats(total: Any, current: Any, path: str = "moe_stats") -> Any:
     """
-    Sum additive MoE statistics across local batches and clients.
-    Numeric scalars/sequences are summed; repeated string/bool metadata must match.
-    Models should expose counters or sums (e.g. tokens_per_expert, router_prob_sum),
-    not pre-averaged values, in moe_stats.
+    累加本地 Batch 和客户端产生的 MoE 统计数据。
+
+    数值标量和序列按元素求和；重复出现的字符串或布尔元数据必须保持一致。
+    模型应在 moe_stats 中提供计数值或累加值（例如 tokens_per_expert、
+    router_prob_sum），而不是预先计算的平均值。
     """
     if total is None:
         return copy.deepcopy(current)
@@ -2974,12 +2974,11 @@ def apply_server_evidence_holdout(
     bundle: DatasetBundle,
 ) -> DatasetBundle:
     """
-    Optionally reserve a deterministic server-side evidence subset from train data.
+    可选地从训练数据中划分确定性的服务端 Evidence 子集。
 
-    The default server_evidence.size=0 is a strict no-op: the original train and
-    train_evidence dataset objects are returned unchanged. When enabled, the same
-    indices are removed from both client-training views, while the reserved subset
-    is taken from the deterministic train_evidence_dataset view.
+    默认 server_evidence.size=0，此时不执行任何划分，直接返回原始 train 和
+    train_evidence 数据集对象。启用后，相同索引会从客户端训练数据视图中移除，
+    保留的子集则从确定性的 train_evidence_dataset 视图中提取。
     """
     evidence_cfg = _cfg_get(cfg, "server_evidence", {})
     evidence_size = int(_cfg_get(evidence_cfg, "size", 0))
@@ -4192,13 +4191,12 @@ class SwitchRouter(nn.Module):
 
 class SwitchMoE(nn.Module):
     """
-    Top-1 Switch FFN with optional capacity and overflow handling.
+    支持容量限制和溢出处理的 Top-1 Switch FFN。
 
-    When capacity is enabled, tokens first try their highest-probability expert.
-    Overflow tokens then try their remaining experts in descending router
-    probability order. If every expert is full, tokens are dropped only when
-    token_dropping=True; otherwise the configuration must guarantee enough
-    aggregate capacity for every token.
+    启用 Expert Capacity 后，Token 首先尝试分配给路由概率最高的 Expert。
+    发生容量溢出时，Token 按剩余专家的 Router 概率从高到低依次尝试。
+    如果所有 Expert 均已满载，仅在 token_dropping=True 时丢弃 Token；
+    否则配置必须保证所有 Token 都有足够的总容量可供分配。
     """
 
     def __init__(
@@ -4260,11 +4258,10 @@ class SwitchMoE(nn.Module):
         top1_experts: torch.Tensor,
     ) -> Tuple[torch.Tensor, int]:
         """
-        Assign tokens in preference rounds while respecting per-expert capacity.
+        在遵守各 Expert 容量限制的前提下，按候选优先级分轮分配 Token。
 
-        Tokens preserve their flattened input order within each expert's queue.
-        A token advances to its next-best expert only when its current candidate
-        has no remaining capacity.
+        每个 Expert 的队列保留 Token 展平后的原始顺序。
+        只有当前候选 Expert 已无剩余容量时，Token 才会尝试下一个候选 Expert。
         """
         num_tokens = int(top1_experts.numel())
         capacity = int(math.ceil(
@@ -4527,14 +4524,14 @@ class SwitchTransformerBlock(nn.Module):
 
 class SwitchViT(nn.Module):
     """
-    Image-classification Switch ViT.
+    用于图像分类的 Switch ViT。
 
-    Default CIFAR configuration:
-      - 6 Transformer blocks, hidden size 256, 4 attention heads
-      - 4x4 patches + CLS token = 65 tokens for 32x32 images
-      - MoE FFNs in blocks 2, 4, and 6; dense FFNs in blocks 1, 3, and 5
-      - 4 experts per MoE layer, each with hidden size 1024
-      - Top-1 routing; auxiliary loss, capacity, and token dropping are disabled by default
+    CIFAR 默认配置：
+      - 6 个 Transformer Block，隐藏维度为 256，包含 4 个 Attention Head。
+      - 使用 4×4 Patch 和 1 个 CLS Token；对于 32×32 图像共生成 65 个 Token。
+      - 第 2、4、6 个 Block 使用 MoE FFN，第 1、3、5 个 Block 使用 Dense FFN。
+      - 每个 MoE 层包含 4 个 Expert，每个 Expert 的隐藏维度为 1024。
+      - 使用 Top-1 Routing；默认关闭 Auxiliary Loss、Expert Capacity 和 Token Dropping。
     """
 
     def __init__(
@@ -6976,10 +6973,10 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
 @dataclass(frozen=True)
 class MethodContext:
     """
-    Generic server-side runtime context exposed to expert aggregation plugins.
+    提供给专家聚合插件使用的通用服务端运行上下文。
 
-    base.py owns only common resources and lifecycle. A method plugin may read
-    the resources it needs without introducing method-name branches into base.py.
+    base.py 只管理公共资源及其生命周期。
+    算法插件可以读取所需资源，而无需在 base.py 中引入具体算法名称分支。
     """
 
     cfg: Any
@@ -7179,12 +7176,11 @@ class Aggregator(ABC):
         weights: Mapping[int, float],
         param_names: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
-        """Build common, algorithm-independent aggregation diagnostics.
+        """构建通用且与具体算法无关的聚合诊断信息。
 
-        The weights argument remains in the signature for compatibility with
-        aggregator implementations, but canonical weights are stored only in
-        AggregationResult.weights. num_state_entries counts selected state_dict
-        entries, including buffers; it is not a trainable-parameter count.
+        weights 参数保留在接口中，以兼容现有聚合器实现；但规范的聚合权重
+        只存储在 AggregationResult.weights 中。num_state_entries 统计选中的
+        state_dict 条目数量（包括 buffer），并不代表可训练参数数量。
         """
         _ = weights
         num_state_entries = (
