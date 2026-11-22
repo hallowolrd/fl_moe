@@ -76,7 +76,7 @@ PLOT_STYLES = [
         "linewidth": 1.8,
     },
     {
-        "color": "#1689D8",
+        "color": "#D95F02",
         "linestyle": "--",
         "linewidth": 1.8,
     },
@@ -97,7 +97,7 @@ STYLE_BY_COLOR = {
 # =========================
 METHOD_COLORS = {
     "Uniform": "#8A8A8A",
-    "RFedAGS": "#1689D8",
+    "RFedAGS": "#D95F02",
     "Fisher/K-FAC": "#A500A5",
     "Fed-MoE": "#19C4C7",
     "FedMoE-DA": "#F4BE00",
@@ -114,7 +114,7 @@ METHOD_COLORS = {
 # =========================
 LEGEND_NAMES = {
     "Uniform": "FedAvg-MoE",
-    "RFedAGS": "RFedAGS",
+    "RFedAGS": "RFedAGS (Euclidean)",
     "Fisher/K-FAC": "GEA-FedMoE",
     "Fed-MoE": "Fed-MoE",
     "FedMoE-DA": "FedMoE-DA",
