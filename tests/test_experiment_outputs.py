@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 import json
@@ -420,23 +421,38 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 }
 
             (output_dir / "manual").mkdir()
-            unique_cfg = base._finalize_run_info(
-                config("manual", True, False)
+            unique_cfg = base.ConfigNode(
+                base._finalize_run_info(config("manual", True, False))
             )
-            self.assertEqual(unique_cfg["run_name"], "manual_v2")
+            # 名称在配置阶段保持基础名称，实际目录创建时才原子选择后缀。
+            self.assertEqual(unique_cfg.run_name, "manual")
+            unique_dir = base.ensure_run_dir(unique_cfg)
+            self.assertEqual(unique_cfg.run_name, "manual_v2")
+            self.assertEqual(unique_dir, output_dir / "manual_v2")
 
+            # 同一个配置对象重复调用时，不应再次分配到 _v3。
+            self.assertEqual(base.ensure_run_dir(unique_cfg), unique_dir)
+
+            conflicting_cfg = base.ConfigNode(
+                base._finalize_run_info(config("manual", False, False))
+            )
             with self.assertRaises(base.ConfigError):
-                base._finalize_run_info(
-                    config("manual", False, False)
-                )
+                base.ensure_run_dir(conflicting_cfg)
 
-            overwrite_cfg = base._finalize_run_info(
-                config("manual", False, True)
+            overwrite_cfg = base.ConfigNode(
+                base._finalize_run_info(config("manual", False, True))
             )
             self.assertEqual(
-                Path(overwrite_cfg["run_dir"]),
+                Path(overwrite_cfg.run_dir),
                 output_dir / "manual",
             )
+            stale_summary = output_dir / "manual" / "summary.json"
+            stale_summary.write_text("stale", encoding="utf-8")
+            self.assertEqual(
+                base.ensure_run_dir(overwrite_cfg),
+                output_dir / "manual",
+            )
+            self.assertFalse(stale_summary.exists())
 
             with self.assertRaises(base.ConfigError):
                 base._finalize_run_info(
@@ -444,15 +460,43 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 )
 
             (output_dir / "uniform").mkdir()
-            auto_cfg = base._finalize_run_info(
-                {
-                    "run_name": "auto",
-                    "output_dir": str(output_dir),
-                    "run": {"unique_name": False, "overwrite": True},
-                    "agg": {"expert": {"method": "uniform"}},
-                }
+            auto_cfg = base.ConfigNode(
+                base._finalize_run_info(
+                    {
+                        "run_name": "auto",
+                        "output_dir": str(output_dir),
+                        "run": {"unique_name": False, "overwrite": True},
+                        "agg": {"expert": {"method": "uniform"}},
+                    }
+                )
             )
-            self.assertEqual(auto_cfg["run_name"], "uniform_v2")
+            self.assertEqual(auto_cfg.run_name, "uniform")
+            auto_dir = base.ensure_run_dir(auto_cfg)
+            # 自动生成名称始终唯一，即使 unique_name=False、overwrite=True。
+            self.assertEqual(auto_cfg.run_name, "uniform_v2")
+            self.assertEqual(auto_dir, output_dir / "uniform_v2")
+
+    def test_unique_run_directory_reservation_is_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "outputs"
+
+            def reserve_directory(_: int) -> tuple[str, Path]:
+                return base._reserve_unique_run_dir(output_dir, "parallel")
+
+            worker_count = 12
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                reservations = list(executor.map(reserve_directory, range(worker_count)))
+
+            names = [name for name, _ in reservations]
+            directories = [directory for _, directory in reservations]
+
+            self.assertEqual(len(set(names)), worker_count)
+            self.assertEqual(len(set(directories)), worker_count)
+            self.assertEqual(
+                set(names),
+                {"parallel", *{f"parallel_v{index}" for index in range(2, worker_count + 1)}},
+            )
+            self.assertTrue(all(directory.is_dir() for directory in directories))
 
 
 if __name__ == "__main__":
