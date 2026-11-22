@@ -99,7 +99,9 @@ class ConfigRecordTests(unittest.TestCase):
             {
                 "root": "outputs",
                 "run_name": cfg.run_name,
+                "auto_generated": True,
                 "unique_name": True,
+                "effective_unique_name": True,
                 "overwrite": False,
             },
         )
@@ -197,11 +199,10 @@ class ConfigRecordTests(unittest.TestCase):
                 "progress_bar": False,
             },
         )
-        self.assertEqual(
-            record["output"]["unique_name"],
-            False,
-        )
-        self.assertEqual(record["output"]["overwrite"], True)
+        self.assertTrue(record["output"]["auto_generated"])
+        self.assertFalse(record["output"]["unique_name"])
+        self.assertTrue(record["output"]["effective_unique_name"])
+        self.assertTrue(record["output"]["overwrite"])
         self.assertEqual(
             record["aggregation"]["method_config"],
             {"plugin_flag": False},
