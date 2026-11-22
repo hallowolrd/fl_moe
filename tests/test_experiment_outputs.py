@@ -481,7 +481,21 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
             output_dir = Path(temp_dir) / "outputs"
 
             def reserve_directory(_: int) -> tuple[str, Path]:
-                return base._reserve_unique_run_dir(output_dir, "parallel")
+                cfg = base.ConfigNode(
+                    base._finalize_run_info(
+                        {
+                            "run_name": "parallel",
+                            "output_dir": str(output_dir),
+                            "run": {
+                                "unique_name": True,
+                                "overwrite": False,
+                            },
+                            "agg": {"expert": {"method": "uniform"}},
+                        }
+                    )
+                )
+                run_dir = base.ensure_run_dir(cfg)
+                return cfg.run_name, run_dir
 
             worker_count = 12
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
