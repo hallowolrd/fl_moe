@@ -4,7 +4,7 @@ set -u
 
 # ============================================================
 # 联邦学习多算法并行启动脚本
-# 数据集 / Backbone / 轮数 / 对比算法 / GPU 均在顶部配置
+# 数据集 / Architecture / 轮数 / 对比算法 / GPU 均在顶部配置
 # ============================================================
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Project/fl_moe}"
@@ -16,9 +16,6 @@ SCRIPT_DIR="$PROJECT_ROOT/algorithms"
 DATASET="cifar10"
 DIRICHLET_SAMPLE_BALANCE="balanced"
 
-BACKBONE="resnet_cifar"
-MODEL="sparse_moe_classifier"
-MOE_HIDDEN_DIM=128
 
 LR=0.01
 MOMENTUM=0
@@ -44,8 +41,7 @@ LAUNCH_LOG_DIR="$OUTPUT_DIR/launcher_logs"
 # ------------------------------------------------------------
 EXPERIMENTS=(
     "uniform|0|uniform.py|"
-    "fedavg_orthogonal|0|fedavg_orthogonal.py|"
-    "rfedags_orthogonal|1|rfedags_orthogonal.py|"
+    "rfedags|1|rfedags.py|"
 )
 
 mkdir -p "$LAUNCH_LOG_DIR"
@@ -87,9 +83,6 @@ launch_experiment() {
         --dataset "$DATASET"
         --num-clients "$NUM_CLIENTS"
         --dirichlet-sample-balance "$DIRICHLET_SAMPLE_BALANCE"
-        --backbone "$BACKBONE"
-        --model "$MODEL"
-        --moe-hidden-dim "$MOE_HIDDEN_DIM"
         --rounds "$ROUNDS"
         --local-steps "$LOCAL_STEPS"
         --alpha "$ALPHA"
@@ -97,7 +90,7 @@ launch_experiment() {
         --lr "$LR"
         --momentum "$MOMENTUM"
         --weight-decay "$WEIGHT_DECAY"
-        --data-augmentation
+        --data-augmentation true
     )
 
     # 添加算法专属参数
@@ -138,9 +131,6 @@ echo "Dataset       : $DATASET"
 echo "Partition     : dirichlet / $DIRICHLET_SAMPLE_BALANCE"
 echo "Clients       : $NUM_CLIENTS"
 echo "Local Steps   : $LOCAL_STEPS"
-echo "Backbone      : $BACKBONE"
-echo "Model         : $MODEL"
-echo "MoE Hidden Dim: $MOE_HIDDEN_DIM"
 echo "Rounds        : $ROUNDS"
 echo "Alpha         : $ALPHA"
 echo "Seed          : $SEED"

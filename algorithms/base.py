@@ -563,7 +563,7 @@ def _build_method_config_record(
             "num_classes",  # derived from the dataset unless explicitly set
             "partition_method",  # legacy alias for partition.method
             "run_dir",  # derived from output_dir and run_name
-            "model",  # legacy label; actual model comes from model_builder
+            "model",  # removed legacy selector; rejected by _validate_config
             "weight_decay",
         }
     )
@@ -678,10 +678,6 @@ def _build_config_record(
             if model_builder is build_switch_vit_model
             else "custom"
         )
-
-    # --model 是兼容旧实验命令的标签，不代表实际构建的模型架构。
-    if raw.get("model") is not None:
-        model_record["legacy_label"] = copy.deepcopy(raw["model"])
 
     if raw.get("num_experts") is not None:
         model_record["num_experts"] = copy.deepcopy(raw["num_experts"])
@@ -1419,9 +1415,20 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前支持：{sorted(SUPPORTED_DATASETS)}"
         )
 
+    if "model" in cfg:
+        raise ConfigError(
+            "顶层 model 选择字段已移除；当前模型由 model_builder 决定。"
+        )
+
     model_cfg = cfg.get("model_cfg", {})
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
+    removed_model_fields = {"backbone", "moe_hidden_dim"}.intersection(model_cfg)
+    if removed_model_fields:
+        raise ConfigError(
+            "旧模型配置字段已移除："
+            f"{sorted(removed_model_fields)}。当前使用 SwitchViT 的 model_cfg。"
+        )
 
     method_config = cfg.get("method_config", {})
     if not isinstance(method_config, Mapping):
@@ -5465,8 +5472,7 @@ def build_federated_optimization_groups(
     按模型参数归属拆分 non_expert 与 expert。
 
     本函数只识别参数属于哪个专家，不决定其几何类型或约束方式。
-    欧氏更新、正交约束、流形优化等行为全部由注入的专家训练策略和
-    专家聚合器决定。
+    专家参数的更新与约束行为由注入的训练策略和聚合器决定。
     """
     if param_groups is None:
         param_groups = build_param_groups(
@@ -8959,12 +8965,6 @@ def _parse_bool_cli_value(value: str) -> bool:
 def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FL + MoE training entrypoint")
     parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="兼容旧实验配置的模型标签；不参与模型构建，实际模型由 model_builder 注入。",
-    )
     parser.add_argument("--dataset", type=normalize_dataset_name, choices=sorted(SUPPORTED_DATASETS), default=None)
     parser.add_argument(
         "--data-augmentation",

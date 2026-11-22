@@ -75,6 +75,11 @@ PLOT_STYLES = [
         "linestyle": (0, (3.2, 1.8)),
         "linewidth": 1.8,
     },
+    {
+        "color": "#1689D8",
+        "linestyle": "--",
+        "linewidth": 1.8,
+    },
 ]
 
 # 颜色与原始线型绑定：
@@ -92,6 +97,7 @@ STYLE_BY_COLOR = {
 # =========================
 METHOD_COLORS = {
     "Uniform": "#8A8A8A",
+    "RFedAGS": "#1689D8",
     "Fisher/K-FAC": "#A500A5",
     "Fed-MoE": "#19C4C7",
     "FedMoE-DA": "#F4BE00",
@@ -108,6 +114,7 @@ METHOD_COLORS = {
 # =========================
 LEGEND_NAMES = {
     "Uniform": "FedAvg-MoE",
+    "RFedAGS": "RFedAGS",
     "Fisher/K-FAC": "GEA-FedMoE",
     "Fed-MoE": "Fed-MoE",
     "FedMoE-DA": "FedMoE-DA",
@@ -121,6 +128,7 @@ LEGEND_NAMES = {
 # 如果以后只改“图例名字”，不需要改这里。
 # =========================
 LEGEND_ORDER = [
+    "RFedAGS",
     "Fisher/K-FAC",
     "Fed-MoE",
     "Uniform",
@@ -147,7 +155,7 @@ def parse_args() -> argparse.Namespace:
         "--input-dir",
         type=Path,
         required=True,
-        help="总实验目录，例如 outputs/cifar10_resnet_cifar",
+        help="总实验目录，例如 outputs/cifar10_SwitchViT",
     )
     parser.add_argument(
         "--window",
@@ -162,10 +170,10 @@ def parse_args() -> argparse.Namespace:
         help="可选。只比较指定 dataset；默认从 config_used.yaml 自动识别。",
     )
     parser.add_argument(
-        "--backbone",
+        "--architecture",
         type=str,
         default=None,
-        help="可选。只比较指定 backbone；默认从 config_used.yaml 自动识别。",
+        help="可选。只比较指定 architecture；默认从 config_used.yaml 自动识别。",
     )
     parser.add_argument(
         "--output-dir",
@@ -184,7 +192,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_run_metadata(csv_path: Path) -> Tuple[str | None, str | None, str]:
     """
-    Read dataset/backbone from config_used.yaml and use the run directory
+    Read dataset/architecture from config_used.yaml and use the run directory
     name as the identity of this plotted experiment.
 
     A run directory is intentionally not collapsed into its aggregation
@@ -214,23 +222,14 @@ def load_run_metadata(csv_path: Path) -> Tuple[str | None, str | None, str]:
     )
 
     model_record = cfg.get("model", {})
-    backbone = (
-        model_record.get("backbone")
+    architecture = (
+        model_record.get("architecture")
         if isinstance(model_record, dict)
         else None
     )
 
-    # Backward compatibility with historical config_used.yaml files.
     if dataset is None:
         dataset = cfg.get("dataset")
-
-    if backbone is None:
-        model_cfg = cfg.get("model_cfg", {})
-        backbone = (
-            model_cfg.get("backbone")
-            if isinstance(model_cfg, dict)
-            else None
-        )
 
     # Keep every run independently identifiable, including run_name_v2,
     # custom run names, and repeated runs of the same aggregation method.
@@ -238,7 +237,7 @@ def load_run_metadata(csv_path: Path) -> Tuple[str | None, str | None, str]:
 
     return (
         str(dataset) if dataset is not None else None,
-        str(backbone) if backbone is not None else None,
+        str(architecture) if architecture is not None else None,
         run_name,
     )
 
@@ -300,6 +299,8 @@ def friendly_method_name(method: str) -> str:
 
     if name == "uniform" or "uniform" in name:
         return "Uniform"
+    if "rfedags" in name:
+        return "RFedAGS"
     if "fisher" in name or "kfac" in name:
         return "Fisher/K-FAC"
     if "fedmoe_da" in name or "fed_moe_da" in name or "fedmoeda" in name:
@@ -316,7 +317,8 @@ def method_order(method: str) -> Tuple[int, str]:
     label = friendly_method_name(method)
     preferred = {
         "Uniform": 0,
-        "Fisher/K-FAC": 1,
+        "RFedAGS": 1,
+        "Fisher/K-FAC": 2,
         "Fed-MoE": 2,
         "FedMoE-DA": 3,
         "SOMFed": 4,
@@ -324,35 +326,35 @@ def method_order(method: str) -> Tuple[int, str]:
     return preferred.get(label, 100), label.lower()
 
 
-def choose_dataset_backbone(
+def choose_dataset_architecture(
     runs: List[Dict[str, object]],
     dataset_arg: str | None,
-    backbone_arg: str | None,
+    architecture_arg: str | None,
 ) -> Tuple[str, str]:
     known_pairs = {
-        (str(run["dataset"]), str(run["backbone"]))
+        (str(run["dataset"]), str(run["architecture"]))
         for run in runs
-        if run["dataset"] is not None and run["backbone"] is not None
+        if run["dataset"] is not None and run["architecture"] is not None
     }
 
-    if dataset_arg is not None and backbone_arg is not None:
-        return dataset_arg, backbone_arg
+    if dataset_arg is not None and architecture_arg is not None:
+        return dataset_arg, architecture_arg
 
     if dataset_arg is not None:
-        backbones = sorted({b for d, b in known_pairs if d == dataset_arg})
-        if len(backbones) == 1:
-            return dataset_arg, backbones[0]
+        architectures = sorted({b for d, b in known_pairs if d == dataset_arg})
+        if len(architectures) == 1:
+            return dataset_arg, architectures[0]
         raise ValueError(
-            f"dataset={dataset_arg!r} 对应的 backbone 无法唯一确定：{backbones}。"
-            "请同时传 --backbone。"
+            f"dataset={dataset_arg!r} 对应的 architecture 无法唯一确定：{architectures}。"
+            "请同时传 --architecture。"
         )
 
-    if backbone_arg is not None:
-        datasets = sorted({d for d, b in known_pairs if b == backbone_arg})
+    if architecture_arg is not None:
+        datasets = sorted({d for d, b in known_pairs if b == architecture_arg})
         if len(datasets) == 1:
-            return datasets[0], backbone_arg
+            return datasets[0], architecture_arg
         raise ValueError(
-            f"backbone={backbone_arg!r} 对应的 dataset 无法唯一确定：{datasets}。"
+            f"architecture={architecture_arg!r} 对应的 dataset 无法唯一确定：{datasets}。"
             "请同时传 --dataset。"
         )
 
@@ -361,14 +363,14 @@ def choose_dataset_backbone(
 
     if len(known_pairs) == 0:
         raise ValueError(
-            "没有从 config_used.yaml 中识别出 dataset/backbone。"
-            "请显式传 --dataset 和 --backbone。"
+            "没有从 config_used.yaml 中识别出 dataset/architecture。"
+            "请显式传 --dataset 和 --architecture。"
         )
 
     choices = ", ".join(f"{d}+{b}" for d, b in sorted(known_pairs))
     raise ValueError(
-        "输入目录中存在多个 dataset/backbone 组合："
-        f"{choices}。请显式传 --dataset 和 --backbone。"
+        "输入目录中存在多个 dataset/architecture 组合："
+        f"{choices}。请显式传 --dataset 和 --architecture。"
     )
 
 
@@ -393,31 +395,31 @@ def main() -> int:
 
     runs: List[Dict[str, object]] = []
     for csv_path in csv_files:
-        dataset, backbone, method = load_run_metadata(csv_path)
+        dataset, architecture, method = load_run_metadata(csv_path)
         runs.append(
             {
                 "csv": csv_path,
                 "dataset": dataset,
-                "backbone": backbone,
+                "architecture": architecture,
                 "method": method,
             }
         )
 
-    dataset, backbone = choose_dataset_backbone(
+    dataset, architecture = choose_dataset_architecture(
         runs=runs,
         dataset_arg=args.dataset,
-        backbone_arg=args.backbone,
+        architecture_arg=args.architecture,
     )
 
     matching_runs = [
         run
         for run in runs
-        if run["dataset"] == dataset and run["backbone"] == backbone
+        if run["dataset"] == dataset and run["architecture"] == architecture
     ]
 
     if not matching_runs:
         raise ValueError(
-            f"没有找到 dataset={dataset!r}, backbone={backbone!r} 的 results.csv。"
+            f"没有找到 dataset={dataset!r}, architecture={architecture!r} 的 results.csv。"
         )
 
     # Do not deduplicate by aggregation method or keep only the newest run.
@@ -453,7 +455,7 @@ def main() -> int:
 
     print()
     print(f"Dataset : {dataset}")
-    print(f"Backbone: {backbone}")
+    print(f"Architecture: {architecture}")
     print(f"Window  : {args.window}")
     print("Results :")
 
@@ -674,8 +676,8 @@ def main() -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    png_path = output_dir / f"{dataset}_{backbone}.png"
-    pdf_path = output_dir / f"{dataset}_{backbone}.pdf"
+    png_path = output_dir / f"{dataset}_{architecture}.png"
+    pdf_path = output_dir / f"{dataset}_{architecture}.pdf"
 
     fig.tight_layout()
 

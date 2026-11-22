@@ -21,21 +21,18 @@ import base  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
-import fedavg_orthogonal  # noqa: E402
-import rfedags_orthogonal  # noqa: E402
+import uniform  # noqa: E402
+import rfedags  # noqa: E402
 
 
 MOE_LAYER_NAMES = ("blocks.0.moe", "blocks.1.moe")
-STIEFEL_BLOCK_NAMES = ("block_0_fc1", "block_1_fc1")
 SWITCH_MOE_LAYER_NAMES = ("blocks.0.mlp", "blocks.1.mlp")
-SWITCH_STIEFEL_BLOCK_NAMES = ("switch_block_0_fc1", "switch_block_1_fc1")
 
 
 class TinyExpert(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        # Two experts per layer give a 4x4 stacked Stiefel coordinate:
-        # cat([W_0, W_1], dim=0).T, with n=p=4.
+        # Keep expert dimensions small for fast client/server integration tests.
         self.fc1 = nn.Linear(4, 2)
         self.fc2 = nn.Linear(2, 4)
 
@@ -162,16 +159,7 @@ class TinySwitchTwoLayerMoEClassifier(nn.Module):
 
 
 def make_switch_cfg() -> dict[str, Any]:
-    cfg = make_cfg()
-    cfg["orthogonal"]["stiefel_blocks"] = {
-        f"switch_block_{layer_index}_fc1": {
-            "parameter_patterns": [
-                f"blocks.{layer_index}.mlp.experts.expert_*.fc1.weight"
-            ]
-        }
-        for layer_index in range(2)
-    }
-    return cfg
+    return make_cfg()
 
 
 def make_cfg() -> dict[str, Any]:
@@ -187,20 +175,6 @@ def make_cfg() -> dict[str, Any]:
             "momentum": 0.0,
             "nesterov": False,
             "weight_decay": 0.0,
-        },
-        "orthogonal": {
-            "stiefel_blocks": {
-                "block_0_fc1": {
-                    "parameter_patterns": [
-                        "blocks.0.moe.experts.*.fc1.weight"
-                    ]
-                },
-                "block_1_fc1": {
-                    "parameter_patterns": [
-                        "blocks.1.moe.experts.*.fc1.weight"
-                    ]
-                },
-            }
         },
     }
 
@@ -225,7 +199,6 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
         cfg_override: dict[str, Any] | None = None,
         global_model_override: nn.Module | None = None,
         expected_moe_layer_names: tuple[str, ...] = MOE_LAYER_NAMES,
-        expected_stiefel_block_names: tuple[str, ...] = STIEFEL_BLOCK_NAMES,
         expects_runtime_stats: bool = False,
     ) -> None:
         torch.manual_seed(2026)
@@ -251,8 +224,10 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
             expert_aggregator_builder=algorithm_module.build_expert_aggregator,
             method_context=method_context,
             global_model=global_model,
-            expert_client_training_strategy_builder=(
-                algorithm_module.build_expert_client_training_strategy
+            expert_client_training_strategy_builder=getattr(
+                algorithm_module,
+                "build_expert_client_training_strategy",
+                None,
             ),
         )
 
@@ -298,59 +273,31 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
 
         expected_non_expert_names = set(server.param_groups.non_expert)
         expected_expert_names = set(server.param_groups.expert)
+        expected_expert_parameter_names = set(
+            server.optimization_groups.expert_parameter_names
+        )
+        expected_expert_buffer_names = expected_expert_names - set(
+            dict(server.global_model.named_parameters())
+        )
         expected_all_names = set(server.param_groups.all)
 
         for update in updates:
             if expects_payload:
-                # RFedAGS sends non-expert deltas through model_delta and all
-                # expert updates through its algorithm-specific payload.
-                self.assertEqual(
-                    set(update.model_delta),
-                    expected_non_expert_names,
-                )
+                self.assertEqual(set(update.model_delta), expected_non_expert_names)
                 payload = update.algorithm_payload["rfedags"]
-                self.assertEqual(
-                    set(payload["stiefel_stream"]),
-                    set(expected_stiefel_block_names),
-                )
-                self.assertTrue(payload["euclidean_stream"])
-                self.assertEqual(
-                    set(payload["euclidean_stream"])
-                    | {
-                        name
-                        for layer_name in expected_moe_layer_names
-                        for names in (
-                            plugin_groups.expert_parameters_by_layer_and_id[
-                                layer_name
-                            ].values()
-                        )
-                        for name in names
-                        if name.endswith("fc1.weight")
-                    },
-                    expected_expert_names,
-                )
+                self.assertEqual(payload["version"], rfedags.PAYLOAD_VERSION)
+                self.assertEqual(set(payload["expert_stream"]), expected_expert_parameter_names)
+                self.assertEqual(set(payload["expert_buffers"]), expected_expert_buffer_names)
             else:
-                # FedAvg-Orthogonal uploads the complete model delta,
-                # including experts from both MoE layers.
                 self.assertEqual(set(update.model_delta), expected_all_names)
                 self.assertEqual(update.algorithm_payload, {})
 
         aggregation_info = server.aggregate_client_updates(updates)
-        expert_summary = aggregation_info["expert"]
-        diagnostics = expert_summary["diagnostics"]
-
-        self.assertEqual(
-            set(diagnostics["orthogonality"]["blocks"]),
-            set(expected_stiefel_block_names),
-        )
-        for block_info in diagnostics["orthogonality"]["blocks"].values():
-            self.assertLess(block_info["orthogonality_error"], 1e-4)
-
+        diagnostics = aggregation_info["expert"]["diagnostics"]
+        self.assertNotIn("manifold_diagnostics", diagnostics)
         if expects_payload:
-            tangent_blocks = diagnostics["manifold_diagnostics"][
-                "stiefel_tangent"
-            ]["blocks"]
-            self.assertEqual(set(tangent_blocks), set(expected_stiefel_block_names))
+            self.assertEqual(diagnostics["update_space"], "euclidean")
+            self.assertEqual(diagnostics["local_steps"], 1)
 
         round_result = server.build_round_result(
             round_id=1,
@@ -410,40 +357,51 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
         self.assertEqual(set(global_state), expected_all_names)
         for name in expected_expert_names:
             self.assertTrue(bool(torch.isfinite(global_state[name]).all()))
+        return {
+            name: value.detach().clone()
+            for name, value in global_state.items()
+        }
 
-    def test_fedavg_orthogonal_client_server_support_two_moe_layers(self) -> None:
+    def test_uniform_client_server_support_two_moe_layers(self) -> None:
         self._run_one_round(
-            fedavg_orthogonal,
+            uniform,
             expects_payload=False,
         )
 
     def test_rfedags_client_server_support_two_moe_layers(self) -> None:
         self._run_one_round(
-            rfedags_orthogonal,
+            rfedags,
             expects_payload=True,
         )
 
-    def test_fedavg_orthogonal_client_server_support_switch_module_dict(self) -> None:
+    def test_uniform_client_server_support_switch_module_dict(self) -> None:
         self._run_one_round(
-            fedavg_orthogonal,
+            uniform,
             expects_payload=False,
             cfg_override=make_switch_cfg(),
             global_model_override=TinySwitchTwoLayerMoEClassifier(),
             expected_moe_layer_names=SWITCH_MOE_LAYER_NAMES,
-            expected_stiefel_block_names=SWITCH_STIEFEL_BLOCK_NAMES,
-            expects_runtime_stats=True,
+                        expects_runtime_stats=True,
         )
 
     def test_rfedags_client_server_support_switch_module_dict(self) -> None:
         self._run_one_round(
-            rfedags_orthogonal,
+            rfedags,
             expects_payload=True,
             cfg_override=make_switch_cfg(),
             global_model_override=TinySwitchTwoLayerMoEClassifier(),
             expected_moe_layer_names=SWITCH_MOE_LAYER_NAMES,
-            expected_stiefel_block_names=SWITCH_STIEFEL_BLOCK_NAMES,
-            expects_runtime_stats=True,
+                        expects_runtime_stats=True,
         )
+
+    def test_euclidean_rfedags_matches_uniform_fedavg(self) -> None:
+        uniform_state = self._run_one_round(uniform, expects_payload=False)
+        rfedags_state = self._run_one_round(rfedags, expects_payload=True)
+        self.assertEqual(set(uniform_state), set(rfedags_state))
+        for name in uniform_state:
+            torch.testing.assert_close(
+                rfedags_state[name], uniform_state[name], rtol=1e-5, atol=1e-7
+            )
 
     def test_build_server_uses_injected_model_builder(self) -> None:
         cfg = make_cfg()
@@ -464,7 +422,7 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
             client_loaders=[make_loader(11), make_loader(22)],
             test_loader=make_loader(33, num_samples=4),
             device="cpu",
-            expert_aggregator_builder=fedavg_orthogonal.build_expert_aggregator,
+            expert_aggregator_builder=uniform.build_expert_aggregator,
             method_context=method_context,
             model_builder=model_builder,
         )

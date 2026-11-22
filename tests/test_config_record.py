@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 
@@ -117,8 +118,6 @@ class ConfigRecordTests(unittest.TestCase):
     def test_explicit_false_and_optimizer_overrides_are_recorded(self) -> None:
         cfg = base.load_embedded_config(
             method_overrides={
-                # This legacy CLI label does not select the actual model.
-                "model": "resnet_cifar",
                 "data_augmentation": False,
                 "download_data": False,
                 "drop_last": True,
@@ -162,7 +161,6 @@ class ConfigRecordTests(unittest.TestCase):
         )
 
         self.assertEqual(record["model"]["architecture"], "SwitchViT")
-        self.assertEqual(record["model"]["legacy_label"], "resnet_cifar")
         self.assertFalse(record["data"]["augmentation"])
         self.assertFalse(record["data"]["download"])
         self.assertEqual(
@@ -229,6 +227,20 @@ class ConfigRecordTests(unittest.TestCase):
             "partition_max_retries",
         ):
             self.assertNotIn(framework_key, method_config)
+
+    def test_removed_model_cli_selector_is_not_registered(self) -> None:
+        with patch.object(sys, "argv", ["base.py"]):
+            args = base.parse_args()
+        self.assertFalse(hasattr(args, "model"))
+
+    def test_removed_model_selector_is_rejected(self) -> None:
+        with self.assertRaises(base.ConfigError):
+            base.load_embedded_config(method_overrides={"model": "legacy_model"})
+
+        with self.assertRaises(base.ConfigError):
+            base.load_embedded_config(
+                method_overrides={"model_cfg": {"backbone": "legacy_backbone"}}
+            )
 
     def test_save_config_yaml_round_trip_keeps_false_and_null_values(self) -> None:
         cfg = base.load_embedded_config(

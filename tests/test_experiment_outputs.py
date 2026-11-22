@@ -192,72 +192,37 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 {"layer_0": {"tokens_per_expert": [5, 3]}},
             )
 
-    def test_plot_metadata_supports_new_and_legacy_config_formats(self) -> None:
+    def test_plot_metadata_reads_switchvit_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-
-            new_run = root / "rfedags_orthogonal_v2"
-            new_run.mkdir()
-            (new_run / "config_used.yaml").write_text(
+            run_dir = root / "rfedags_v2"
+            run_dir.mkdir()
+            (run_dir / "config_used.yaml").write_text(
                 yaml.safe_dump(
                     {
                         "data": {"dataset": "cifar10"},
-                        "model": {"backbone": "resnet_cifar"},
-                        "aggregation": {"expert": "rfedags_orthogonal"},
+                        "model": {"architecture": "SwitchViT"},
+                        "aggregation": {"expert": "rfedags"},
                     },
                     sort_keys=False,
                 ),
                 encoding="utf-8",
             )
-            new_metadata = paper_draw.load_run_metadata(new_run / "results.csv")
-            self.assertEqual(
-                new_metadata,
-                ("cifar10", "resnet_cifar", "rfedags_orthogonal_v2"),
-            )
-
-            old_run = root / "legacy_run_name"
-            old_run.mkdir()
-            (old_run / "config_used.yaml").write_text(
-                yaml.safe_dump(
-                    {
-                        "dataset": "cifar100",
-                        "model_cfg": {"backbone": "resnet_cifar"},
-                        "agg": {
-                            "expert": {"method": "legacy_method_name"}
-                        },
-                    },
-                    sort_keys=False,
-                ),
-                encoding="utf-8",
-            )
-            old_metadata = paper_draw.load_run_metadata(old_run / "results.csv")
-            self.assertEqual(
-                old_metadata,
-                ("cifar100", "resnet_cifar", "legacy_run_name"),
-            )
+            metadata = paper_draw.load_run_metadata(run_dir / "results.csv")
+            self.assertEqual(metadata, ("cifar10", "SwitchViT", "rfedags_v2"))
 
     def test_method_options_are_recorded_without_algorithm_name_checks(self) -> None:
-        orthogonal_options = {
-            "stiefel_blocks": {
-                "layer_0": {
-                    "parameter_patterns": [
-                        "blocks.0.moe.experts.expert_0.wi.weight"
-                    ]
-                }
-            }
-        }
+        plugin_options = {"routing_options": {"capacity_factor": 1.25}}
         cfg = base.load_embedded_config(
             method_overrides={
                 "agg": {
                     "non_expert": {"method": "uniform"},
                     "expert": {"method": "custom_expert_method"},
                 },
-                # Legacy method-owned root options remain supported.
-                "orthogonal": orthogonal_options,
                 "custom_extension": {"scale": 0.25},
                 # New method-owned options use the generic namespace.
                 "method_config": {
-                    "routing": {"capacity_factor": 1.25},
+                    "routing": plugin_options["routing_options"],
                 },
             }
         )
@@ -266,7 +231,6 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
         self.assertEqual(
             record["aggregation"]["method_config"],
             {
-                "orthogonal": orthogonal_options,
                 "custom_extension": {"scale": 0.25},
                 "routing": {"capacity_factor": 1.25},
             },
@@ -303,7 +267,7 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                     yaml.safe_dump(
                         {
                             "data": {"dataset": "cifar10"},
-                            "model": {"backbone": "resnet_cifar"},
+                            "model": {"architecture": "SwitchViT"},
                             "aggregation": {"expert": "uniform"},
                         },
                         sort_keys=False,
@@ -343,8 +307,8 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
             self.assertEqual(output.count("rounds="), 2)
             self.assertIn("Uniform (uniform)", output)
             self.assertIn("Uniform (uniform_v2)", output)
-            self.assertTrue((output_dir / "cifar10_resnet_cifar.png").is_file())
-            self.assertTrue((output_dir / "cifar10_resnet_cifar.pdf").is_file())
+            self.assertTrue((output_dir / "cifar10_SwitchViT.png").is_file())
+            self.assertTrue((output_dir / "cifar10_SwitchViT.pdf").is_file())
 
     def test_run_overwrite_cleans_only_framework_owned_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

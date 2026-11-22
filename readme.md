@@ -1,66 +1,79 @@
-tmux new -s train_clean1
-tmux attach -t train_clean1
+# SwitchViT 联邦学习实验
 
-cd /home/cjq/Project/clean
+当前分支以 **SwitchViT** 作为默认图像分类模型。模型由 `base.build_switch_vit_model` 构建，模型结构参数统一放在 `model_cfg` 中；当前只保留 SwitchViT 模型配置。
+
+## 环境与启动
+
+```bash
 conda activate fl_moe
+```
 
-单个实验运行命令
-CUDA_VISIBLE_DEVICES=1 python algorithms/uniform.py \
+普通客户端等权 FedAvg 基线：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python algorithms/uniform.py \
   --dataset cifar10 \
-  --dirichlet-sample-balance balanced \
-  --model switch_vit \
+  --num-clients 5 \
+  --rounds 50 \
+  --local-epochs 5 \
   --lr 0.01 \
   --momentum 0 \
   --weight-decay 0 \
-  --data-augmentation \
-  --output-dir three01_exp/
+  --data-augmentation true \
+  --output-dir outputs/
+```
 
-折线图运行命令
+Euclidean RFedAGS 梯度流版本：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python algorithms/rfedags.py \
+  --dataset cifar10 \
+  --num-clients 5 \
+  --rounds 50 \
+  --local-steps 5 \
+  --lr 0.01 \
+  --momentum 0 \
+  --weight-decay 0 \
+  --data-augmentation true \
+  --output-dir outputs/
+```
+
+## 当前算法
+
+- `algorithms/uniform.py`：客户端等权聚合，作为 FedAvg 基线。
+- `algorithms/rfedags.py`：全客户端参与的 Euclidean 专家梯度流聚合版本。
+- `algorithms/base.py`：负责公共配置、SwitchViT 构建、客户端训练、服务端协调、日志和结果输出。
+
+当前 RFedAGS 版本要求：
+
+- `frac = 1.0`，每轮全部客户端参与；
+- 所有客户端每轮执行相同的本地更新步数；
+- 使用 SGD，且 `momentum = 0`、`weight_decay = 0`；
+- 不启用梯度裁剪。
+
+在这些条件下，当前纯欧氏梯度流版本与客户端等权 FedAvg 的更新结果等价。保留该实现是为了明确区分客户端梯度流接口，并为后续独立设计流形优化方法保留算法扩展位置；当前版本不包含流形约束、投影或回缩。
+
+## 本地训练预算
+
+- Epoch 模式：设置 `local_epochs`，并令 `local_steps` 为 `null`。
+- 固定步数模式：使用 `--local-steps K`；该设置优先于 `local_epochs`。
+- RFedAGS 要求所有客户端的实际本地更新步数一致。使用不平衡样本划分时，建议显式设置统一的 `--local-steps K`。
+
+## 结果绘图
+
+```bash
 python tools/paper_draw.py \
-  --input-dir outputs_tkfac/cifar10_resnet_cifar \
+  --input-dir outputs/ \
+  --dataset cifar10 \
+  --architecture SwitchViT \
   --window 5 \
-  --max-round 50 \
-  --output-dir ./paper_pic/line
+  --output-dir pictures/
+```
 
-迭代步数折线运行命令
-python tools/plot_tkfac_server_steps.py \
-  --input-dir outputs_tkfac_server_steps/cifar10_resnet_cifar \
-  --window 5 \
-  --max-round 50 \
-  --output-dir ./paper_pic/Steps_line
+绘图工具从 `config_used.yaml` 中读取 `model.architecture`，不再读取旧模型类型字段。
 
-支持的数据集：
-cifar10
-cifar100
-cinic10
-fashionmnist
-stl10
-tiny-imagenet-200
-femnist
+## 启动脚本
 
-支持的backbone：
-resnet_cifar
-vit_tiny
-
-kill $(cat outputs/fashionmnist_vit_tiny/launcher_logs/*.pid)
-
-模型与专家聚合算法的职责约定：
-- \`model\` 只选择网络结构；当前统一使用 \`sparse_moe_classifier\`。
-- 是否对专家参数施加正交约束，由专家聚合算法决定，不再提供 \`sparse_moe_orthogonal\` 模型。
-- \`fedavg_orthogonal.py\` 与 \`rfedags_orthogonal.py\` 默认约束所有专家的 \`fc1.weight\` 行空间。
-- 正交约束对象可在算法配置的 \`orthogonal.stiefel_blocks\` 中通过参数名模式调整。
-
-正交 FedAvg：
-\`\`\`bash
-python algorithms/fedavg_orthogonal.py --dataset cifar10 --backbone resnet_cifar
-\`\`\`
-
-RFedAGS 正交专家聚合：
-\`\`\`bash
-python algorithms/rfedags_orthogonal.py --dataset cifar10 --backbone resnet_cifar --local-steps 5
-
-本地训练预算（所有算法通用）：
-- 默认按 Epoch 训练：`local_epochs: 5`、`local_steps: null`。
-- 固定本地更新次数：增加命令行参数 `--local-steps 100`，该设置优先于 `local_epochs`。
-- Epoch 模式要求本轮参与客户端的 DataLoader batch 数一致；使用不平衡样本量划分时，建议设置统一的 `--local-steps K`。
-\`\`\`
+- `tools/clients.sh`：并行运行客户端数量对比实验。
+- `tools/steps.sh`：并行运行本地更新步数对比实验。
+- `tools/run.sh`：运行当前分支的基础算法对比实验。
