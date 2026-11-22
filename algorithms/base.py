@@ -8265,14 +8265,6 @@ class FLServer:
                         )
                         for client in selected_clients
                     }
-                    if len(set(planned_steps_by_client.values())) != 1:
-                        raise ValueError(
-                            "当前使用 Epoch 本地训练模式，但参与客户端的预计更新次数不一致："
-                            f"{planned_steps_by_client}。"
-                            "请设置统一的顶层 local_steps（命令行使用 --local-steps K），"
-                            "或使用 sample_balance=balanced 使各客户端 DataLoader "
-                            "具有相同 batch 数。"
-                        )
                     if any(step_count <= 0 for step_count in planned_steps_by_client.values()):
                         raise ValueError(
                             "Epoch 本地训练模式下，参与客户端必须至少有一个训练 batch；"
@@ -8390,7 +8382,26 @@ class FLServer:
         if len(client_updates) == 0:
             raise ValueError("client_updates 不能为空。")
 
-        actual_local_steps = validate_equal_client_update_steps(client_updates)
+        # 每轮客户端真实更新步数由 num_batches 记录；Epoch 模式允许客户端不同步数。
+        actual_local_steps_by_client = {
+            int(update.client_id): int(update.metrics["num_batches"])
+            for update in client_updates
+        }
+        configured_local_steps = _cfg_get(
+            self.cfg,
+            "local_steps",
+            _default_config_value("local_steps"),
+        )
+        if configured_local_steps is not None:
+            # 固定 Steps 模式保持原有严格一致性校验。
+            actual_local_steps = validate_equal_client_update_steps(client_updates)
+        else:
+            # Epoch 模式仅在步数碰巧一致时保留原有标量记录。
+            # 不一致时标量记为 None，具体步数通过每客户端诊断读取。
+            unique_steps = set(actual_local_steps_by_client.values())
+            actual_local_steps = (
+                unique_steps.pop() if len(unique_steps) == 1 else None
+            )
 
         global_state_cpu = state_dict_to(
             self.global_model.state_dict(),
@@ -8485,7 +8496,10 @@ class FLServer:
         self.global_model.to("cpu")
 
         return {
-            "local_update_steps": int(actual_local_steps),
+            "local_update_steps": (
+                int(actual_local_steps) if actual_local_steps is not None else None
+            ),
+            "local_update_steps_by_client": actual_local_steps_by_client,
             "non_expert": non_expert_result.summary(),
             "expert": expert_result.summary(),
         }
