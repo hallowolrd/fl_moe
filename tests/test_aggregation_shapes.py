@@ -13,8 +13,9 @@ ALGORITHMS_DIR = ROOT / "algorithms"
 if str(ALGORITHMS_DIR) not in sys.path:
     sys.path.insert(0, str(ALGORITHMS_DIR))
 
-import torch  # noqa: E402
 import base  # noqa: E402
+
+import torch  # noqa: E402
 
 
 class AggregationTensorShapeTests(unittest.TestCase):
