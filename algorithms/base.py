@@ -8770,7 +8770,7 @@ MethodCliOverridesBuilder = Callable[[argparse.Namespace], Mapping[str, Any]]
 
 
 def _parse_bool_cli_value(value: str) -> bool:
-    """解析 True/False、true/false 等显式命令行布尔值。""
+    """解析 True/False、true/false 等显式命令行布尔值。"""
     normalized = str(value).strip().lower()
     if normalized in {"true", "1", "yes", "y", "on"}:
         return True
