@@ -3334,7 +3334,7 @@ def apply_server_evidence_holdout(
         )
 
     targets = get_dataset_targets(bundle.train_evidence_dataset)
-    class_balanced = bool(_cfg_get(evidence_cfg, "class_balanced", True))
+    class_balanced = _cfg_get_bool(evidence_cfg, "class_balanced", True)
     seed = int(_cfg_get(cfg, "seed", 0))
 
     evidence_indices = select_server_evidence_indices(
