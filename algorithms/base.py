@@ -223,7 +223,7 @@ _prepare_deterministic_env_before_torch()
 
 # ============================================================================
 # 依赖导入：必须放在启动环境初始化之后。
-# Consolidated imports; keep this block after the deterministic bootstrap.
+# 集中导入依赖；此代码块必须位于确定性环境初始化之后。
 # ============================================================================
 
 import argparse
@@ -446,8 +446,8 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "non_expert": {"method": "uniform"},
         "expert": {"method": "uniform"},
     },
-    # Opaque options owned by the selected method/plugin. The base framework
-    # validates only the mapping container and does not interpret its contents.
+    # 此配置由所选算法或插件自行定义。
+    # 公共框架只校验其为映射类型，不解析内部字段。
     "method_config": {},
     "seed": EMBEDDED_DEFAULT_SEED,
     "deterministic": True,
@@ -483,8 +483,8 @@ def load_embedded_config(
     if method_overrides is not None:
         raw_cfg = copy.deepcopy(dict(method_overrides))
 
-    # Apply algorithm-specific defaults before shared framework defaults.
-    # Explicit embedded settings remain higher priority than both default layers.
+    # 先应用算法专属默认值，再应用公共默认值。
+    # 显式写入的内置配置优先级高于上述两层默认值。
     raw_cfg = _apply_method_defaults(raw_cfg, method_defaults)
     raw_cfg = _apply_defaults(raw_cfg)
     raw_cfg = _apply_config_overrides(raw_cfg, config_overrides)
@@ -516,8 +516,8 @@ def load_config(
 
     raw_cfg = _load_yaml_with_include(config_path)
 
-    # Apply algorithm-specific defaults before shared framework defaults.
-    # Explicit YAML settings remain higher priority than both default layers.
+    # 先应用算法专属默认值，再应用公共默认值。
+    # YAML 中显式配置的优先级高于上述两层默认值。
     raw_cfg = _apply_method_defaults(raw_cfg, method_defaults)
     raw_cfg = _apply_defaults(raw_cfg)
     raw_cfg = _apply_config_overrides(raw_cfg, config_overrides)
@@ -557,7 +557,7 @@ def _build_method_config_record(
         }
     )
 
-    # Preserve legacy method-specific root keys without naming any algorithm.
+    # 兼容旧版算法专属顶层字段，不在公共框架中绑定具体算法名称。
     method_config = {
         key: copy.deepcopy(value)
         for key, value in raw.items()
@@ -570,7 +570,7 @@ def _build_method_config_record(
     if not isinstance(explicit_method_config, Mapping):
         raise ConfigError("method_config 必须是 dict。")
 
-    # The explicit generic namespace takes precedence over legacy root keys.
+    # 显式配置的通用命名空间优先于旧版顶层字段。
     method_config.update(copy.deepcopy(dict(explicit_method_config)))
     return method_config
 
@@ -597,7 +597,7 @@ def _build_config_record(
 
     record: Dict[str, Any] = {}
 
-    # 1. Data
+    # 1. 数据配置
     data_cfg: Dict[str, Any] = {}
     for source_key, record_key in (
         ("dataset", "dataset"),
@@ -623,15 +623,15 @@ def _build_config_record(
                     partition_record[key] = copy.deepcopy(dirichlet_cfg[key])
         data_cfg["partition"] = partition_record
 
-    # Data augmentation defaults to enabled in build_datasets().
-    # Show it only when enabled, as requested.
+    # build_datasets() 默认启用数据增强。
+    # 仅在启用数据增强时记录该配置。
     if bool(raw.get("data_augmentation", True)):
         data_cfg["augmentation"] = True
 
     if data_cfg:
         record["data"] = data_cfg
 
-    # 2. Model
+    # 2. 模型配置
     model_record: Dict[str, Any] = {}
     if raw.get("model") is not None:
         model_record["architecture"] = copy.deepcopy(raw["model"])
@@ -641,7 +641,7 @@ def _build_config_record(
     if model_record:
         record["model"] = model_record
 
-    # 3. Training
+    # 3. 训练配置
     training_record: Dict[str, Any] = {}
     if raw.get("rounds") is not None:
         training_record["communication_rounds"] = copy.deepcopy(raw["rounds"])
@@ -677,7 +677,7 @@ def _build_config_record(
             if key in optimizer_cfg:
                 optimizer_record[key] = copy.deepcopy(optimizer_cfg[key])
 
-        # Optional optimizer switches are shown only when enabled.
+        # 仅记录已启用的可选优化器配置。
         if bool(optimizer_cfg.get("nesterov", False)):
             optimizer_record["nesterov"] = True
 
@@ -687,7 +687,7 @@ def _build_config_record(
     if training_record:
         record["training"] = training_record
 
-    # 4. Aggregation
+    # 4. 聚合配置
     agg_cfg = as_mapping(raw.get("agg"))
     aggregation_record: Dict[str, Any] = {}
 
@@ -700,8 +700,8 @@ def _build_config_record(
     if expert_cfg.get("method") is not None:
         aggregation_record["expert"] = copy.deepcopy(expert_cfg["method"])
 
-    # Method/plugin options are opaque to the shared framework. The record
-    # preserves them generically and does not branch on the selected method.
+    # 算法或插件专属配置由对应实现解释。
+    # 此处仅以通用形式保存，不根据算法名称分支处理。
     method_config = _build_method_config_record(raw)
     if method_config:
         aggregation_record["method_config"] = method_config
@@ -709,7 +709,7 @@ def _build_config_record(
     if aggregation_record:
         record["aggregation"] = aggregation_record
 
-    # 5. Reproducibility
+    # 5. 可复现性配置
     reproducibility_record: Dict[str, Any] = {}
     if raw.get("seed") is not None:
         reproducibility_record["seed"] = copy.deepcopy(raw["seed"])
@@ -718,11 +718,11 @@ def _build_config_record(
     if reproducibility_record:
         record["reproducibility"] = reproducibility_record
 
-    # 6. Runtime
+    # 6. 运行环境配置
     if raw.get("device") is not None:
         record["runtime"] = {"device": copy.deepcopy(raw["device"])}
 
-    # 7. Server evidence: omit the whole section when disabled.
+    # 7. 服务端 Evidence：未启用时省略整个配置分区。
     evidence_cfg = as_mapping(raw.get("server_evidence"))
     evidence_size = int(evidence_cfg.get("size", 0) or 0)
     if evidence_size > 0:
@@ -737,7 +737,7 @@ def _build_config_record(
             )
         record["server_evidence"] = evidence_record
 
-    # 8. Logging: only enabled options are recorded.
+    # 8. 日志配置：仅记录已启用的选项。
     logging_cfg = as_mapping(raw.get("logging"))
     logging_record = {
         key: True
@@ -751,7 +751,7 @@ def _build_config_record(
     if logging_record:
         record["logging"] = logging_record
 
-    # 9. Output: keep the root and final name; run_dir is derived from them.
+    # 9. 输出配置：记录输出根目录和最终名称，run_dir 根据二者生成。
     output_record: Dict[str, Any] = {}
     if raw.get("output_dir") is not None:
         output_record["root"] = str(raw["output_dir"])
@@ -784,7 +784,7 @@ def save_config(
         default_flow_style=False,
     )
 
-    # Separate top-level sections with a blank line for readability.
+    # 各顶层配置分区之间保留空行，以提高可读性。
     yaml_text = re.sub(
         r"\n(?=[A-Za-z_][A-Za-z0-9_]*:\n)",
         "\n\n",
@@ -796,8 +796,8 @@ def save_config(
         f.write(yaml_text)
 
 
-# Files owned by the experiment runner inside each run directory.
-# User-created files are deliberately not removed during overwrite.
+# 以下文件由实验运行器在每个实验目录中创建和管理。
+# 覆盖实验目录时，用户自行创建的文件不会被删除。
 RUN_OUTPUT_FILENAMES = (
     "train.log",
     "config_used.yaml",
@@ -836,8 +836,8 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
             for filename in RUN_OUTPUT_FILENAMES
         ]
 
-        # Preflight before deleting anything. A directory at a reserved output
-        # path is unexpected and must not be recursively removed.
+        # 删除文件前先执行预检查。保留路径若意外指向目录，
+        # 不得对其执行递归删除。
         invalid_paths = [
             path
             for path in output_paths
@@ -976,11 +976,11 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     explicit_cfg = copy.deepcopy(dict(cfg))
     cfg = _deep_merge(base=EMBEDDED_BASE_CONFIG, override=explicit_cfg)
 
-    # Canonical schema:
+    # 标准配置结构：
     #   partition.method
     #   partition.dirichlet.alpha
     #   partition.dirichlet.sample_balance
-    # Legacy top-level partition_method / alpha remain accepted as input aliases.
+    # 仍接受旧版顶层 partition_method / alpha 字段作为输入别名。
     explicit_partition = explicit_cfg.get("partition", {})
     if explicit_partition is None:
         explicit_partition = {}
@@ -1027,7 +1027,7 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     ).strip().lower()
     cfg["partition"] = normalized_partition
 
-    # Legacy keys are input-only; save and expose only the canonical nested form.
+    # 旧版字段仅用于兼容输入；保存和对外展示时只使用标准嵌套结构。
     cfg.pop("partition_method", None)
     cfg.pop("alpha", None)
 
@@ -1177,7 +1177,7 @@ def _infer_num_classes(dataset: str) -> int:
     dataset_name = normalize_dataset_name(dataset)
     info = DATASET_INFO.get(dataset_name)
     if info is None:
-        # Validation will report the unsupported dataset with a clearer message.
+        # 数据集合法性检查会给出更明确的错误信息。
         return 10
     return int(info["num_classes"])
 
@@ -1403,7 +1403,7 @@ def _require_non_negative_int(cfg: Mapping[str, Any], key: str) -> None:
         raise ConfigError(f"{key} 必须是非负整数，当前值：{value}")
 
 
-# Shared configuration accessor used by all bundled sections.
+# 各公共功能模块统一通过此接口读取配置。
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     """Read a plain or dotted key from ConfigNode, dict, or a regular object."""
     if cfg is None:
@@ -1715,8 +1715,8 @@ def tee_output_to_file(
     old_stdout = sys.stdout
     old_stderr = sys.stderr
 
-    # Each training invocation starts a fresh log. In particular, this
-    # prevents stale output from a reused/overwritten run directory.
+    # 每次训练启动时都创建新的日志文件，
+    # 避免复用或覆盖实验目录后残留旧日志。
     with log_path.open(
         "w",
         encoding="utf-8",
@@ -2605,7 +2605,7 @@ DATASET_INFO: Dict[str, Dict[str, Any]] = {
     "femnist": {
         "num_classes": 62,
         "input_shape": (1, 28, 28),
-        # LEAF FEMNIST stores pixels as [0, 1] floats. Keep that scale.
+        # LEAF FEMNIST 的像素值范围为 [0, 1]，此处保持原始数值范围。
         "mean": (0.0,),
         "std": (1.0,),
     },
@@ -2915,12 +2915,12 @@ def build_datasets(cfg: Any) -> DatasetBundle:
                 transform=test_transform,
             )
         else:
-            # Also accept a validation split that the user has reorganized into class folders.
+            # 同时兼容用户已按类别目录重新整理的验证集。
             test_dataset = datasets.ImageFolder(val_root, transform=test_transform)
 
     elif dataset_name == "femnist":
-        # Scheme A: ignore writer identity after loading, then reuse the existing
-        # centralized IID/Dirichlet partitioning code below this dataset layer.
+        # 方案 A：加载后不再区分书写者身份，
+        # 直接复用本模块后续的集中式 IID/Dirichlet 划分逻辑。
         root = _resolve_femnist_root(data_root)
         train_data, train_targets = _load_femnist_split_storage(root / "train")
         test_data, test_targets = _load_femnist_split_storage(root / "test")
@@ -2931,7 +2931,7 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             transform=train_transform,
             image_mode="L",
         )
-        # Share the same uint8 backing array; only the transform differs.
+        # 训练集与 Evidence 数据集共享 uint8 底层数组，仅数据变换不同。
         train_evidence_dataset = _ArrayImageDataset(
             data=train_data,
             targets=train_targets,
@@ -3116,7 +3116,7 @@ def build_train_transform(
 
     if use_augmentation:
         if dataset_name in {"cifar10", "cifar100", "cinic10"}:
-            # Keep the original CIFAR augmentation exactly unchanged.
+            # 保持 CIFAR 数据集原有的数据增强流程不变。
             transform_list.extend(
                 [transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip()]
             )
@@ -3129,7 +3129,7 @@ def build_train_transform(
                 [transforms.RandomCrop(64, padding=8), transforms.RandomHorizontalFlip()]
             )
         elif dataset_name in {"fashionmnist", "femnist"}:
-            # Do not horizontally flip clothing/character glyphs. Translation crop only.
+            # 衣物图像和字符字形不执行水平翻转，仅使用平移裁剪。
             transform_list.append(transforms.RandomCrop(image_size, padding=4))
 
     transform_list.extend(
@@ -4181,7 +4181,7 @@ class SwitchRouter(nn.Module):
         tokens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.projection(tokens)
-        # Compute routing probabilities in FP32 for numerical stability.
+        # 使用 FP32 计算路由概率，以提高数值稳定性。
         router_probabilities = torch.softmax(router_logits.float(), dim=-1)
         top1_probabilities, top1_experts = torch.max(
             router_probabilities,
@@ -4271,8 +4271,8 @@ class SwitchMoE(nn.Module):
             (num_tokens / self.num_experts) * self.capacity_factor
         ))
 
-        # Force rank zero to be exactly the Top-1 choice returned by torch.max.
-        # This also avoids inconsistent tie-breaking between argmax and argsort.
+        # 将排名第一的专家固定为 torch.max 返回的 Top-1 结果。
+        # 同时避免 argmax 与 argsort 在概率相同时采用不同的排序规则。
         remaining_probabilities = router_probabilities.clone()
         remaining_probabilities.scatter_(
             1,
@@ -4332,8 +4332,8 @@ class SwitchMoE(nn.Module):
                 expert_loads[expert_id] += int(accepted_indices.numel())
                 accepted_mask[accepted_positions] = True
 
-            # Keep rejected tokens in their original relative order for the
-            # next preference round.
+            # 保持被拒绝 Token 的原始相对顺序，
+            # 以便进入下一轮候选专家分配。
             active_indices = active_indices[~accepted_mask]
 
         if active_indices.numel() > 0 and not self.token_dropping:
@@ -4373,8 +4373,8 @@ class SwitchMoE(nn.Module):
             assigned_experts = top1_experts
             capacity = None
 
-        # The auxiliary loss uses the original Top-1 choices, before capacity
-        # overflow rerouting, and the mean router probabilities for this layer.
+        # Auxiliary Loss 使用容量溢出二次路由之前的原始 Top-1 选择结果，
+        # 以及当前层的平均 Router 概率。
         aux_loss: Optional[torch.Tensor] = None
         if self.auxiliary_loss:
             first_choice_counts = torch.bincount(
@@ -4389,8 +4389,8 @@ class SwitchMoE(nn.Module):
                 * torch.sum(expert_fraction * mean_router_probability)
             )
 
-        # Dispatch every successfully assigned token exactly once. Tokens left
-        # unassigned after all preference rounds are dropped only when enabled.
+        # 每个成功分配的 Token 只执行一次派发。
+        # 经过所有候选轮次仍未分配的 Token，仅在启用 Token Dropping 时丢弃。
         flat_outputs = torch.zeros_like(flat_tokens)
         for expert_id, expert in enumerate(self.experts.values()):
             token_indices = torch.nonzero(
@@ -4430,12 +4430,12 @@ class SwitchMoE(nn.Module):
             )
             dropped_mask = assigned_experts < 0
             stats = {
-                # Backward-compatible meaning: original Top-1 demand per expert.
+                # 为兼容旧接口，此字段表示各 Expert 原始 Top-1 路由需求量。
                 "tokens_per_expert": tokens_per_expert,
                 "router_prob_sum": router_probabilities.sum(dim=0),
                 "top1_prob_sum": top1_probabilities.sum(),
                 "num_tokens": num_tokens,
-                # Actual dispatch after capacity and overflow handling.
+                # 表示容量限制和溢出处理后的实际派发数量。
                 "processed_tokens_per_expert": processed_tokens_per_expert,
                 "rerouted_tokens": int(rerouted_mask.sum().item()),
                 "rerouted_tokens_per_expert": torch.bincount(
@@ -4690,8 +4690,8 @@ class SwitchViT(nn.Module):
             outputs, layer_stats, layer_aux_loss = block(outputs)
             layer_name = f"blocks.{block_index - 1}.mlp"
             if layer_stats:
-                # Use the same module path as the expert parameters, allowing
-                # per-layer diagnostics to line up with federated param groups.
+                # 使用与 Expert 参数相同的模块路径，
+                # 使逐层诊断信息能够对应联邦参数分组。
                 moe_stats[layer_name] = layer_stats
             if layer_aux_loss is not None:
                 aux_loss_by_layer[layer_name] = layer_aux_loss
@@ -4807,10 +4807,10 @@ def summarize_model(model: nn.Module) -> Dict[str, int]:
 # ============================================================================
 
 
-# Support both ModuleList-style experts.0 and ModuleDict-style
-# experts.expert_0 (used by common Switch Transformer implementations).
-# Keep one parser as the source of truth so expert-id and MoE-layer extraction
-# cannot disagree.
+# 同时支持 ModuleList 风格的 experts.0 和 ModuleDict 风格的
+# experts.expert_0（常见 Switch Transformer 实现采用此结构）。
+# 统一使用此解析逻辑提取 Expert ID 和 MoE 层编号，
+# 避免不同位置的解析结果不一致。
 _EXPERT_PATH_PATTERN = re.compile(
     r"^(?P<layer>.*?)(?:^|\.)experts\."
     r"(?P<expert_key>\d+|expert_\d+)(?=\.|$)"
@@ -7858,8 +7858,8 @@ class FLServer:
         self.aggregators.expert.after_aggregate(self.global_model)
         check_finite_state_dict(self.global_model.state_dict())
 
-        # Collect diagnostics only after the final server model state has
-        # been loaded and all algorithm-owned post-aggregation operations ran.
+        # 只有在最终服务端模型状态加载完成、
+        # 且算法专属聚合后处理全部执行完毕后，才收集诊断信息。
         post_diagnostics = (
             self.aggregators.expert.build_post_aggregate_diagnostics(
                 self.global_model,
@@ -8836,7 +8836,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-experts", type=int, default=None)
 
-    # SwitchViT architecture options. These are nested under model_cfg.
+    # SwitchViT 结构参数统一归属于 model_cfg 配置节点。
     parser.add_argument("--transformer-layers", type=int, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--attention-heads", type=int, default=None)
@@ -8853,7 +8853,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--routing", choices=("top1",), default=None)
     parser.add_argument("--dropout", type=float, default=None)
 
-    # Numeric zero disables these features; positive values enable them.
+    # 数值为 0 时关闭对应功能；正数表示启用。
     parser.add_argument(
         "--aux-loss-coef",
         type=float,
