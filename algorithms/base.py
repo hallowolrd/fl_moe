@@ -4951,7 +4951,7 @@ class SwitchViT(nn.Module):
         self.input_shape = (in_channels, image_height, image_width)
         self.transformer_layers = int(transformer_layers)
         self.hidden_dim = int(hidden_dim)
-        self.num_experts = int(num_experts)
+        self.num_experts = num_experts
         self.moe_block_indices = normalized_moe_blocks
         self.patch_size = int(patch_size)
 
@@ -5068,7 +5068,7 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
     aux_loss_coef = model_cfg["aux_loss_coef"]
     capacity_factor = model_cfg["capacity_factor"]
 
-    num_experts = int(_cfg_get(cfg, "num_experts", 4))
+    num_experts = _cfg_get(cfg, "num_experts", 4)
     input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
     if not isinstance(input_shape, (tuple, list)):
         raise TypeError("input_shape 必须是包含 channels、height、width 的序列。")

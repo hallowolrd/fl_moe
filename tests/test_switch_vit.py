@@ -278,6 +278,16 @@ class SwitchViTTests(unittest.TestCase):
             )
         return moe
 
+    def test_switch_vit_builder_rejects_invalid_expert_counts(self) -> None:
+        for value in (0, -1, 2.5, True):
+            with self.subTest(num_experts=value):
+                cfg = {
+                    **self.cfg,
+                    "num_experts": value,
+                }
+                with self.assertRaisesRegex(ValueError, "num_experts"):
+                    base.build_switch_vit_model(cfg)
+
     def test_switch_moe_requires_positive_integer_expert_count(self) -> None:
         common = {
             "hidden_dim": 4,
