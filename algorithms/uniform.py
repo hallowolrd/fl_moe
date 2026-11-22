@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """Uniform expert aggregation experiment.
 
 All shared experiment behavior is owned by base.py.  This file contains only
 the expert-parameter aggregation policy and its executable entrypoint.
 """
+
+from __future__ import annotations
 
 # Import base before importing torch so base.py can prepare deterministic CUDA
 # environment variables before PyTorch initializes CUDA/cuBLAS.
