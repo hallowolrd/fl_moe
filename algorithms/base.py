@@ -9264,11 +9264,11 @@ def run_training(
     总流程：
         1. 解析设备并保存完整配置
         2. 加载数据集
-        4. 划分客户端数据
-        5. 创建 DataLoader
-        6. 创建 FLServer
-        7. 执行联邦训练
-        8. 保存结果
+        3. 划分客户端数据
+        4. 创建 DataLoader
+        5. 创建 FLServer
+        6. 执行联邦训练
+        7. 保存结果
     """
     device = resolve_device(cfg)
 
