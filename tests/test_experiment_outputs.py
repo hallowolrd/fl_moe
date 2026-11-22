@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import csv
 from concurrent.futures import ThreadPoolExecutor
+import csv
 import importlib.util
 import io
 import json
@@ -485,17 +485,21 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
 
             worker_count = 12
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                reservations = list(executor.map(reserve_directory, range(worker_count)))
+                reservations = list(
+                    executor.map(reserve_directory, range(worker_count))
+                )
 
             names = [name for name, _ in reservations]
             directories = [directory for _, directory in reservations]
+            expected_names = {"parallel"}
+            expected_names.update(
+                f"parallel_v{index}"
+                for index in range(2, worker_count + 1)
+            )
 
             self.assertEqual(len(set(names)), worker_count)
             self.assertEqual(len(set(directories)), worker_count)
-            self.assertEqual(
-                set(names),
-                {"parallel", *{f"parallel_v{index}" for index in range(2, worker_count + 1)}},
-            )
+            self.assertEqual(set(names), expected_names)
             self.assertTrue(all(directory.is_dir() for directory in directories))
 
 
