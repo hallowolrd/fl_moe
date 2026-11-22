@@ -835,7 +835,8 @@ def save_config(
     保存按功能分组的实验配置记录。
 
     生成的 config_used.yaml 用于查看和复现实验记录，
-    不作为再次传入训练配置加载器的输入文件。
+    不作为再次传入训练配置加载器的输入文件。模型构建器和解析后的设备
+    由训练入口传入，以记录本次实际使用的模型构建接口与运行设备。
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9261,9 +9262,8 @@ def run_training(
         tqdm 进度条由 utils/logging.py 过滤，不写入 train.log。
 
     总流程：
-        1. 保存配置
-        2. 解析设备
-        3. 加载数据集
+        1. 解析设备并保存完整配置
+        2. 加载数据集
         4. 划分客户端数据
         5. 创建 DataLoader
         6. 创建 FLServer
