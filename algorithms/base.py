@@ -806,28 +806,106 @@ RUN_OUTPUT_FILENAMES = (
 )
 
 
+def _set_reserved_run_info(
+    cfg: ConfigNode | MutableMapping[str, Any],
+    run_name: str,
+    run_dir: Path,
+) -> None:
+    """回写原子保留后的实验名称和目录，并标记目录已保留。"""
+    if isinstance(cfg, ConfigNode):
+        cfg.run_name = run_name
+        cfg.run_dir = str(run_dir)
+        run_cfg = cfg.get("run")
+        if not isinstance(run_cfg, ConfigNode):
+            raise ConfigError("run 必须是配置节点。")
+        run_cfg._directory_reserved = True
+        return
+
+    if not isinstance(cfg, MutableMapping):
+        raise ConfigError("原子分配实验目录时，配置对象必须可修改。")
+
+    cfg["run_name"] = run_name
+    cfg["run_dir"] = str(run_dir)
+    run_cfg = cfg.get("run", {})
+    if isinstance(run_cfg, Mapping) and not isinstance(run_cfg, MutableMapping):
+        run_cfg = dict(run_cfg)
+        cfg["run"] = run_cfg
+    if not isinstance(run_cfg, MutableMapping):
+        raise ConfigError("run 必须是可修改的 dict。")
+    run_cfg["_directory_reserved"] = True
+
+
 def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
     """
-    创建实验目录，并在 run.overwrite=True 时重置由框架管理的输出文件。
-    不属于实验运行器管理范围的用户文件会被保留。
+    原子创建实验目录，并在 run.overwrite=True 时重置框架管理的输出文件。
+
+    自动名称以及启用 unique_name 的实验通过 mkdir(exist_ok=False) 原子保留目录。
+    用户自行创建且不属于实验运行器管理范围的文件会被保留。
     """
     if isinstance(cfg, ConfigNode):
         run_dir = Path(cfg.run_dir)
+        has_run_identity = hasattr(cfg, "output_dir") and hasattr(cfg, "run_name")
+        output_dir = Path(getattr(cfg, "output_dir", run_dir.parent))
+        run_name = str(getattr(cfg, "run_name", run_dir.name))
         overwrite = cfg.get("run.overwrite", False)
+        unique_name = cfg.get("run.unique_name", True)
+        auto_generated = cfg.get("run._auto_generated", False)
+        directory_reserved = cfg.get("run._directory_reserved", False)
     else:
         run_dir = Path(cfg["run_dir"])
+        has_run_identity = "output_dir" in cfg and "run_name" in cfg
+        output_dir = Path(cfg.get("output_dir", run_dir.parent))
+        run_name = str(cfg.get("run_name", run_dir.name))
         run_cfg = cfg.get("run", {})
         if not isinstance(run_cfg, Mapping):
             raise ConfigError("run 必须是 dict。")
         overwrite = run_cfg.get("overwrite", False)
+        unique_name = run_cfg.get("unique_name", True)
+        auto_generated = run_cfg.get("_auto_generated", False)
+        directory_reserved = run_cfg.get("_directory_reserved", False)
 
     if not isinstance(overwrite, bool):
         raise ConfigError(
             "run.overwrite 必须是布尔值，"
             f"当前值：{overwrite!r}"
         )
+    if not isinstance(unique_name, bool):
+        raise ConfigError(
+            "run.unique_name 必须是布尔值，"
+            f"当前值：{unique_name!r}"
+        )
+    if not isinstance(auto_generated, bool):
+        raise ConfigError("内部配置 run._auto_generated 必须是布尔值。")
+    if not isinstance(directory_reserved, bool):
+        raise ConfigError("内部配置 run._directory_reserved 必须是布尔值。")
 
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if has_run_identity:
+        # 同一个配置对象重复调用时，复用本进程已经保留的目录。
+        if directory_reserved and run_dir.is_dir():
+            pass
+        elif auto_generated or (unique_name and not overwrite):
+            # 自动名称始终唯一；手动名称仅在 unique_name=True 且
+            # overwrite=False 时自动追加版本号。
+            run_name, run_dir = _reserve_unique_run_dir(output_dir, run_name)
+            _set_reserved_run_info(cfg, run_name, run_dir)
+        elif not overwrite:
+            # unique_name=False 且 overwrite=False：不追加版本号，
+            # 但必须用独占创建避免并发进程同时复用同一目录。
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError as exc:
+                raise ConfigError(
+                    f"实验目录已存在：{run_dir}。"
+                    "请启用 run.overwrite，或启用 run.unique_name "
+                    "让框架自动创建新的实验目录。"
+                ) from exc
+            _set_reserved_run_info(cfg, run_name, run_dir)
+        else:
+            # 手动指定名称且 overwrite=True：按用户明确要求复用原目录。
+            run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # 兼容只提供 run_dir 的旧调用方式。
+        run_dir.mkdir(parents=True, exist_ok=True)
 
     if overwrite:
         output_paths = [
@@ -1044,12 +1122,12 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
-    生成 run_name 和 run_dir。
+    生成基础 run_name 和暂定 run_dir。
 
     规则：
-    1. run_name 缺失 / 为空 / auto / null 时，直接使用专家聚合方法名。
-    2. 自动生成的名称始终保持唯一，目录已存在时追加 _v2 / _v3。
-    3. 手动指定 run_name 时，仍由 run.unique_name / run.overwrite 控制重名行为。
+    1. run_name 缺失 / 为空 / auto / null 时，使用专家聚合方法名。
+    2. 自动名称始终唯一；目录名称在 ensure_run_dir 中通过原子创建确定。
+    3. 手动名称的重名行为由 run.unique_name / run.overwrite 控制。
     """
     cfg = copy.deepcopy(cfg)
 
@@ -1080,21 +1158,12 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
             f"当前值：{overwrite!r}"
         )
 
-    # 自动生成的名称始终唯一，不受 unique_name / overwrite 开关影响。
-    # 手动指定名称时：
-    # - unique_name=True 且 overwrite=False：追加版本号。
-    # - overwrite=True：复用原目录，后续由 ensure_run_dir 清理旧产物。
-    # - unique_name=False 且 overwrite=False：目录已存在则拒绝静默复用。
-    if should_auto_name or (unique_name and not overwrite):
-        run_name = _make_unique_run_name(run_name, output_dir)
-    elif not unique_name and not overwrite:
-        existing_run_dir = output_dir / run_name
-        if existing_run_dir.exists():
-            raise ConfigError(
-                f"实验目录已存在：{existing_run_dir}。"
-                "请启用 run.overwrite，或启用 run.unique_name "
-                "让框架自动创建新的实验目录。"
-            )
+    # 只在配置中记录命名策略，不提前检查目录是否存在。
+    # 真正创建目录时再执行原子保留，避免 exists() 与 mkdir() 之间的竞争窗口。
+    run_state = dict(run_cfg)
+    run_state["_auto_generated"] = should_auto_name
+    run_state.pop("_directory_reserved", None)
+    cfg["run"] = run_state
 
     cfg["run_name"] = run_name
     cfg["run_dir"] = str(output_dir / run_name)
@@ -1152,23 +1221,35 @@ def _safe_name(value: Any) -> str:
     return text.strip("_")
 
 
-def _make_unique_run_name(run_name: str, output_dir: Path) -> str:
+def _reserve_unique_run_dir(
+    output_dir: Path,
+    run_name: str,
+) -> tuple[str, Path]:
     """
-    如果输出目录已存在，自动追加版本号。
+    通过原子目录创建保留唯一实验目录。
 
-    示例：
-        exp
-        exp_v2
-        exp_v3
+    依次尝试 run_name、run_name_v2、run_name_v3 等名称。
+    mkdir(exist_ok=False) 将目录占用检查与创建合并为一个原子操作，
+    避免并发实验进程选择到同一个目录。
     """
-    candidate = run_name
-    index = 2
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    while (output_dir / candidate).exists():
-        candidate = f"{run_name}_v{index}"
-        index += 1
+    index = 1
+    while True:
+        candidate = (
+            run_name
+            if index == 1
+            else f"{run_name}_v{index}"
+        )
+        run_dir = output_dir / candidate
 
-    return candidate
+        try:
+            run_dir.mkdir(exist_ok=False)
+        except FileExistsError:
+            index += 1
+            continue
+
+        return candidate, run_dir
 
 
 def _infer_num_classes(dataset: str) -> int:
