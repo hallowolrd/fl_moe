@@ -53,10 +53,18 @@ class ConfigRecordTests(unittest.TestCase):
         self.assertEqual(record["model"]["num_classes"], 10)
         self.assertEqual(record["model"]["input_shape"], [3, 32, 32])
         self.assertEqual(
+            record["model"]["config"],
+            cfg.model_cfg.to_dict(),
+        )
+        self.assertEqual(
             record["model"]["config"]["moe_block_indices"],
             [2, 4, 6],
         )
 
+        self.assertEqual(
+            record["aggregation"],
+            {"non_expert": "uniform", "expert": "uniform"},
+        )
         self.assertEqual(record["training"]["communication_rounds"], 50)
         self.assertEqual(record["training"]["local"]["epochs"], 5)
         self.assertEqual(record["training"]["local"]["batch_size"], 64)
