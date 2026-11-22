@@ -414,6 +414,8 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
             "sample_balance": "unbalanced",
         },
     },
+    "min_samples_per_client": 1,
+    "partition_max_retries": 100,
     "frac": 1.0,
     "rounds": 50,
     "local_epochs": 5,
@@ -421,6 +423,12 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
     "batch_size": 64,
     "test_batch_size": 64,
     "num_workers": 2,
+    "data_augmentation": True,
+    "download_data": True,
+    "drop_last": False,
+    "pin_memory": None,
+    "label_smooth": 0.0,
+    "grad_clip": None,
     "model_cfg": {
         "transformer_layers": 6,
         "hidden_dim": 256,
@@ -441,6 +449,9 @@ EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
         "lr": 0.01,
         "momentum": 0.9,
         "weight_decay": 0.0005,
+        "nesterov": False,
+        "betas": [0.9, 0.999],
+        "eps": 1e-8,
     },
     "agg": {
         "non_expert": {"method": "uniform"},
@@ -552,6 +563,7 @@ def _build_method_config_record(
             "num_classes",  # derived from the dataset unless explicitly set
             "partition_method",  # legacy alias for partition.method
             "run_dir",  # derived from output_dir and run_name
+            "model",  # legacy label; actual model comes from model_builder
             "weight_decay",
         }
     )
@@ -576,13 +588,15 @@ def _build_method_config_record(
 
 def _build_config_record(
     cfg: ConfigNode | Mapping[str, Any],
+    model_builder: Optional[Callable[..., Any]] = None,
+    resolved_device: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
-    构建便于阅读的实验配置记录。
+    构建便于阅读且能够复现实验的最终配置记录。
 
-    此格式仅用于展示，不作为训练配置输入结构。
-    记录按功能分组展示最终生效的配置，省略派生信息和仅运行时使用的元数据，
-    并隐藏未启用的可选功能。
+    记录最终生效的公共配置，包括默认值、显式覆盖值和由框架推导的
+    DataLoader / 运行设备配置。算法插件专属配置仍统一放入
+    aggregation.method_config。
     """
     if isinstance(cfg, ConfigNode):
         raw = cfg.to_dict()
@@ -609,34 +623,80 @@ def _build_config_record(
         if value is not None:
             data_cfg[record_key] = copy.deepcopy(value)
 
+    data_cfg["augmentation"] = bool(raw.get("data_augmentation", True))
+    data_cfg["download"] = bool(raw.get("download_data", True))
+
     partition_cfg = as_mapping(raw.get("partition"))
-    partition_method = partition_cfg.get("method")
-    if partition_method is not None:
-        partition_record: Dict[str, Any] = {
-            "method": copy.deepcopy(partition_method)
-        }
-        if str(partition_method).strip().lower() == "dirichlet":
+    partition_method = str(
+        partition_cfg.get("method", "dirichlet")
+    ).strip().lower()
+    if partition_method:
+        partition_record: Dict[str, Any] = {"method": partition_method}
+        if partition_method == "dirichlet":
             dirichlet_cfg = as_mapping(partition_cfg.get("dirichlet"))
-            for key in ("alpha", "sample_balance"):
-                if key in dirichlet_cfg:
-                    partition_record[key] = copy.deepcopy(dirichlet_cfg[key])
+            alpha = dirichlet_cfg.get("alpha", 0.1)
+            sample_balance = str(
+                dirichlet_cfg.get("sample_balance", "unbalanced")
+            ).strip().lower()
+            partition_record["alpha"] = copy.deepcopy(alpha)
+            partition_record["sample_balance"] = sample_balance
+            partition_record["min_samples_per_client"] = int(
+                raw.get("min_samples_per_client", 1)
+            )
+            if sample_balance == "unbalanced":
+                partition_record["max_retries"] = int(
+                    raw.get("partition_max_retries", 100)
+                )
         data_cfg["partition"] = partition_record
 
-    # build_datasets() 默认启用数据增强。
-    # 仅在启用数据增强时记录该配置。
-    if bool(raw.get("data_augmentation", True)):
-        data_cfg["augmentation"] = True
-
-    if data_cfg:
-        record["data"] = data_cfg
+    # 记录 DataLoader 的最终行为，而不是只记录用户显式传入的字段。
+    num_workers = int(raw.get("num_workers", 0) or 0)
+    data_cfg["loader"] = {
+        "drop_last": bool(raw.get("drop_last", False)),
+        "pin_memory": _infer_pin_memory(raw),
+        "persistent_workers": num_workers > 0,
+    }
+    record["data"] = data_cfg
 
     # 2. 模型配置
     model_record: Dict[str, Any] = {}
+    if model_builder is not None:
+        builder_module = getattr(model_builder, "__module__", None)
+        builder_name = getattr(
+            model_builder,
+            "__qualname__",
+            getattr(model_builder, "__name__", type(model_builder).__qualname__),
+        )
+        model_record["builder"] = (
+            f"{builder_module}.{builder_name}"
+            if builder_module
+            else str(builder_name)
+        )
+        model_record["architecture"] = (
+            "SwitchViT"
+            if model_builder is build_switch_vit_model
+            else "custom"
+        )
+
+    # --model 是兼容旧实验命令的标签，不代表实际构建的模型架构。
     if raw.get("model") is not None:
-        model_record["architecture"] = copy.deepcopy(raw["model"])
+        model_record["legacy_label"] = copy.deepcopy(raw["model"])
+
+    if raw.get("num_experts") is not None:
+        model_record["num_experts"] = copy.deepcopy(raw["num_experts"])
+    if raw.get("num_classes") is not None:
+        model_record["num_classes"] = copy.deepcopy(raw["num_classes"])
+    if raw.get("input_shape") is not None:
+        input_shape = raw["input_shape"]
+        model_record["input_shape"] = (
+            list(input_shape)
+            if isinstance(input_shape, (tuple, list))
+            else copy.deepcopy(input_shape)
+        )
+
     model_cfg = as_mapping(raw.get("model_cfg"))
     if model_cfg:
-        model_record["config"] = copy.deepcopy(model_cfg)
+        model_record["config"] = copy.deepcopy(dict(model_cfg))
     if model_record:
         record["model"] = model_record
 
@@ -662,29 +722,42 @@ def _build_config_record(
             "batch_size": copy.deepcopy(raw["test_batch_size"])
         }
 
+    training_record["loss"] = {
+        "name": "cross_entropy",
+        "label_smoothing": copy.deepcopy(raw.get("label_smooth", 0.0)),
+    }
+    training_record["gradient_clip"] = copy.deepcopy(_get_grad_clip(raw))
+
     optimizer_cfg = as_mapping(raw.get("optimizer"))
     if optimizer_cfg:
-        optimizer_record: Dict[str, Any] = {}
-        optimizer_name = optimizer_cfg.get("type")
-        if optimizer_name is not None:
-            optimizer_record["name"] = copy.deepcopy(optimizer_name)
+        optimizer_name = str(optimizer_cfg.get("type", "sgd")).strip().lower()
+        optimizer_record: Dict[str, Any] = {"name": optimizer_name}
 
         if optimizer_cfg.get("lr") is not None:
             optimizer_record["learning_rate"] = copy.deepcopy(optimizer_cfg["lr"])
+        if "weight_decay" in optimizer_cfg:
+            optimizer_record["weight_decay"] = copy.deepcopy(
+                optimizer_cfg["weight_decay"]
+            )
 
-        for key in ("momentum", "weight_decay"):
-            if key in optimizer_cfg:
-                optimizer_record[key] = copy.deepcopy(optimizer_cfg[key])
+        if optimizer_name == "sgd":
+            optimizer_record["momentum"] = copy.deepcopy(
+                optimizer_cfg.get("momentum", 0.9)
+            )
+            optimizer_record["nesterov"] = bool(
+                optimizer_cfg.get("nesterov", False)
+            )
+        elif optimizer_name in {"adam", "adamw"}:
+            optimizer_record["betas"] = copy.deepcopy(
+                list(optimizer_cfg.get("betas", (0.9, 0.999)))
+            )
+            optimizer_record["eps"] = copy.deepcopy(
+                optimizer_cfg.get("eps", 1e-8)
+            )
 
-        # 仅记录已启用的可选优化器配置。
-        if bool(optimizer_cfg.get("nesterov", False)):
-            optimizer_record["nesterov"] = True
+        training_record["optimizer"] = optimizer_record
 
-        if optimizer_record:
-            training_record["optimizer"] = optimizer_record
-
-    if training_record:
-        record["training"] = training_record
+    record["training"] = training_record
 
     # 4. 聚合配置
     agg_cfg = as_mapping(raw.get("agg"))
@@ -699,8 +772,6 @@ def _build_config_record(
     if expert_cfg.get("method") is not None:
         aggregation_record["expert"] = copy.deepcopy(expert_cfg["method"])
 
-    # 算法或插件专属配置由对应实现解释。
-    # 此处仅以通用形式保存，不根据算法名称分支处理。
     method_config = _build_method_config_record(raw)
     if method_config:
         aggregation_record["method_config"] = method_config
@@ -708,63 +779,57 @@ def _build_config_record(
     if aggregation_record:
         record["aggregation"] = aggregation_record
 
-    # 5. 可复现性配置
-    reproducibility_record: Dict[str, Any] = {}
-    if raw.get("seed") is not None:
-        reproducibility_record["seed"] = copy.deepcopy(raw["seed"])
-    if bool(raw.get("deterministic", False)):
-        reproducibility_record["deterministic"] = True
-    if reproducibility_record:
-        record["reproducibility"] = reproducibility_record
-
-    # 6. 运行环境配置
-    if raw.get("device") is not None:
-        record["runtime"] = {"device": copy.deepcopy(raw["device"])}
-
-    # 7. 服务端 Evidence：未启用时省略整个配置分区。
-    evidence_cfg = as_mapping(raw.get("server_evidence"))
-    evidence_size = int(evidence_cfg.get("size", 0) or 0)
-    if evidence_size > 0:
-        evidence_record: Dict[str, Any] = {"size": evidence_size}
-        if evidence_cfg.get("batch_size") is not None:
-            evidence_record["batch_size"] = copy.deepcopy(
-                evidence_cfg["batch_size"]
-            )
-        if "class_balanced" in evidence_cfg:
-            evidence_record["class_balanced"] = copy.deepcopy(
-                evidence_cfg["class_balanced"]
-            )
-        record["server_evidence"] = evidence_record
-
-    # 8. 日志配置：仅记录已启用的选项。
-    logging_cfg = as_mapping(raw.get("logging"))
-    logging_record = {
-        key: True
-        for key in (
-            "save_config",
-            "save_results_csv",
-            "progress_bar",
-        )
-        if bool(logging_cfg.get(key, False))
+    # 5. 可复现性配置：False 也是有效实验设置，必须显式记录。
+    record["reproducibility"] = {
+        "seed": copy.deepcopy(raw.get("seed")),
+        "deterministic": bool(raw.get("deterministic", True)),
     }
-    if logging_record:
-        record["logging"] = logging_record
 
-    # 9. 输出配置：记录输出根目录和最终名称，run_dir 根据二者生成。
+    # 6. 运行环境：同时记录请求设备和本次实际解析出的设备。
+    runtime_record: Dict[str, Any] = {
+        "device": copy.deepcopy(raw.get("device", "auto"))
+    }
+    if resolved_device is not None:
+        runtime_record["resolved_device"] = str(resolved_device)
+    record["runtime"] = runtime_record
+
+    # 7. Server Evidence：size=0 时也保留完整配置，明确表示该功能未启用。
+    evidence_cfg = as_mapping(raw.get("server_evidence"))
+    record["server_evidence"] = {
+        "size": int(evidence_cfg.get("size", 0) or 0),
+        "batch_size": copy.deepcopy(evidence_cfg.get("batch_size", 256)),
+        "class_balanced": bool(evidence_cfg.get("class_balanced", True)),
+    }
+
+    # 8. 日志配置：True 和 False 均完整记录。
+    logging_cfg = as_mapping(raw.get("logging"))
+    record["logging"] = {
+        key: bool(logging_cfg.get(key, default))
+        for key, default in (
+            ("save_config", True),
+            ("save_results_csv", True),
+            ("progress_bar", True),
+        )
+    }
+
+    # 9. 输出配置：包含实验命名策略，便于理解目录如何分配。
+    run_cfg = as_mapping(raw.get("run"))
     output_record: Dict[str, Any] = {}
     if raw.get("output_dir") is not None:
         output_record["root"] = str(raw["output_dir"])
     if raw.get("run_name") is not None:
         output_record["run_name"] = str(raw["run_name"])
-    if output_record:
-        record["output"] = output_record
+    output_record["unique_name"] = bool(run_cfg.get("unique_name", True))
+    output_record["overwrite"] = bool(run_cfg.get("overwrite", False))
+    record["output"] = output_record
 
     return record
-
 
 def save_config(
     cfg: ConfigNode | Mapping[str, Any],
     output_path: str | Path,
+    model_builder: Optional[Callable[..., Any]] = None,
+    resolved_device: Optional[Any] = None,
 ) -> None:
     """
     保存按功能分组的实验配置记录。
@@ -775,7 +840,11 @@ def save_config(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    record = _build_config_record(cfg)
+    record = _build_config_record(
+        cfg,
+        model_builder=model_builder,
+        resolved_device=resolved_device,
+    )
     yaml_text = yaml.safe_dump(
         record,
         allow_unicode=True,
@@ -9201,13 +9270,15 @@ def run_training(
         7. 执行联邦训练
         8. 保存结果
     """
+    device = resolve_device(cfg)
+
     if bool(cfg.get("logging.save_config", True)):
         save_config(
             cfg=cfg,
             output_path=run_dir / "config_used.yaml",
+            model_builder=model_builder,
+            resolved_device=device,
         )
-
-    device = resolve_device(cfg)
 
     print()
     print("=" * 80)
