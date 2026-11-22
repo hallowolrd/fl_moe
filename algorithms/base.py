@@ -814,13 +814,20 @@ def _build_config_record(
 
     # 9. 输出配置：包含实验命名策略，便于理解目录如何分配。
     run_cfg = as_mapping(raw.get("run"))
+    auto_generated = bool(run_cfg.get("_auto_generated", False))
+    unique_name = bool(run_cfg.get("unique_name", True))
+    overwrite = bool(run_cfg.get("overwrite", False))
     output_record: Dict[str, Any] = {}
     if raw.get("output_dir") is not None:
         output_record["root"] = str(raw["output_dir"])
     if raw.get("run_name") is not None:
         output_record["run_name"] = str(raw["run_name"])
-    output_record["unique_name"] = bool(run_cfg.get("unique_name", True))
-    output_record["overwrite"] = bool(run_cfg.get("overwrite", False))
+    output_record["auto_generated"] = auto_generated
+    output_record["unique_name"] = unique_name
+    output_record["effective_unique_name"] = (
+        auto_generated or (unique_name and not overwrite)
+    )
+    output_record["overwrite"] = overwrite
     record["output"] = output_record
 
     return record
