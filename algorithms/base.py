@@ -8912,7 +8912,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
         "--dirichlet-sample-balance",
         choices=("balanced", "unbalanced"),
         default=None,
-        help="Dirichlet 客户端样本数均衡策略；默认 balanced。",
+        help="Dirichlet 客户端样本数均衡策略；默认 unbalanced。",
     )
     parser.add_argument("--frac", type=float, default=None)
     parser.add_argument("--rounds", type=int, default=None)
