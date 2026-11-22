@@ -49,6 +49,7 @@ class ConfigRecordTests(unittest.TestCase):
         )
 
         self.assertEqual(record["model"]["architecture"], "SwitchViT")
+        self.assertNotIn("legacy_label", record["model"])
         self.assertEqual(record["model"]["builder"], "base.build_switch_vit_model")
         self.assertEqual(record["model"]["num_experts"], 4)
         self.assertEqual(record["model"]["num_classes"], 10)

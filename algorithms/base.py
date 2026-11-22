@@ -142,7 +142,7 @@ def _read_top_level_scalar_from_yaml_like_file(
                 if not raw_value:
                     include_list_indent = indent
                 elif value.startswith("[") and value.endswith("]"):
-                    # 支持 include: [base.yaml, model/resnet.yaml]。
+                    # 支持 include: [base.yaml, model/switch_vit.yaml]。
                     for item in value[1:-1].split(","):
                         item = _clean_simple_yaml_value(item)
                         if item:
@@ -1038,7 +1038,7 @@ def _load_yaml_with_include(
     也支持：
         include:
           - base.yaml
-          - model/resnet.yaml
+          - model/switch_vit.yaml
 
     子配置会覆盖 base 配置。
     """
@@ -6121,8 +6121,8 @@ class ExpertClientTrainingStrategy(ABC):
     上传 algorithm_payload。non_expert 参数仍由框架的普通优化器更新。
 
     默认由框架对全部模型梯度统一执行 grad_clip；若策略声明自己负责
-    expert 梯度裁剪，则框架只裁剪 non_expert 梯度。是否执行正交约束或
-    流形回缩由具体策略决定，模型本身不触发。
+    expert 梯度裁剪，则框架只裁剪 non_expert 梯度。额外的参数约束或回缩
+    由具体策略决定，模型本身不触发。
     """
 
     @property

@@ -200,7 +200,7 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
         global_model_override: nn.Module | None = None,
         expected_moe_layer_names: tuple[str, ...] = MOE_LAYER_NAMES,
         expects_runtime_stats: bool = False,
-    ) -> None:
+    ) -> dict[str, torch.Tensor]:
         torch.manual_seed(2026)
         cfg = make_cfg() if cfg_override is None else cfg_override
         global_model = (
@@ -381,7 +381,7 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
             cfg_override=make_switch_cfg(),
             global_model_override=TinySwitchTwoLayerMoEClassifier(),
             expected_moe_layer_names=SWITCH_MOE_LAYER_NAMES,
-                        expects_runtime_stats=True,
+            expects_runtime_stats=True,
         )
 
     def test_rfedags_client_server_support_switch_module_dict(self) -> None:
@@ -391,7 +391,7 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
             cfg_override=make_switch_cfg(),
             global_model_override=TinySwitchTwoLayerMoEClassifier(),
             expected_moe_layer_names=SWITCH_MOE_LAYER_NAMES,
-                        expects_runtime_stats=True,
+            expects_runtime_stats=True,
         )
 
     def test_euclidean_rfedags_matches_uniform_fedavg(self) -> None:
