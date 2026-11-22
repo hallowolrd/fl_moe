@@ -1731,7 +1731,12 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"optimizer.lr 必须是有限的正数，当前值：{lr}"
         )
 
-    weight_decay = float(optimizer_cfg.get("weight_decay", _default_config_value("optimizer.weight_decay")))
+    weight_decay = float(
+        optimizer_cfg.get(
+            "weight_decay",
+            _default_config_value("optimizer.weight_decay"),
+        )
+    )
     if not math.isfinite(weight_decay) or weight_decay < 0:
         raise ConfigError(
             f"optimizer.weight_decay 必须是有限的非负数，当前值：{weight_decay}"
@@ -3732,8 +3737,20 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
         sample_balance = "none"
 
     elif partition_method == "dirichlet":
-        dirichlet_alpha = float(_cfg_get(dirichlet_cfg, "alpha", _default_config_value("partition.dirichlet.alpha")))
-        min_samples_per_client = int(_cfg_get(cfg, "min_samples_per_client", _default_config_value("min_samples_per_client")))
+        dirichlet_alpha = float(
+            _cfg_get(
+                dirichlet_cfg,
+                "alpha",
+                _default_config_value("partition.dirichlet.alpha"),
+            )
+        )
+        min_samples_per_client = int(
+            _cfg_get(
+                cfg,
+                "min_samples_per_client",
+                _default_config_value("min_samples_per_client"),
+            )
+        )
 
         if sample_balance == "balanced":
             client_indices = build_balanced_dirichlet_partition(
@@ -3744,7 +3761,13 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
                 min_samples_per_client=min_samples_per_client,
             )
         elif sample_balance == "unbalanced":
-            max_retries = int(_cfg_get(cfg, "partition_max_retries", _default_config_value("partition_max_retries")))
+            max_retries = int(
+                _cfg_get(
+                    cfg,
+                    "partition_max_retries",
+                    _default_config_value("partition_max_retries"),
+                )
+            )
             client_indices = build_dirichlet_partition(
                 targets=targets,
                 num_clients=num_clients,
@@ -6574,7 +6597,11 @@ class FLClient:
 
         criterion = build_criterion(self.cfg)
         local_epochs = int(
-            _cfg_get(self.cfg, "local_epochs", _default_config_value("local_epochs"))
+            _cfg_get(
+                self.cfg,
+                "local_epochs",
+                _default_config_value("local_epochs"),
+            )
         )
         configured_local_steps = _cfg_get(self.cfg, "local_steps", _default_config_value("local_steps"))
         local_steps = (
@@ -7204,7 +7231,9 @@ def build_optimizer(
     """
     optimizer_type = get_optimizer_type(cfg)
     optimizer_cfg = _cfg_get(
-        cfg, "optimizer", _default_config_value("optimizer")
+        cfg,
+        "optimizer",
+        _default_config_value("optimizer"),
     )
 
     lr = float(
@@ -7325,7 +7354,9 @@ def get_optimizer_type(cfg: Any) -> str:
     从配置中读取优化器类型。
     """
     optimizer_cfg = _cfg_get(
-        cfg, "optimizer", _default_config_value("optimizer")
+        cfg,
+        "optimizer",
+        _default_config_value("optimizer"),
     )
     optimizer_type = _cfg_get(optimizer_cfg, "type", _default_config_value("optimizer.type"))
 
@@ -7480,7 +7511,9 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
     如果没有配置，则返回 None。
     """
     optimizer_cfg = _cfg_get(
-        cfg, "optimizer", _default_config_value("optimizer")
+        cfg,
+        "optimizer",
+        _default_config_value("optimizer"),
     )
 
     value = _cfg_get(
@@ -8137,11 +8170,21 @@ class FLServer:
             6. 在服务器测试集评估
             7. 记录 RoundResult
         """
-        rounds = int(_cfg_get(self.cfg, "rounds", _default_config_value("rounds")))
-        frac = float(_cfg_get(self.cfg, "frac", _default_config_value("frac")))
-        seed = int(_cfg_get(self.cfg, "seed", _default_config_value("seed")))
+        rounds = int(
+            _cfg_get(self.cfg, "rounds", _default_config_value("rounds"))
+        )
+        frac = float(
+            _cfg_get(self.cfg, "frac", _default_config_value("frac"))
+        )
+        seed = int(
+            _cfg_get(self.cfg, "seed", _default_config_value("seed"))
+        )
 
-        logging_cfg = _cfg_get(self.cfg, "logging", _default_config_value("logging"))
+        logging_cfg = _cfg_get(
+            self.cfg,
+            "logging",
+            _default_config_value("logging"),
+        )
 
         # 日志行为固定：每轮记录，不提供配置入口。
         log_every = 1
@@ -8210,7 +8253,11 @@ class FLServer:
                 # 在开始本轮本地训练前先检查，避免完成昂贵训练后才发现步数不一致。
                 if _cfg_get(self.cfg, "local_steps", _default_config_value("local_steps")) is None:
                     local_epochs = int(
-            _cfg_get(self.cfg, "local_epochs", _default_config_value("local_epochs"))
+            _cfg_get(
+                self.cfg,
+                "local_epochs",
+                _default_config_value("local_epochs"),
+            )
         )
                     planned_steps_by_client = {
                         int(client.client_id): (
@@ -8556,7 +8603,11 @@ class FLServer:
             _default_config_value("local_steps"),
         )
         local_epochs = int(
-            _cfg_get(self.cfg, "local_epochs", _default_config_value("local_epochs"))
+            _cfg_get(
+                self.cfg,
+                "local_epochs",
+                _default_config_value("local_epochs"),
+            )
         )
         frac = float(
             _cfg_get(self.cfg, "frac", _default_config_value("frac"))
