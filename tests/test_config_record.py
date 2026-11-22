@@ -41,7 +41,7 @@ class ConfigRecordTests(unittest.TestCase):
         self.assertEqual(
             record["data"]["loader"],
             {
-                "drop_last": False,
+                "client_train_drop_last": False,
                 "pin_memory": True,
                 "persistent_workers": True,
             },
@@ -158,7 +158,7 @@ class ConfigRecordTests(unittest.TestCase):
         self.assertEqual(
             record["data"]["loader"],
             {
-                "drop_last": True,
+                "client_train_drop_last": True,
                 "pin_memory": False,
                 "persistent_workers": False,
             },
