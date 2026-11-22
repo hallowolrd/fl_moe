@@ -26,9 +26,85 @@ import sys
 from pathlib import Path
 
 
-# 与原 configs/base.yaml 保持一致。该值必须在 import torch 之前可用，
-# 以便没有外部 --config 文件时仍能正确设置 PYTHONHASHSEED。
-EMBEDDED_DEFAULT_SEED = 0
+# 公共实验配置的唯一默认值来源。
+# 必须在 import torch 前定义，因为启动阶段需要读取默认 seed。
+DEFAULT_CONFIG = {
+    "dataset": "cifar10",
+    "data_root": "./datasets",
+    "num_clients": 5,
+    "partition": {
+        "method": "dirichlet",
+        "dirichlet": {
+            "alpha": 0.1,
+            "sample_balance": "unbalanced",
+        },
+    },
+    "min_samples_per_client": 1,
+    "partition_max_retries": 100,
+    "frac": 1.0,
+    "rounds": 50,
+    "local_epochs": 5,
+    "local_steps": None,
+    "batch_size": 64,
+    "test_batch_size": 64,
+    "num_workers": 2,
+    "data_augmentation": True,
+    "download_data": True,
+    "drop_last": False,
+    "pin_memory": None,
+    "label_smooth": 0.0,
+    "grad_clip": None,
+    "model_cfg": {
+        "transformer_layers": 6,
+        "hidden_dim": 256,
+        "attention_heads": 4,
+        "patch_size": 4,
+        "expert_hidden_dim": 1024,
+        "moe_block_indices": [2, 4, 6],
+        "routing": "top1",
+        "aux_loss_coef": 0.0,
+        "capacity_factor": 0.0,
+        "token_dropping": False,
+        "router_statistics": True,
+        "dropout": 0.0,
+    },
+    "num_experts": 4,
+    "optimizer": {
+        "type": "sgd",
+        "lr": 0.01,
+        "momentum": 0.9,
+        "weight_decay": 0.0005,
+        "nesterov": False,
+        "betas": [0.9, 0.999],
+        "eps": 1e-8,
+    },
+    "agg": {
+        "non_expert": {"method": "uniform"},
+        "expert": {"method": "uniform"},
+    },
+    # 此配置由所选算法或插件自行定义。
+    # 公共框架只校验其为映射类型，不解析内部字段。
+    "method_config": {},
+    "seed": 0,
+    "deterministic": True,
+    "device": "auto",
+    "output_dir": "outputs",
+    "run_name": "auto",
+    "run": {
+        "unique_name": True,
+        "overwrite": False,
+    },
+    "server_evidence": {
+        "size": 0,
+        "batch_size": 256,
+        "class_balanced": True,
+    },
+    "logging": {
+        "save_config": True,
+        "save_results_csv": True,
+        "progress_bar": True,
+    },
+}
 
 
 def _get_cli_arg_value(name: str) -> str | None:
@@ -197,7 +273,7 @@ def _prepare_deterministic_env_before_torch() -> None:
 
     target_hash_seed = str(
         cli_seed if cli_seed is not None else (
-            config_seed if config_seed is not None else EMBEDDED_DEFAULT_SEED
+            config_seed if config_seed is not None else DEFAULT_CONFIG["seed"]
         )
     )
 
@@ -328,8 +404,8 @@ class ConfigNode:
         cfg.method_config
 
     也支持路径读取：
-        cfg.get("agg.non_expert.method", "uniform")
-        cfg.get("agg.expert.method", "uniform")
+        cfg.get("agg.non_expert.method")
+        cfg.get("agg.expert.method")
         cfg.get("method_config.some_option")
     """
 
@@ -356,8 +432,8 @@ class ConfigNode:
         按路径读取配置。
 
         示例：
-            cfg.get("agg.non_expert.method", "uniform")
-            cfg.get("agg.expert.method", "uniform")
+            cfg.get("agg.non_expert.method")
+            cfg.get("agg.expert.method")
         """
         current: Any = self
 
@@ -403,83 +479,14 @@ class ConfigNode:
         return repr(self.to_dict())
 
 
-EMBEDDED_BASE_CONFIG: Dict[str, Any] = {
-    "dataset": "cifar10",
-    "data_root": "./datasets",
-    "num_clients": 5,
-    "partition": {
-        "method": "dirichlet",
-        "dirichlet": {
-            "alpha": 0.1,
-            "sample_balance": "unbalanced",
-        },
-    },
-    "min_samples_per_client": 1,
-    "partition_max_retries": 100,
-    "frac": 1.0,
-    "rounds": 50,
-    "local_epochs": 5,
-    "local_steps": None,
-    "batch_size": 64,
-    "test_batch_size": 64,
-    "num_workers": 2,
-    "data_augmentation": True,
-    "download_data": True,
-    "drop_last": False,
-    "pin_memory": None,
-    "label_smooth": 0.0,
-    "grad_clip": None,
-    "model_cfg": {
-        "transformer_layers": 6,
-        "hidden_dim": 256,
-        "attention_heads": 4,
-        "patch_size": 4,
-        "expert_hidden_dim": 1024,
-        "moe_block_indices": [2, 4, 6],
-        "routing": "top1",
-        "aux_loss_coef": 0.0,
-        "capacity_factor": 0.0,
-        "token_dropping": False,
-        "router_statistics": True,
-        "dropout": 0.0,
-    },
-    "num_experts": 4,
-    "optimizer": {
-        "type": "sgd",
-        "lr": 0.01,
-        "momentum": 0.9,
-        "weight_decay": 0.0005,
-        "nesterov": False,
-        "betas": [0.9, 0.999],
-        "eps": 1e-8,
-    },
-    "agg": {
-        "non_expert": {"method": "uniform"},
-        "expert": {"method": "uniform"},
-    },
-    # 此配置由所选算法或插件自行定义。
-    # 公共框架只校验其为映射类型，不解析内部字段。
-    "method_config": {},
-    "seed": EMBEDDED_DEFAULT_SEED,
-    "deterministic": True,
-    "device": "auto",
-    "output_dir": "outputs",
-    "run_name": "auto",
-    "run": {
-        "unique_name": True,
-        "overwrite": False,
-    },
-    "server_evidence": {
-        "size": 0,
-        "batch_size": 256,
-        "class_balanced": True,
-    },
-    "logging": {
-        "save_config": True,
-        "save_results_csv": True,
-        "progress_bar": True,
-    },
-}
+def _default_config_value(path: str) -> Any:
+    """按点分隔路径读取默认配置，并返回独立副本。"""
+    current: Any = DEFAULT_CONFIG
+    for part in path.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            raise KeyError(f"默认配置中不存在字段：{path}")
+        current = current[part]
+    return copy.deepcopy(current)
 
 
 def load_embedded_config(
@@ -550,7 +557,7 @@ def _build_method_config_record(
 
     公共框架字段以及派生字段、输入别名字段不会被收集。
     """
-    framework_keys = set(EMBEDDED_BASE_CONFIG)
+    framework_keys = set(DEFAULT_CONFIG)
     framework_keys.update(
         {
             "alpha",  # legacy alias for partition.dirichlet.alpha
@@ -619,41 +626,70 @@ def _build_config_record(
         ("frac", "participation"),
         ("num_workers", "workers"),
     ):
-        value = raw.get(source_key)
+        value = raw.get(source_key, _default_config_value(source_key))
         if value is not None:
             data_cfg[record_key] = copy.deepcopy(value)
 
-    data_cfg["augmentation"] = _cfg_get_bool(raw, "data_augmentation", True)
-    data_cfg["download"] = _cfg_get_bool(raw, "download_data", True)
+    data_cfg["augmentation"] = _cfg_get_bool(
+        raw,
+        "data_augmentation",
+        _default_config_value("data_augmentation"),
+    )
+    data_cfg["download"] = _cfg_get_bool(
+        raw,
+        "download_data",
+        _default_config_value("download_data"),
+    )
 
-    partition_cfg = as_mapping(raw.get("partition"))
+    partition_cfg = _deep_merge(
+        base=_default_config_value("partition"),
+        override=as_mapping(raw.get("partition")),
+    )
     partition_method = str(
-        partition_cfg.get("method", "dirichlet")
+        partition_cfg.get("method", _default_config_value("partition.method"))
     ).strip().lower()
     if partition_method:
         partition_record: Dict[str, Any] = {"method": partition_method}
         if partition_method == "dirichlet":
             dirichlet_cfg = as_mapping(partition_cfg.get("dirichlet"))
-            alpha = dirichlet_cfg.get("alpha", 0.1)
+            alpha = dirichlet_cfg.get(
+                "alpha",
+                _default_config_value("partition.dirichlet.alpha"),
+            )
             sample_balance = str(
-                dirichlet_cfg.get("sample_balance", "unbalanced")
+                dirichlet_cfg.get(
+                    "sample_balance",
+                    _default_config_value("partition.dirichlet.sample_balance"),
+                )
             ).strip().lower()
             partition_record["alpha"] = copy.deepcopy(alpha)
             partition_record["sample_balance"] = sample_balance
             partition_record["min_samples_per_client"] = int(
-                raw.get("min_samples_per_client", 1)
+                raw.get(
+                    "min_samples_per_client",
+                    _default_config_value("min_samples_per_client"),
+                )
             )
             if sample_balance == "unbalanced":
                 partition_record["max_retries"] = int(
-                    raw.get("partition_max_retries", 100)
+                    raw.get(
+                        "partition_max_retries",
+                        _default_config_value("partition_max_retries"),
+                    )
                 )
         data_cfg["partition"] = partition_record
 
     # 记录 DataLoader 的最终行为，而不是只记录用户显式传入的字段。
     # drop_last 仅控制客户端训练 loader；测试和 Evidence loader 固定为 False。
-    num_workers = int(raw.get("num_workers", 0) or 0)
+    num_workers = int(
+        raw.get("num_workers", _default_config_value("num_workers")) or 0
+    )
     data_cfg["loader"] = {
-        "client_train_drop_last": _cfg_get_bool(raw, "drop_last", False),
+        "client_train_drop_last": _cfg_get_bool(
+            raw,
+            "drop_last",
+            _default_config_value("drop_last"),
+        ),
         "pin_memory": _infer_pin_memory(raw),
         "persistent_workers": num_workers > 0,
     }
@@ -679,19 +715,32 @@ def _build_config_record(
             else "custom"
         )
 
-    if raw.get("num_experts") is not None:
-        model_record["num_experts"] = copy.deepcopy(raw["num_experts"])
-    if raw.get("num_classes") is not None:
-        model_record["num_classes"] = copy.deepcopy(raw["num_classes"])
-    if raw.get("input_shape") is not None:
-        input_shape = raw["input_shape"]
+    model_record["num_experts"] = copy.deepcopy(
+        raw.get("num_experts", _default_config_value("num_experts"))
+    )
+    dataset_name = normalize_dataset_name(
+        raw.get("dataset", _default_config_value("dataset"))
+    )
+    dataset_info = DATASET_INFO.get(dataset_name)
+    num_classes = raw.get("num_classes")
+    if num_classes is None and dataset_info is not None:
+        num_classes = int(dataset_info["num_classes"])
+    if num_classes is not None:
+        model_record["num_classes"] = copy.deepcopy(num_classes)
+    input_shape = raw.get("input_shape")
+    if input_shape is None and dataset_info is not None:
+        input_shape = tuple(dataset_info["input_shape"])
+    if input_shape is not None:
         model_record["input_shape"] = (
             list(input_shape)
             if isinstance(input_shape, (tuple, list))
             else copy.deepcopy(input_shape)
         )
 
-    model_cfg = as_mapping(raw.get("model_cfg"))
+    model_cfg = _deep_merge(
+        base=_default_config_value("model_cfg"),
+        override=as_mapping(raw.get("model_cfg")),
+    )
     if model_cfg:
         model_record["config"] = copy.deepcopy(dict(model_cfg))
     if model_record:
@@ -699,38 +748,49 @@ def _build_config_record(
 
     # 3. 训练配置
     training_record: Dict[str, Any] = {}
-    if raw.get("rounds") is not None:
-        training_record["communication_rounds"] = copy.deepcopy(raw["rounds"])
+    training_record["communication_rounds"] = copy.deepcopy(
+        raw.get("rounds", _default_config_value("rounds"))
+    )
 
     local_record: Dict[str, Any] = {}
-    local_steps = raw.get("local_steps")
+    local_steps = raw.get("local_steps", _default_config_value("local_steps"))
     if local_steps is not None:
         local_record["steps"] = copy.deepcopy(local_steps)
-    elif raw.get("local_epochs") is not None:
-        local_record["epochs"] = copy.deepcopy(raw["local_epochs"])
+    else:
+        local_record["epochs"] = copy.deepcopy(
+            raw.get("local_epochs", _default_config_value("local_epochs"))
+        )
 
-    if raw.get("batch_size") is not None:
-        local_record["batch_size"] = copy.deepcopy(raw["batch_size"])
-    if local_record:
-        training_record["local"] = local_record
+    local_record["batch_size"] = copy.deepcopy(
+        raw.get("batch_size", _default_config_value("batch_size"))
+    )
+    training_record["local"] = local_record
 
-    if raw.get("test_batch_size") is not None:
-        training_record["evaluation"] = {
-            "batch_size": copy.deepcopy(raw["test_batch_size"])
-        }
+    training_record["evaluation"] = {
+        "batch_size": copy.deepcopy(
+            raw.get("test_batch_size", _default_config_value("test_batch_size"))
+        )
+    }
 
     training_record["loss"] = {
         "name": "cross_entropy",
-        "label_smoothing": copy.deepcopy(raw.get("label_smooth", 0.0)),
+        "label_smoothing": copy.deepcopy(
+            raw.get("label_smooth", _default_config_value("label_smooth"))
+        ),
     }
     training_record["gradient_clip"] = copy.deepcopy(_get_grad_clip(raw))
 
-    optimizer_cfg = as_mapping(raw.get("optimizer"))
+    optimizer_cfg = _deep_merge(
+        base=_default_config_value("optimizer"),
+        override=as_mapping(raw.get("optimizer")),
+    )
     if optimizer_cfg:
-        optimizer_name = str(optimizer_cfg.get("type", "sgd")).strip().lower()
+        optimizer_name = str(
+            optimizer_cfg.get("type", _default_config_value("optimizer.type"))
+        ).strip().lower()
         optimizer_record: Dict[str, Any] = {"name": optimizer_name}
 
-        if optimizer_cfg.get("lr") is not None:
+        if optimizer_cfg.get("lr", _default_config_value("optimizer.lr")) is not None:
             optimizer_record["learning_rate"] = copy.deepcopy(optimizer_cfg["lr"])
         if "weight_decay" in optimizer_cfg:
             optimizer_record["weight_decay"] = copy.deepcopy(
@@ -739,19 +799,24 @@ def _build_config_record(
 
         if optimizer_name == "sgd":
             optimizer_record["momentum"] = copy.deepcopy(
-                optimizer_cfg.get("momentum", 0.9)
+                optimizer_cfg.get(
+                    "momentum",
+                    _default_config_value("optimizer.momentum"),
+                )
             )
             optimizer_record["nesterov"] = _cfg_get_bool(
                 optimizer_cfg,
                 "nesterov",
-                False,
+                _default_config_value("optimizer.nesterov"),
             )
         elif optimizer_name in {"adam", "adamw"}:
             optimizer_record["betas"] = copy.deepcopy(
-                list(optimizer_cfg.get("betas", (0.9, 0.999)))
+                list(
+                    optimizer_cfg.get("betas", _default_config_value("optimizer.betas"))
+                )
             )
             optimizer_record["eps"] = copy.deepcopy(
-                optimizer_cfg.get("eps", 1e-8)
+                optimizer_cfg.get("eps", _default_config_value("optimizer.eps"))
             )
 
         training_record["optimizer"] = optimizer_record
@@ -759,11 +824,18 @@ def _build_config_record(
     record["training"] = training_record
 
     # 4. 聚合配置
-    agg_cfg = as_mapping(raw.get("agg"))
+    agg_cfg = _deep_merge(
+        base=_default_config_value("agg"),
+        override=as_mapping(raw.get("agg")),
+    )
     aggregation_record: Dict[str, Any] = {}
 
-    non_expert_cfg = as_mapping(agg_cfg.get("non_expert"))
-    expert_cfg = as_mapping(agg_cfg.get("expert"))
+    non_expert_cfg = as_mapping(
+        agg_cfg.get("non_expert", _default_config_value("agg.non_expert"))
+    )
+    expert_cfg = as_mapping(
+        agg_cfg.get("expert", _default_config_value("agg.expert"))
+    )
     if non_expert_cfg.get("method") is not None:
         aggregation_record["non_expert"] = copy.deepcopy(
             non_expert_cfg["method"]
@@ -780,51 +852,76 @@ def _build_config_record(
 
     # 5. 可复现性配置：False 也是有效实验设置，必须显式记录。
     record["reproducibility"] = {
-        "seed": copy.deepcopy(raw.get("seed")),
-        "deterministic": _cfg_get_bool(raw, "deterministic", True),
+        "seed": copy.deepcopy(raw.get("seed", _default_config_value("seed"))),
+        "deterministic": _cfg_get_bool(
+            raw,
+            "deterministic",
+            _default_config_value("deterministic"),
+        ),
     }
 
     # 6. 运行环境：同时记录请求设备和本次实际解析出的设备。
     runtime_record: Dict[str, Any] = {
-        "device": copy.deepcopy(raw.get("device", "auto"))
+        "device": copy.deepcopy(
+            raw.get("device", _default_config_value("device"))
+        )
     }
     if resolved_device is not None:
         runtime_record["resolved_device"] = str(resolved_device)
     record["runtime"] = runtime_record
 
     # 7. Server Evidence：size=0 时也保留完整配置，明确表示该功能未启用。
-    evidence_cfg = as_mapping(raw.get("server_evidence"))
+    evidence_cfg = _deep_merge(
+        base=_default_config_value("server_evidence"),
+        override=as_mapping(raw.get("server_evidence")),
+    )
     record["server_evidence"] = {
-        "size": int(evidence_cfg.get("size", 0) or 0),
-        "batch_size": copy.deepcopy(evidence_cfg.get("batch_size", 256)),
+        "size": int(
+            evidence_cfg.get("size", _default_config_value("server_evidence.size")) or 0
+        ),
+        "batch_size": copy.deepcopy(
+            evidence_cfg.get(
+                "batch_size",
+                _default_config_value("server_evidence.batch_size"),
+            )
+        ),
         "class_balanced": _cfg_get_bool(
             evidence_cfg,
             "class_balanced",
-            True,
+            _default_config_value("server_evidence.class_balanced"),
         ),
     }
 
     # 8. 日志配置：True 和 False 均完整记录。
-    logging_cfg = as_mapping(raw.get("logging"))
+    logging_cfg = _deep_merge(
+        base=_default_config_value("logging"),
+        override=as_mapping(raw.get("logging")),
+    )
     record["logging"] = {
-        key: _cfg_get_bool(logging_cfg, key, default)
-        for key, default in (
-            ("save_config", True),
-            ("save_results_csv", True),
-            ("progress_bar", True),
-        )
+        key: _cfg_get_bool(logging_cfg, key, _default_config_value(f"logging.{key}"))
+        for key in ("save_config", "save_results_csv", "progress_bar")
     }
 
     # 9. 输出配置：包含实验命名策略，便于理解目录如何分配。
-    run_cfg = as_mapping(raw.get("run"))
+    run_cfg = _deep_merge(
+        base=_default_config_value("run"),
+        override=as_mapping(raw.get("run")),
+    )
     auto_generated = _cfg_get_bool(run_cfg, "_auto_generated", False)
-    unique_name = _cfg_get_bool(run_cfg, "unique_name", True)
-    overwrite = _cfg_get_bool(run_cfg, "overwrite", False)
-    output_record: Dict[str, Any] = {}
-    if raw.get("output_dir") is not None:
-        output_record["root"] = str(raw["output_dir"])
-    if raw.get("run_name") is not None:
-        output_record["run_name"] = str(raw["run_name"])
+    unique_name = _cfg_get_bool(
+        run_cfg,
+        "unique_name",
+        _default_config_value("run.unique_name"),
+    )
+    overwrite = _cfg_get_bool(
+        run_cfg,
+        "overwrite",
+        _default_config_value("run.overwrite"),
+    )
+    output_record: Dict[str, Any] = {
+        "root": str(raw.get("output_dir", _default_config_value("output_dir"))),
+        "run_name": str(raw.get("run_name", _default_config_value("run_name"))),
+    }
     output_record["auto_generated"] = auto_generated
     output_record["unique_name"] = unique_name
     output_record["effective_unique_name"] = (
@@ -910,7 +1007,7 @@ def _set_reserved_run_info(
 
     cfg["run_name"] = run_name
     cfg["run_dir"] = str(run_dir)
-    run_cfg = cfg.get("run", {})
+    run_cfg = cfg.get("run", _default_config_value("run"))
     if isinstance(run_cfg, Mapping) and not isinstance(run_cfg, MutableMapping):
         run_cfg = dict(run_cfg)
         cfg["run"] = run_cfg
@@ -933,8 +1030,8 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
         has_run_identity = hasattr(cfg, "output_dir") and hasattr(cfg, "run_name")
         output_dir = Path(getattr(cfg, "output_dir", run_dir.parent))
         run_name = str(getattr(cfg, "run_name", run_dir.name))
-        overwrite = cfg.get("run.overwrite", False)
-        unique_name = cfg.get("run.unique_name", True)
+        overwrite = cfg.get("run.overwrite", _default_config_value("run.overwrite"))
+        unique_name = cfg.get("run.unique_name", _default_config_value("run.unique_name"))
         auto_generated = cfg.get("run._auto_generated", False)
         directory_reserved = cfg.get("run._directory_reserved", False)
     else:
@@ -942,11 +1039,11 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
         has_run_identity = "output_dir" in cfg and "run_name" in cfg
         output_dir = Path(cfg.get("output_dir", run_dir.parent))
         run_name = str(cfg.get("run_name", run_dir.name))
-        run_cfg = cfg.get("run", {})
+        run_cfg = cfg.get("run", _default_config_value("run"))
         if not isinstance(run_cfg, Mapping):
             raise ConfigError("run 必须是 dict。")
-        overwrite = run_cfg.get("overwrite", False)
-        unique_name = run_cfg.get("unique_name", True)
+        overwrite = run_cfg.get("overwrite", _default_config_value("run.overwrite"))
+        unique_name = run_cfg.get("unique_name", _default_config_value("run.unique_name"))
         auto_generated = run_cfg.get("_auto_generated", False)
         directory_reserved = run_cfg.get("_directory_reserved", False)
 
@@ -1137,7 +1234,7 @@ def _apply_config_overrides(
 def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """应用公共默认值，并将数据划分配置规范化为嵌套结构。"""
     explicit_cfg = copy.deepcopy(dict(cfg))
-    cfg = _deep_merge(base=EMBEDDED_BASE_CONFIG, override=explicit_cfg)
+    cfg = _deep_merge(base=DEFAULT_CONFIG, override=explicit_cfg)
 
     # 标准配置结构：
     #   partition.method
@@ -1156,23 +1253,23 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(explicit_dirichlet, Mapping):
         raise ConfigError("partition.dirichlet 必须是 dict。")
 
-    default_partition = copy.deepcopy(EMBEDDED_BASE_CONFIG["partition"])
-    default_dirichlet = default_partition.get("dirichlet", {})
+    default_partition = copy.deepcopy(DEFAULT_CONFIG["partition"])
+    default_dirichlet = default_partition["dirichlet"]
 
     partition_method = explicit_partition.get(
         "method",
         explicit_cfg.get(
             "partition_method",
-            default_partition.get("method", "dirichlet"),
+            default_partition["method"],
         ),
     )
     dirichlet_alpha = explicit_dirichlet.get(
         "alpha",
-        explicit_cfg.get("alpha", default_dirichlet.get("alpha", 0.1)),
+        explicit_cfg.get("alpha", default_dirichlet["alpha"]),
     )
     sample_balance = explicit_dirichlet.get(
         "sample_balance",
-        default_dirichlet.get("sample_balance", "balanced"),
+        default_dirichlet["sample_balance"],
     )
 
     normalized_partition = _deep_merge(
@@ -1217,7 +1314,7 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """
     cfg = copy.deepcopy(cfg)
 
-    raw_run_name = cfg.get("run_name", "auto")
+    raw_run_name = cfg.get("run_name", _default_config_value("run_name"))
     should_auto_name = _is_auto_run_name(raw_run_name)
 
     if should_auto_name:
@@ -1225,13 +1322,13 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     else:
         run_name = _safe_name(raw_run_name)
 
-    output_dir = Path(cfg.get("output_dir", "outputs_bias"))
-    run_cfg = cfg.get("run", {})
+    output_dir = Path(cfg.get("output_dir", _default_config_value("output_dir")))
+    run_cfg = cfg.get("run", _default_config_value("run"))
     if not isinstance(run_cfg, Mapping):
         raise ConfigError("run 必须是 dict。")
 
-    unique_name = run_cfg.get("unique_name", True)
-    overwrite = run_cfg.get("overwrite", False)
+    unique_name = run_cfg.get("unique_name", _default_config_value("run.unique_name"))
+    overwrite = run_cfg.get("overwrite", _default_config_value("run.overwrite"))
 
     _require_bool_value(unique_name, "run.unique_name")
     _require_bool_value(overwrite, "run.overwrite")
@@ -1270,9 +1367,9 @@ def _build_auto_run_name(cfg: Mapping[str, Any]) -> str:
 
     完整实验参数统一保存在 config_used.yaml 中。
     """
-    agg_cfg = cfg.get("agg", {})
-    expert_cfg = agg_cfg.get("expert", {})
-    expert_method = expert_cfg.get("method", "expert")
+    agg_cfg = cfg.get("agg", _default_config_value("agg"))
+    expert_cfg = agg_cfg.get("expert", _default_config_value("agg.expert"))
+    expert_method = expert_cfg.get("method", _default_config_value("agg.expert.method"))
 
     if not isinstance(expert_method, str) or not expert_method.strip():
         raise ConfigError(
@@ -1335,8 +1432,9 @@ def _infer_num_classes(dataset: str) -> int:
     dataset_name = normalize_dataset_name(dataset)
     info = DATASET_INFO.get(dataset_name)
     if info is None:
-        # 数据集合法性检查会给出更明确的错误信息。
-        return 10
+        raise ConfigError(
+            f"无法根据数据集 {dataset_name!r} 推断类别数量。"
+        )
     return int(info["num_classes"])
 
 
@@ -1365,7 +1463,7 @@ def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
     对旧版配置中已固定或不再支持的字段显式报错，
     避免过期 YAML 文件静默改变框架的固定日志行为。
     """
-    logging_cfg = cfg.get("logging", {})
+    logging_cfg = cfg.get("logging", _default_config_value("logging"))
     if not isinstance(logging_cfg, Mapping):
         raise ConfigError("logging 必须是 dict。")
 
@@ -1398,7 +1496,7 @@ def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
     }
     for key in supported_keys:
         _require_bool_value(
-            logging_cfg.get(key, True),
+            logging_cfg.get(key, _default_config_value(f"logging.{key}")),
             f"logging.{key}",
         )
 
@@ -1431,7 +1529,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             "顶层 model 选择字段已移除；当前模型由 model_builder 决定。"
         )
 
-    model_cfg = cfg.get("model_cfg", {})
+    model_cfg = cfg.get("model_cfg", _default_config_value("model_cfg"))
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
 
@@ -1444,7 +1542,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         if key in cfg:
             _require_bool_value(cfg[key], key)
     _require_bool_value(
-        cfg.get("pin_memory"),
+        cfg.get("pin_memory", _default_config_value("pin_memory")),
         "pin_memory",
         allow_none=True,
     )
@@ -1459,13 +1557,27 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"{sorted(removed_model_fields)}。当前使用 SwitchViT 的 model_cfg。"
         )
 
-    method_config = cfg.get("method_config", {})
+    method_config = cfg.get(
+        "method_config",
+        _default_config_value("method_config"),
+    )
     if not isinstance(method_config, Mapping):
         raise ConfigError("method_config 必须是 dict。")
 
-    agg_cfg = cfg.get("agg", {})
-    non_expert_method = agg_cfg.get("non_expert", {}).get("method")
-    expert_method = agg_cfg.get("expert", {}).get("method")
+    agg_cfg = cfg.get("agg", _default_config_value("agg"))
+    if isinstance(agg_cfg, Mapping):
+        agg_cfg = _deep_merge(
+            base=_default_config_value("agg"),
+            override=agg_cfg,
+        )
+    non_expert_cfg = agg_cfg.get(
+        "non_expert", _default_config_value("agg.non_expert")
+    )
+    expert_cfg = agg_cfg.get(
+        "expert", _default_config_value("agg.expert")
+    )
+    non_expert_method = non_expert_cfg.get("method")
+    expert_method = expert_cfg.get("method")
 
     if str(non_expert_method).lower().strip() != "uniform":
         raise ConfigError(
@@ -1483,9 +1595,9 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_positive_int(cfg, "num_clients")
     _require_positive_int(cfg, "rounds")
     _require_non_negative_int(cfg, "local_epochs")
-    local_steps = cfg.get("local_steps", None)
+    local_steps = cfg.get("local_steps", _default_config_value("local_steps"))
     if local_steps is None:
-        if int(cfg.get("local_epochs", 0)) <= 0:
+        if int(cfg.get("local_epochs", _default_config_value("local_epochs"))) <= 0:
             raise ConfigError(
                 "local_steps 未设置时，local_epochs 必须是正整数。"
             )
@@ -1496,16 +1608,23 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_non_negative_int(cfg, "num_workers")
     _require_positive_int(cfg, "num_experts")
 
-    server_evidence_cfg = cfg.get("server_evidence", {})
+    server_evidence_cfg = cfg.get(
+        "server_evidence", _default_config_value("server_evidence")
+    )
     if not isinstance(server_evidence_cfg, Mapping):
         raise ConfigError("server_evidence 必须是 dict。")
 
     _require_bool_value(
-        server_evidence_cfg.get("class_balanced", True),
+        server_evidence_cfg.get(
+            "class_balanced",
+            _default_config_value("server_evidence.class_balanced"),
+        ),
         "server_evidence.class_balanced",
     )
 
-    server_evidence_size = server_evidence_cfg.get("size", 0)
+    server_evidence_size = server_evidence_cfg.get(
+        "size", _default_config_value("server_evidence.size")
+    )
     if (
         isinstance(server_evidence_size, bool)
         or not isinstance(server_evidence_size, int)
@@ -1516,7 +1635,9 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前值：{server_evidence_size}"
         )
 
-    server_evidence_batch_size = server_evidence_cfg.get("batch_size", 256)
+    server_evidence_batch_size = server_evidence_cfg.get(
+        "batch_size", _default_config_value("server_evidence.batch_size")
+    )
     if (
         isinstance(server_evidence_batch_size, bool)
         or not isinstance(server_evidence_batch_size, int)
@@ -1527,28 +1648,36 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前值：{server_evidence_batch_size}"
         )
 
-    frac = float(cfg.get("frac"))
+    frac = float(cfg.get("frac", _default_config_value("frac")))
     if not (0.0 < frac <= 1.0):
         raise ConfigError(f"frac 必须在 (0, 1] 范围内，当前值：{frac}")
 
-    partition_cfg = cfg.get("partition", {})
+    partition_cfg = cfg.get(
+        "partition", _default_config_value("partition")
+    )
     if not isinstance(partition_cfg, Mapping):
         raise ConfigError("partition 必须是 dict。")
 
     partition_method = str(
-        partition_cfg.get("method", "dirichlet")
+        partition_cfg.get("method", _default_config_value("partition.method"))
     ).strip().lower()
     if partition_method not in {"iid", "dirichlet"}:
         raise ConfigError(
             f"不支持的数据划分方法：{partition_method}。当前支持：iid, dirichlet"
         )
 
-    dirichlet_cfg = partition_cfg.get("dirichlet", {})
+    dirichlet_cfg = partition_cfg.get(
+        "dirichlet", _default_config_value("partition.dirichlet")
+    )
     if not isinstance(dirichlet_cfg, Mapping):
         raise ConfigError("partition.dirichlet 必须是 dict。")
 
     if partition_method == "dirichlet":
-        alpha = float(dirichlet_cfg.get("alpha"))
+        alpha = float(
+            dirichlet_cfg.get(
+                "alpha", _default_config_value("partition.dirichlet.alpha")
+            )
+        )
         if not math.isfinite(alpha) or alpha <= 0:
             raise ConfigError(
                 "partition.dirichlet.alpha 必须是有限的正数，"
@@ -1556,7 +1685,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             )
 
         sample_balance = str(
-            dirichlet_cfg.get("sample_balance", "balanced")
+            dirichlet_cfg.get(
+                "sample_balance",
+                _default_config_value("partition.dirichlet.sample_balance"),
+            )
         ).strip().lower()
         if sample_balance not in {"balanced", "unbalanced"}:
             raise ConfigError(
@@ -1578,14 +1710,14 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
                 f"请统一写到 optimizer.{key} 下面。"
             )
 
-    optimizer_cfg = cfg.get("optimizer", {})
+    optimizer_cfg = cfg.get("optimizer", _default_config_value("optimizer"))
     if not isinstance(optimizer_cfg, Mapping):
         raise ConfigError("optimizer 必须是 dict。")
     _require_bool_value(
-        optimizer_cfg.get("nesterov", False),
+        optimizer_cfg.get("nesterov", _default_config_value("optimizer.nesterov")),
         "optimizer.nesterov",
     )
-    optimizer_type = optimizer_cfg.get("type")
+    optimizer_type = optimizer_cfg.get("type", _default_config_value("optimizer.type"))
 
     if optimizer_type not in {"sgd", "adam", "adamw"}:
         raise ConfigError(
@@ -1593,27 +1725,27 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前支持：sgd, adam, adamw"
         )
 
-    lr = float(optimizer_cfg.get("lr"))
+    lr = float(optimizer_cfg.get("lr", _default_config_value("optimizer.lr")))
     if not math.isfinite(lr) or lr <= 0:
         raise ConfigError(
             f"optimizer.lr 必须是有限的正数，当前值：{lr}"
         )
 
-    weight_decay = float(optimizer_cfg.get("weight_decay"))
+    weight_decay = float(optimizer_cfg.get("weight_decay", _default_config_value("optimizer.weight_decay")))
     if not math.isfinite(weight_decay) or weight_decay < 0:
         raise ConfigError(
             f"optimizer.weight_decay 必须是有限的非负数，当前值：{weight_decay}"
         )
 
-    run_cfg = cfg.get("run", {})
+    run_cfg = cfg.get("run", _default_config_value("run"))
     if not isinstance(run_cfg, Mapping):
         raise ConfigError("run 必须是 dict。")
     _require_bool_value(
-        run_cfg.get("unique_name", True),
+        run_cfg.get("unique_name", _default_config_value("run.unique_name")),
         "run.unique_name",
     )
     _require_bool_value(
-        run_cfg.get("overwrite", False),
+        run_cfg.get("overwrite", _default_config_value("run.overwrite")),
         "run.overwrite",
     )
 
@@ -1705,7 +1837,7 @@ def disable_tf32() -> None:
 
 def set_seed(
     seed: int,
-    deterministic: bool = True,
+    deterministic: bool = DEFAULT_CONFIG["deterministic"],
     benchmark: Optional[bool] = None,
 ) -> None:
     """
@@ -3316,8 +3448,14 @@ def apply_server_evidence_holdout(
     train_evidence 数据集对象。启用后，相同索引会从客户端训练数据视图中移除，
     保留的子集则从确定性的 train_evidence_dataset 视图中提取。
     """
-    evidence_cfg = _cfg_get(cfg, "server_evidence", {})
-    evidence_size = int(_cfg_get(evidence_cfg, "size", 0))
+    evidence_cfg = _cfg_get(
+        cfg,
+        "server_evidence",
+        _default_config_value("server_evidence"),
+    )
+    evidence_size = int(
+        _cfg_get(evidence_cfg, "size", _default_config_value("server_evidence.size"))
+    )
 
     if evidence_size <= 0:
         return bundle
@@ -3335,7 +3473,9 @@ def apply_server_evidence_holdout(
             f"size={evidence_size}, train_size={train_size}"
         )
 
-    num_clients = int(_cfg_get(cfg, "num_clients", 1))
+    num_clients = int(
+        _cfg_get(cfg, "num_clients", _default_config_value("num_clients"))
+    )
     if train_size - evidence_size < num_clients:
         raise ValueError(
             "server evidence holdout 后剩余训练样本少于客户端数量："
@@ -3343,8 +3483,12 @@ def apply_server_evidence_holdout(
         )
 
     targets = get_dataset_targets(bundle.train_evidence_dataset)
-    class_balanced = _cfg_get_bool(evidence_cfg, "class_balanced", True)
-    seed = int(_cfg_get(cfg, "seed", 0))
+    class_balanced = _cfg_get_bool(
+        evidence_cfg,
+        "class_balanced",
+        _default_config_value("server_evidence.class_balanced"),
+    )
+    seed = int(_cfg_get(cfg, "seed", _default_config_value("seed")))
 
     evidence_indices = select_server_evidence_indices(
         targets=targets,
@@ -3562,13 +3706,17 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
     num_clients = int(cfg.num_clients)
     seed = int(cfg.seed)
 
-    partition_cfg = _cfg_get(cfg, "partition", {})
+    partition_cfg = _cfg_get(cfg, "partition", _default_config_value("partition"))
     partition_method = str(
-        _cfg_get(partition_cfg, "method", "dirichlet")
+        _cfg_get(partition_cfg, "method", _default_config_value("partition.method"))
     ).strip().lower()
-    dirichlet_cfg = _cfg_get(partition_cfg, "dirichlet", {})
+    dirichlet_cfg = _cfg_get(
+        partition_cfg,
+        "dirichlet",
+        _default_config_value("partition.dirichlet"),
+    )
     sample_balance = str(
-        _cfg_get(dirichlet_cfg, "sample_balance", "balanced")
+        _cfg_get(dirichlet_cfg, "sample_balance", _default_config_value("partition.dirichlet.sample_balance"))
     ).strip().lower()
 
     targets = get_dataset_targets(dataset)
@@ -3584,8 +3732,8 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
         sample_balance = "none"
 
     elif partition_method == "dirichlet":
-        dirichlet_alpha = float(_cfg_get(dirichlet_cfg, "alpha", 0.1))
-        min_samples_per_client = int(_cfg_get(cfg, "min_samples_per_client", 1))
+        dirichlet_alpha = float(_cfg_get(dirichlet_cfg, "alpha", _default_config_value("partition.dirichlet.alpha")))
+        min_samples_per_client = int(_cfg_get(cfg, "min_samples_per_client", _default_config_value("min_samples_per_client")))
 
         if sample_balance == "balanced":
             client_indices = build_balanced_dirichlet_partition(
@@ -3596,7 +3744,7 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
                 min_samples_per_client=min_samples_per_client,
             )
         elif sample_balance == "unbalanced":
-            max_retries = int(_cfg_get(cfg, "partition_max_retries", 100))
+            max_retries = int(_cfg_get(cfg, "partition_max_retries", _default_config_value("partition_max_retries")))
             client_indices = build_dirichlet_partition(
                 targets=targets,
                 num_clients=num_clients,
@@ -4351,8 +4499,18 @@ def build_server_evidence_loader(
     if len(server_evidence_dataset) <= 0:
         raise ValueError("server_evidence_dataset 不能为空。")
 
-    evidence_cfg = _cfg_get(cfg, "server_evidence", {})
-    batch_size = int(_cfg_get(evidence_cfg, "batch_size", 256))
+    evidence_cfg = _cfg_get(
+        cfg,
+        "server_evidence",
+        _default_config_value("server_evidence"),
+    )
+    batch_size = int(
+        _cfg_get(
+            evidence_cfg,
+            "batch_size",
+            _default_config_value("server_evidence.batch_size"),
+        )
+    )
     persistent_workers = num_workers > 0
 
     return DataLoader(
@@ -4404,12 +4562,18 @@ def _infer_pin_memory(cfg: Any) -> bool:
         2. 如果 device 是 cuda 或 auto，就默认启用
         3. 如果 device 是 cpu，就默认关闭
     """
-    explicit_pin_memory = _cfg_get(cfg, "pin_memory", None)
+    explicit_pin_memory = _cfg_get(
+        cfg,
+        "pin_memory",
+        _default_config_value("pin_memory"),
+    )
     if explicit_pin_memory is not None:
         _require_bool_value(explicit_pin_memory, "pin_memory")
         return explicit_pin_memory
 
-    device = str(_cfg_get(cfg, "device", "auto")).lower()
+    device = str(
+        _cfg_get(cfg, "device", _default_config_value("device"))
+    ).lower()
     if device == "cpu":
         return False
 
@@ -4430,30 +4594,14 @@ ModelBuilder = Callable[[Any], nn.Module]
 # 模型包即可使用。配置中的 MoE Block 编号从 1 开始。
 # ============================================================================
 
-SWITCH_VIT_DEFAULT_MODEL_CFG: Dict[str, Any] = {
-    "transformer_layers": 6,
-    "hidden_dim": 256,
-    "attention_heads": 4,
-    "patch_size": 4,
-    "expert_hidden_dim": 1024,
-    "moe_block_indices": [2, 4, 6],
-    "routing": "top1",
-    "aux_loss_coef": 0.0,
-    "capacity_factor": 0.0,
-    "token_dropping": False,
-    "router_statistics": True,
-    "dropout": 0.0,
-}
-
-
 def _switch_model_config(cfg: Any) -> Dict[str, Any]:
-    raw = _cfg_get(cfg, "model_cfg", {})
+    raw = _cfg_get(cfg, "model_cfg", _default_config_value("model_cfg"))
     if hasattr(raw, "to_dict"):
         raw = raw.to_dict()
     if not isinstance(raw, Mapping):
         raise TypeError("model_cfg 必须是 Mapping。")
     return _deep_merge(
-        base=SWITCH_VIT_DEFAULT_MODEL_CFG,
+        base=DEFAULT_CONFIG["model_cfg"],
         override=dict(raw),
     )
 
@@ -4465,7 +4613,7 @@ class SwitchFeedForward(nn.Module):
         self,
         hidden_dim: int,
         expert_hidden_dim: int,
-        dropout: float = 0.0,
+        dropout: float = DEFAULT_CONFIG["model_cfg"]["dropout"],
     ) -> None:
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim, expert_hidden_dim)
@@ -4488,7 +4636,7 @@ class SwitchExpert(nn.Module):
         self,
         hidden_dim: int,
         expert_hidden_dim: int,
-        dropout: float = 0.0,
+        dropout: float = DEFAULT_CONFIG["model_cfg"]["dropout"],
     ) -> None:
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim, expert_hidden_dim)
@@ -4541,11 +4689,13 @@ class SwitchMoE(nn.Module):
         hidden_dim: int,
         expert_hidden_dim: int,
         num_experts: int,
-        dropout: float = 0.0,
-        collect_router_statistics: bool = True,
-        aux_loss_coef: float = 0.0,
-        capacity_factor: float = 0.0,
-        token_dropping: bool = False,
+        dropout: float = DEFAULT_CONFIG["model_cfg"]["dropout"],
+        collect_router_statistics: bool = (
+            DEFAULT_CONFIG["model_cfg"]["router_statistics"]
+        ),
+        aux_loss_coef: float = DEFAULT_CONFIG["model_cfg"]["aux_loss_coef"],
+        capacity_factor: float = DEFAULT_CONFIG["model_cfg"]["capacity_factor"],
+        token_dropping: bool = DEFAULT_CONFIG["model_cfg"]["token_dropping"],
     ) -> None:
         super().__init__()
         if not _is_positive_int_value(num_experts):
@@ -4810,11 +4960,13 @@ class SwitchTransformerBlock(nn.Module):
         expert_hidden_dim: int,
         num_experts: int,
         use_moe: bool,
-        dropout: float = 0.0,
-        collect_router_statistics: bool = True,
-        aux_loss_coef: float = 0.0,
-        capacity_factor: float = 0.0,
-        token_dropping: bool = False,
+        dropout: float = DEFAULT_CONFIG["model_cfg"]["dropout"],
+        collect_router_statistics: bool = (
+            DEFAULT_CONFIG["model_cfg"]["router_statistics"]
+        ),
+        aux_loss_coef: float = DEFAULT_CONFIG["model_cfg"]["aux_loss_coef"],
+        capacity_factor: float = DEFAULT_CONFIG["model_cfg"]["capacity_factor"],
+        token_dropping: bool = DEFAULT_CONFIG["model_cfg"]["token_dropping"],
     ) -> None:
         super().__init__()
         self.use_moe = bool(use_moe)
@@ -4873,30 +5025,28 @@ class SwitchViT(nn.Module):
     """
     用于图像分类的 Switch ViT。
 
-    CIFAR 默认配置：
-      - 6 个 Transformer Block，隐藏维度为 256，包含 4 个 Attention Head。
-      - 使用 4×4 Patch 和 1 个 CLS Token；对于 32×32 图像共生成 65 个 Token。
-      - 第 2、4、6 个 Block 使用 MoE FFN，第 1、3、5 个 Block 使用 Dense FFN。
-      - 每个 MoE 层包含 4 个 Expert，每个 Expert 的隐藏维度为 1024。
-      - 使用 Top-1 Routing；默认关闭 Auxiliary Loss、Expert Capacity 和 Token Dropping。
+    架构默认参数统一由 DEFAULT_CONFIG["model_cfg"] 提供；
+    数据集类别数和输入尺寸由数据集注册信息推导。
     """
 
     def __init__(
         self,
         num_classes: int,
         input_shape: Sequence[int],
-        transformer_layers: int = 6,
-        hidden_dim: int = 256,
-        attention_heads: int = 4,
-        patch_size: int = 4,
-        expert_hidden_dim: int = 1024,
-        num_experts: int = 4,
-        moe_block_indices: Sequence[int] = (2, 4, 6),
-        dropout: float = 0.0,
-        router_statistics: bool = True,
-        aux_loss_coef: float = 0.0,
-        capacity_factor: float = 0.0,
-        token_dropping: bool = False,
+        transformer_layers: int = DEFAULT_CONFIG["model_cfg"]["transformer_layers"],
+        hidden_dim: int = DEFAULT_CONFIG["model_cfg"]["hidden_dim"],
+        attention_heads: int = DEFAULT_CONFIG["model_cfg"]["attention_heads"],
+        patch_size: int = DEFAULT_CONFIG["model_cfg"]["patch_size"],
+        expert_hidden_dim: int = DEFAULT_CONFIG["model_cfg"]["expert_hidden_dim"],
+        num_experts: int = DEFAULT_CONFIG["num_experts"],
+        moe_block_indices: Sequence[int] = tuple(
+            DEFAULT_CONFIG["model_cfg"]["moe_block_indices"]
+        ),
+        dropout: float = DEFAULT_CONFIG["model_cfg"]["dropout"],
+        router_statistics: bool = DEFAULT_CONFIG["model_cfg"]["router_statistics"],
+        aux_loss_coef: float = DEFAULT_CONFIG["model_cfg"]["aux_loss_coef"],
+        capacity_factor: float = DEFAULT_CONFIG["model_cfg"]["capacity_factor"],
+        token_dropping: bool = DEFAULT_CONFIG["model_cfg"]["token_dropping"],
     ) -> None:
         super().__init__()
 
@@ -5059,7 +5209,7 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
     """根据公共实验配置构建默认 SwitchViT 模型。"""
     model_cfg = _switch_model_config(cfg)
 
-    if str(model_cfg.get("routing", "top1")).strip().lower() != "top1":
+    if str(model_cfg["routing"]).strip().lower() != "top1":
         raise ValueError("当前 SwitchViT 仅实现 Top-1 Routing。")
 
     # MoE 自身的选项约束由 SwitchMoE.__init__ 统一负责。
@@ -5068,13 +5218,32 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
     aux_loss_coef = model_cfg["aux_loss_coef"]
     capacity_factor = model_cfg["capacity_factor"]
 
-    num_experts = _cfg_get(cfg, "num_experts", 4)
-    input_shape = _cfg_get(cfg, "input_shape", (3, 32, 32))
+    num_experts = _cfg_get(
+        cfg,
+        "num_experts",
+        _default_config_value("num_experts"),
+    )
+    dataset_name = normalize_dataset_name(
+        _cfg_get(cfg, "dataset", _default_config_value("dataset"))
+    )
+    dataset_info = DATASET_INFO.get(dataset_name)
+    if dataset_info is None:
+        raise ValueError(
+            f"无法根据数据集 {dataset_name!r} 推断模型输入尺寸和类别数量。"
+        )
+
+    input_shape = _cfg_get(cfg, "input_shape", None)
+    if input_shape is None:
+        input_shape = tuple(dataset_info["input_shape"])
     if not isinstance(input_shape, (tuple, list)):
         raise TypeError("input_shape 必须是包含 channels、height、width 的序列。")
 
+    num_classes = _cfg_get(cfg, "num_classes", None)
+    if num_classes is None:
+        num_classes = int(dataset_info["num_classes"])
+
     return SwitchViT(
-        num_classes=int(_cfg_get(cfg, "num_classes", 10)),
+        num_classes=int(num_classes),
         input_shape=input_shape,
         transformer_layers=int(model_cfg["transformer_layers"]),
         hidden_dim=int(model_cfg["hidden_dim"]),
@@ -5083,7 +5252,7 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
         expert_hidden_dim=int(model_cfg["expert_hidden_dim"]),
         num_experts=num_experts,
         moe_block_indices=model_cfg["moe_block_indices"],
-        dropout=float(model_cfg.get("dropout", 0.0)),
+        dropout=float(model_cfg["dropout"]),
         router_statistics=router_statistics,
         aux_loss_coef=aux_loss_coef,
         capacity_factor=capacity_factor,
@@ -6404,8 +6573,10 @@ class FLClient:
         local_model.train()
 
         criterion = build_criterion(self.cfg)
-        local_epochs = int(_cfg_get(self.cfg, "local_epochs", 5))
-        configured_local_steps = _cfg_get(self.cfg, "local_steps", None)
+        local_epochs = int(
+            _cfg_get(self.cfg, "local_epochs", _default_config_value("local_epochs"))
+        )
+        configured_local_steps = _cfg_get(self.cfg, "local_steps", _default_config_value("local_steps"))
         local_steps = (
             None if configured_local_steps is None
             else int(configured_local_steps)
@@ -6434,7 +6605,7 @@ class FLClient:
             # 专家算法路径：non_expert 使用原优化器，expert 交给注入策略。
             optimization_groups = build_federated_optimization_groups(
                 model=local_model,
-                expected_num_experts=int(_cfg_get(self.cfg, "num_experts", 0)),
+                expected_num_experts=int(_cfg_get(self.cfg, "num_experts", _default_config_value("num_experts"))),
                 strict=True,
             )
             optimizer = build_optimizer(
@@ -7009,7 +7180,9 @@ def build_criterion(cfg: Any) -> nn.Module:
 
     第一版只使用 CrossEntropyLoss。
     """
-    label_smoothing = float(_cfg_get(cfg, "label_smooth", 0.0))
+    label_smoothing = float(
+        _cfg_get(cfg, "label_smooth", _default_config_value("label_smooth"))
+    )
 
     return nn.CrossEntropyLoss(
         label_smoothing=label_smoothing,
@@ -7030,10 +7203,20 @@ def build_optimizer(
         adamw
     """
     optimizer_type = get_optimizer_type(cfg)
-    optimizer_cfg = _cfg_get(cfg, "optimizer", {})
+    optimizer_cfg = _cfg_get(
+        cfg, "optimizer", _default_config_value("optimizer")
+    )
 
-    lr = float(_cfg_get(optimizer_cfg, "lr", 0.01))
-    weight_decay = float(_cfg_get(optimizer_cfg, "weight_decay", 0.0005))
+    lr = float(
+        _cfg_get(optimizer_cfg, "lr", _default_config_value("optimizer.lr"))
+    )
+    weight_decay = float(
+        _cfg_get(
+            optimizer_cfg,
+            "weight_decay",
+            _default_config_value("optimizer.weight_decay"),
+        )
+    )
 
     if param_names is None:
         params = [
@@ -7066,8 +7249,18 @@ def build_optimizer(
         raise ValueError("模型没有可训练参数。")
 
     if optimizer_type == "sgd":
-        momentum = float(_cfg_get(optimizer_cfg, "momentum", 0.9))
-        nesterov = _cfg_get_bool(optimizer_cfg, "nesterov", False)
+        momentum = float(
+            _cfg_get(
+                optimizer_cfg,
+                "momentum",
+                _default_config_value("optimizer.momentum"),
+            )
+        )
+        nesterov = _cfg_get_bool(
+            optimizer_cfg,
+            "nesterov",
+            _default_config_value("optimizer.nesterov"),
+        )
 
         return optim.SGD(
             params,
@@ -7078,8 +7271,18 @@ def build_optimizer(
         )
 
     if optimizer_type == "adam":
-        betas = _cfg_get(optimizer_cfg, "betas", (0.9, 0.999))
-        eps = float(_cfg_get(optimizer_cfg, "eps", 1e-8))
+        betas = _cfg_get(
+            optimizer_cfg,
+            "betas",
+            _default_config_value("optimizer.betas"),
+        )
+        eps = float(
+            _cfg_get(
+                optimizer_cfg,
+                "eps",
+                _default_config_value("optimizer.eps"),
+            )
+        )
 
         return optim.Adam(
             params,
@@ -7090,8 +7293,18 @@ def build_optimizer(
         )
 
     if optimizer_type == "adamw":
-        betas = _cfg_get(optimizer_cfg, "betas", (0.9, 0.999))
-        eps = float(_cfg_get(optimizer_cfg, "eps", 1e-8))
+        betas = _cfg_get(
+            optimizer_cfg,
+            "betas",
+            _default_config_value("optimizer.betas"),
+        )
+        eps = float(
+            _cfg_get(
+                optimizer_cfg,
+                "eps",
+                _default_config_value("optimizer.eps"),
+            )
+        )
 
         return optim.AdamW(
             params,
@@ -7111,8 +7324,10 @@ def get_optimizer_type(cfg: Any) -> str:
     """
     从配置中读取优化器类型。
     """
-    optimizer_cfg = _cfg_get(cfg, "optimizer", {})
-    optimizer_type = _cfg_get(optimizer_cfg, "type", "sgd")
+    optimizer_cfg = _cfg_get(
+        cfg, "optimizer", _default_config_value("optimizer")
+    )
+    optimizer_type = _cfg_get(optimizer_cfg, "type", _default_config_value("optimizer.type"))
 
     return str(optimizer_type).lower().strip()
 
@@ -7264,19 +7479,21 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
 
     如果没有配置，则返回 None。
     """
-    optimizer_cfg = _cfg_get(cfg, "optimizer", {})
+    optimizer_cfg = _cfg_get(
+        cfg, "optimizer", _default_config_value("optimizer")
+    )
 
     value = _cfg_get(
         optimizer_cfg,
         "grad_clip",
-        None,
+        _default_config_value("grad_clip"),
     )
 
     if value is None:
         value = _cfg_get(
             cfg,
             "grad_clip",
-            None,
+            _default_config_value("grad_clip"),
         )
 
     if value is None:
@@ -7803,7 +8020,7 @@ class FLServer:
 
         self.param_groups = build_param_groups(
             model=self.global_model,
-            expected_num_experts=int(_cfg_get(cfg, "num_experts", 0)),
+            expected_num_experts=int(_cfg_get(cfg, "num_experts", _default_config_value("num_experts"))),
             strict=True,
         )
         self.optimization_groups = build_federated_optimization_groups(
@@ -7920,11 +8137,11 @@ class FLServer:
             6. 在服务器测试集评估
             7. 记录 RoundResult
         """
-        rounds = int(_cfg_get(self.cfg, "rounds", 50))
-        frac = float(_cfg_get(self.cfg, "frac", 1.0))
-        seed = int(_cfg_get(self.cfg, "seed", 0))
+        rounds = int(_cfg_get(self.cfg, "rounds", _default_config_value("rounds")))
+        frac = float(_cfg_get(self.cfg, "frac", _default_config_value("frac")))
+        seed = int(_cfg_get(self.cfg, "seed", _default_config_value("seed")))
 
-        logging_cfg = _cfg_get(self.cfg, "logging", {})
+        logging_cfg = _cfg_get(self.cfg, "logging", _default_config_value("logging"))
 
         # 日志行为固定：每轮记录，不提供配置入口。
         log_every = 1
@@ -7936,7 +8153,7 @@ class FLServer:
         progress_bar_enabled = _cfg_get_bool(
             logging_cfg,
             "progress_bar",
-            True,
+            _default_config_value("logging.progress_bar"),
         )
 
         if rounds <= 0:
@@ -7991,8 +8208,10 @@ class FLServer:
 
                 # Epoch 模式下，每个客户端的实际更新次数由 DataLoader 长度决定。
                 # 在开始本轮本地训练前先检查，避免完成昂贵训练后才发现步数不一致。
-                if _cfg_get(self.cfg, "local_steps", None) is None:
-                    local_epochs = int(_cfg_get(self.cfg, "local_epochs", 5))
+                if _cfg_get(self.cfg, "local_steps", _default_config_value("local_steps")) is None:
+                    local_epochs = int(
+            _cfg_get(self.cfg, "local_epochs", _default_config_value("local_epochs"))
+        )
                     planned_steps_by_client = {
                         int(client.client_id): (
                             local_epochs * len(client.train_loader)
@@ -8328,19 +8547,29 @@ class FLServer:
         print("[Server] FL training start")
         print(f"[Server] device: {self.device}")
         print(f"[Server] num_clients: {len(self.clients)}")
-        print(f"[Server] rounds: {int(_cfg_get(self.cfg, 'rounds', 50))}")
-        local_steps = _cfg_get(self.cfg, "local_steps", None)
+        rounds = int(
+            _cfg_get(self.cfg, "rounds", _default_config_value("rounds"))
+        )
+        local_steps = _cfg_get(
+            self.cfg,
+            "local_steps",
+            _default_config_value("local_steps"),
+        )
+        local_epochs = int(
+            _cfg_get(self.cfg, "local_epochs", _default_config_value("local_epochs"))
+        )
+        frac = float(
+            _cfg_get(self.cfg, "frac", _default_config_value("frac"))
+        )
+        print(f"[Server] rounds: {rounds}")
         if local_steps is None:
-            print(
-                "[Server] local_training: "
-                f"epochs={int(_cfg_get(self.cfg, 'local_epochs', 5))}"
-            )
+            print(f"[Server] local_training: epochs={local_epochs}")
         else:
             print(
-                "[Server] local_training: "
-                f"steps={int(local_steps)} (local_epochs ignored)"
+                f"[Server] local_training: steps={int(local_steps)} "
+                "(local_epochs ignored)"
             )
-        print(f"[Server] frac: {float(_cfg_get(self.cfg, 'frac', 1.0))}")
+        print(f"[Server] frac: {frac}")
         model_type = type(self.global_model)
         print(
             "[Server] model_type: "
@@ -9033,7 +9262,9 @@ def resolve_device(cfg: Any) -> torch.device:
         cuda
         mps
     """
-    device_name = str(_cfg_get(cfg, "device", "auto")).lower().strip()
+    device_name = str(
+        _cfg_get(cfg, "device", _default_config_value("device"))
+    ).lower().strip()
 
     if device_name == "auto":
         if torch.cuda.is_available():
@@ -9125,7 +9356,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
         "--dirichlet-sample-balance",
         choices=("balanced", "unbalanced"),
         default=None,
-        help="Dirichlet 客户端样本数均衡策略；默认 unbalanced。",
+        help="Dirichlet 客户端样本数均衡策略；覆盖 partition.dirichlet.sample_balance。",
     )
     parser.add_argument("--frac", type=float, default=None)
     parser.add_argument("--rounds", type=int, default=None)
@@ -9329,7 +9560,10 @@ def main(
     )
 
     configured_non_expert_method = str(
-        cfg.get("agg.non_expert.method", "uniform")
+        cfg.get(
+            "agg.non_expert.method",
+            _default_config_value("agg.non_expert.method"),
+        )
     ).lower().strip()
     if configured_non_expert_method != "uniform":
         raise ValueError(
@@ -9338,7 +9572,10 @@ def main(
         )
 
     configured_expert_method = str(
-        cfg.get("agg.expert.method", "")
+        cfg.get(
+            "agg.expert.method",
+            _default_config_value("agg.expert.method"),
+        )
     ).lower().strip()
     if configured_expert_method != expert_method_name.lower().strip():
         raise ValueError(
@@ -9348,7 +9585,11 @@ def main(
 
     set_seed(
         seed=int(cfg.seed),
-        deterministic=_cfg_get_bool(cfg, "deterministic", True),
+        deterministic=_cfg_get_bool(
+            cfg,
+            "deterministic",
+            _default_config_value("deterministic"),
+        ),
     )
 
     run_dir = Path(ensure_run_dir(cfg))
