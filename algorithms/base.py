@@ -623,8 +623,8 @@ def _build_config_record(
         if value is not None:
             data_cfg[record_key] = copy.deepcopy(value)
 
-    data_cfg["augmentation"] = bool(raw.get("data_augmentation", True))
-    data_cfg["download"] = bool(raw.get("download_data", True))
+    data_cfg["augmentation"] = _cfg_get_bool(raw, "data_augmentation", True)
+    data_cfg["download"] = _cfg_get_bool(raw, "download_data", True)
 
     partition_cfg = as_mapping(raw.get("partition"))
     partition_method = str(
@@ -653,7 +653,7 @@ def _build_config_record(
     # drop_last 仅控制客户端训练 loader；测试和 Evidence loader 固定为 False。
     num_workers = int(raw.get("num_workers", 0) or 0)
     data_cfg["loader"] = {
-        "client_train_drop_last": bool(raw.get("drop_last", False)),
+        "client_train_drop_last": _cfg_get_bool(raw, "drop_last", False),
         "pin_memory": _infer_pin_memory(raw),
         "persistent_workers": num_workers > 0,
     }
@@ -741,8 +741,10 @@ def _build_config_record(
             optimizer_record["momentum"] = copy.deepcopy(
                 optimizer_cfg.get("momentum", 0.9)
             )
-            optimizer_record["nesterov"] = bool(
-                optimizer_cfg.get("nesterov", False)
+            optimizer_record["nesterov"] = _cfg_get_bool(
+                optimizer_cfg,
+                "nesterov",
+                False,
             )
         elif optimizer_name in {"adam", "adamw"}:
             optimizer_record["betas"] = copy.deepcopy(
@@ -779,7 +781,7 @@ def _build_config_record(
     # 5. 可复现性配置：False 也是有效实验设置，必须显式记录。
     record["reproducibility"] = {
         "seed": copy.deepcopy(raw.get("seed")),
-        "deterministic": bool(raw.get("deterministic", True)),
+        "deterministic": _cfg_get_bool(raw, "deterministic", True),
     }
 
     # 6. 运行环境：同时记录请求设备和本次实际解析出的设备。
@@ -795,13 +797,17 @@ def _build_config_record(
     record["server_evidence"] = {
         "size": int(evidence_cfg.get("size", 0) or 0),
         "batch_size": copy.deepcopy(evidence_cfg.get("batch_size", 256)),
-        "class_balanced": bool(evidence_cfg.get("class_balanced", True)),
+        "class_balanced": _cfg_get_bool(
+            evidence_cfg,
+            "class_balanced",
+            True,
+        ),
     }
 
     # 8. 日志配置：True 和 False 均完整记录。
     logging_cfg = as_mapping(raw.get("logging"))
     record["logging"] = {
-        key: bool(logging_cfg.get(key, default))
+        key: _cfg_get_bool(logging_cfg, key, default)
         for key, default in (
             ("save_config", True),
             ("save_results_csv", True),
@@ -811,9 +817,9 @@ def _build_config_record(
 
     # 9. 输出配置：包含实验命名策略，便于理解目录如何分配。
     run_cfg = as_mapping(raw.get("run"))
-    auto_generated = bool(run_cfg.get("_auto_generated", False))
-    unique_name = bool(run_cfg.get("unique_name", True))
-    overwrite = bool(run_cfg.get("overwrite", False))
+    auto_generated = _cfg_get_bool(run_cfg, "_auto_generated", False)
+    unique_name = _cfg_get_bool(run_cfg, "unique_name", True)
+    overwrite = _cfg_get_bool(run_cfg, "overwrite", False)
     output_record: Dict[str, Any] = {}
     if raw.get("output_dir") is not None:
         output_record["root"] = str(raw["output_dir"])
@@ -954,20 +960,10 @@ def ensure_run_dir(cfg: ConfigNode | Mapping[str, Any]) -> Path:
     ):
         raise ConfigError("run 必须是 dict。")
 
-    if not isinstance(overwrite, bool):
-        raise ConfigError(
-            "run.overwrite 必须是布尔值，"
-            f"当前值：{overwrite!r}"
-        )
-    if not isinstance(unique_name, bool):
-        raise ConfigError(
-            "run.unique_name 必须是布尔值，"
-            f"当前值：{unique_name!r}"
-        )
-    if not isinstance(auto_generated, bool):
-        raise ConfigError("内部配置 run._auto_generated 必须是布尔值。")
-    if not isinstance(directory_reserved, bool):
-        raise ConfigError("内部配置 run._directory_reserved 必须是布尔值。")
+    _require_bool_value(overwrite, "run.overwrite")
+    _require_bool_value(unique_name, "run.unique_name")
+    _require_bool_value(auto_generated, "run._auto_generated")
+    _require_bool_value(directory_reserved, "run._directory_reserved")
 
     if has_run_identity:
         # 同一个配置对象重复调用时，复用本进程已经保留的目录。
@@ -1237,16 +1233,8 @@ def _finalize_run_info(cfg: Dict[str, Any]) -> Dict[str, Any]:
     unique_name = run_cfg.get("unique_name", True)
     overwrite = run_cfg.get("overwrite", False)
 
-    if not isinstance(unique_name, bool):
-        raise ConfigError(
-            "run.unique_name 必须是布尔值，"
-            f"当前值：{unique_name!r}"
-        )
-    if not isinstance(overwrite, bool):
-        raise ConfigError(
-            "run.overwrite 必须是布尔值，"
-            f"当前值：{overwrite!r}"
-        )
+    _require_bool_value(unique_name, "run.unique_name")
+    _require_bool_value(overwrite, "run.overwrite")
 
     # 只在配置中记录命名策略，不提前检查目录是否存在。
     # 真正创建目录时再执行原子保留，避免 exists() 与 mkdir() 之间的竞争窗口。
@@ -1352,6 +1340,23 @@ def _infer_num_classes(dataset: str) -> int:
     return int(info["num_classes"])
 
 
+def _require_bool_value(
+    value: Any,
+    key: str,
+    *,
+    allow_none: bool = False,
+) -> None:
+    """严格校验配置值为 bool；仅显式声明可选的字段允许 None。"""
+    if value is None and allow_none:
+        return
+    if type(value) is not bool:
+        expected = "bool 或 None" if allow_none else "bool"
+        raise ConfigError(
+            f"{key} 必须是 {expected}，当前值：{value!r}"
+            f"（类型：{type(value).__name__}）。"
+        )
+
+
 def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
     """
     校验范围受控的公共日志配置项。
@@ -1391,6 +1396,12 @@ def _validate_logging_config(cfg: Mapping[str, Any]) -> None:
         "save_results_csv",
         "progress_bar",
     }
+    for key in supported_keys:
+        _require_bool_value(
+            logging_cfg.get(key, True),
+            f"logging.{key}",
+        )
+
     unsupported_keys = sorted(set(logging_cfg.keys()) - supported_keys)
     if unsupported_keys:
         fields = ", ".join(str(key) for key in unsupported_keys)
@@ -1423,6 +1434,24 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     model_cfg = cfg.get("model_cfg", {})
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
+
+    for key in (
+        "data_augmentation",
+        "download_data",
+        "drop_last",
+        "deterministic",
+    ):
+        if key in cfg:
+            _require_bool_value(cfg[key], key)
+    _require_bool_value(
+        cfg.get("pin_memory"),
+        "pin_memory",
+        allow_none=True,
+    )
+    for key in ("token_dropping", "router_statistics"):
+        if key in model_cfg:
+            _require_bool_value(model_cfg[key], f"model_cfg.{key}")
+
     removed_model_fields = {"backbone", "moe_hidden_dim"}.intersection(model_cfg)
     if removed_model_fields:
         raise ConfigError(
@@ -1470,6 +1499,11 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     server_evidence_cfg = cfg.get("server_evidence", {})
     if not isinstance(server_evidence_cfg, Mapping):
         raise ConfigError("server_evidence 必须是 dict。")
+
+    _require_bool_value(
+        server_evidence_cfg.get("class_balanced", True),
+        "server_evidence.class_balanced",
+    )
 
     server_evidence_size = server_evidence_cfg.get("size", 0)
     if (
@@ -1545,6 +1579,12 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             )
 
     optimizer_cfg = cfg.get("optimizer", {})
+    if not isinstance(optimizer_cfg, Mapping):
+        raise ConfigError("optimizer 必须是 dict。")
+    _require_bool_value(
+        optimizer_cfg.get("nesterov", False),
+        "optimizer.nesterov",
+    )
     optimizer_type = optimizer_cfg.get("type")
 
     if optimizer_type not in {"sgd", "adam", "adamw"}:
@@ -1564,6 +1604,18 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             f"optimizer.weight_decay 必须是有限的非负数，当前值：{weight_decay}"
         )
+
+    run_cfg = cfg.get("run", {})
+    if not isinstance(run_cfg, Mapping):
+        raise ConfigError("run 必须是 dict。")
+    _require_bool_value(
+        run_cfg.get("unique_name", True),
+        "run.unique_name",
+    )
+    _require_bool_value(
+        run_cfg.get("overwrite", False),
+        "run.overwrite",
+    )
 
     _validate_logging_config(cfg)
 
@@ -3104,14 +3156,14 @@ def build_datasets(cfg: Any) -> DatasetBundle:
     info = DATASET_INFO[dataset_name]
     train_transform = build_train_transform(
         dataset_name=dataset_name,
-        use_augmentation=bool(_cfg_get(cfg, "data_augmentation", True)),
+        use_augmentation=_cfg_get_bool(cfg, "data_augmentation", True),
     )
     train_evidence_transform = build_train_transform(
         dataset_name=dataset_name,
         use_augmentation=False,
     )
     test_transform = build_test_transform(dataset_name=dataset_name)
-    download = bool(_cfg_get(cfg, "download_data", True))
+    download = _cfg_get_bool(cfg, "download_data", True)
 
     if dataset_name == "cifar10":
         train_dataset = datasets.CIFAR10(
@@ -4212,7 +4264,7 @@ def build_client_train_loaders(
     每个客户端使用不同的 generator seed，避免所有客户端 shuffle 顺序完全一致。
     """
     client_loaders: List[DataLoader] = []
-    drop_last = bool(_cfg_get(cfg, "drop_last", False))
+    drop_last = _cfg_get_bool(cfg, "drop_last", False)
     persistent_workers = num_workers > 0
 
     for client_id, client_dataset in enumerate(client_datasets):
@@ -4345,7 +4397,8 @@ def _infer_pin_memory(cfg: Any) -> bool:
     """
     explicit_pin_memory = _cfg_get(cfg, "pin_memory", None)
     if explicit_pin_memory is not None:
-        return bool(explicit_pin_memory)
+        _require_bool_value(explicit_pin_memory, "pin_memory")
+        return explicit_pin_memory
 
     device = str(_cfg_get(cfg, "device", "auto")).lower()
     if device == "cpu":
@@ -7015,7 +7068,7 @@ def build_optimizer(
 
     if optimizer_type == "sgd":
         momentum = float(_cfg_get(optimizer_cfg, "momentum", 0.9))
-        nesterov = bool(_cfg_get(optimizer_cfg, "nesterov", False))
+        nesterov = _cfg_get_bool(optimizer_cfg, "nesterov", False)
 
         return optim.SGD(
             params,
@@ -9016,26 +9069,10 @@ def _cfg_get_bool(
     key: str,
     default: bool = False,
 ) -> bool:
-    """
-    从配置里读取 bool 值。
-
-    支持 true / false、1 / 0、yes / no、on / off 等常见写法。
-    """
+    """严格读取布尔配置；字符串和整数形式的真假值不做隐式转换。"""
     value = _cfg_get(cfg, key, default)
-
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-
-        if normalized in {"1", "true", "yes", "y", "on"}:
-            return True
-
-        if normalized in {"0", "false", "no", "n", "off"}:
-            return False
-
-    return bool(value)
+    _require_bool_value(value, key)
+    return value
 
 
 # ============================================================================
@@ -9312,7 +9349,7 @@ def main(
 
     set_seed(
         seed=int(cfg.seed),
-        deterministic=bool(cfg.get("deterministic", True)),
+        deterministic=_cfg_get_bool(cfg, "deterministic", True),
     )
 
     run_dir = Path(ensure_run_dir(cfg))
@@ -9379,7 +9416,7 @@ def run_training(
     """
     device = resolve_device(cfg)
 
-    if bool(cfg.get("logging.save_config", True)):
+    if _cfg_get_bool(cfg, "logging.save_config", True):
         save_config(
             cfg=cfg,
             output_path=run_dir / "config_used.yaml",
@@ -9473,7 +9510,7 @@ def run_training(
     save_train_outputs(
         train_result=train_result,
         output_dir=run_dir,
-        save_csv=bool(cfg.get("logging.save_results_csv", True)),
+        save_csv=_cfg_get_bool(cfg, "logging.save_results_csv", True),
     )
 
     print()
