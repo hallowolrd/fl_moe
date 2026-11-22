@@ -306,7 +306,7 @@ DATASET_ALIASES = {
 
 
 def normalize_dataset_name(dataset_name: str) -> str:
-    """Normalize common dataset spelling variants to one canonical name."""
+    """将常见的数据集名称变体规范化为统一名称。"""
     key = str(dataset_name).strip().lower()
     return DATASET_ALIASES.get(key, key)
 
@@ -477,7 +477,7 @@ def load_embedded_config(
     method_validator: Optional[Callable[[Mapping[str, Any]], None]] = None,
     config_overrides: Mapping[str, Any] | None = None,
 ) -> ConfigNode:
-    """Build the effective configuration without requiring a YAML file."""
+    """在不依赖 YAML 文件的情况下构建最终生效的配置。"""
     raw_cfg: Dict[str, Any] = {}
 
     if method_overrides is not None:
@@ -951,7 +951,7 @@ def _apply_method_defaults(
     cfg: Dict[str, Any],
     method_defaults: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
-    """Apply method-owned defaults while keeping explicit config values."""
+    """应用算法专属默认值，同时保留用户显式指定的配置。"""
     if method_defaults is None:
         return copy.deepcopy(cfg)
 
@@ -965,14 +965,14 @@ def _apply_config_overrides(
     cfg: Dict[str, Any],
     config_overrides: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
-    """Apply highest-priority runtime overrides such as command-line values."""
+    """应用优先级最高的运行时覆盖项，例如命令行参数。"""
     if config_overrides is None:
         return copy.deepcopy(cfg)
     return _deep_merge(base=cfg, override=config_overrides)
 
 
 def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply shared defaults and normalize partition settings to the nested schema."""
+    """应用公共默认值，并将数据划分配置规范化为嵌套结构。"""
     explicit_cfg = copy.deepcopy(dict(cfg))
     cfg = _deep_merge(base=EMBEDDED_BASE_CONFIG, override=explicit_cfg)
 
@@ -1173,7 +1173,7 @@ def _make_unique_run_name(run_name: str, output_dir: Path) -> str:
 
 
 def _infer_num_classes(dataset: str) -> int:
-    """Infer class count from the dataset registry."""
+    """根据数据集注册信息推断类别数量。"""
     dataset_name = normalize_dataset_name(dataset)
     info = DATASET_INFO.get(dataset_name)
     if info is None:
@@ -1405,7 +1405,7 @@ def _require_non_negative_int(cfg: Mapping[str, Any], key: str) -> None:
 
 # 各公共功能模块统一通过此接口读取配置。
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
-    """Read a plain or dotted key from ConfigNode, dict, or a regular object."""
+    """从 ConfigNode、dict 或普通对象中读取普通字段或点分隔路径字段。"""
     if cfg is None:
         return default
 
@@ -2417,7 +2417,7 @@ def compute_model_loss(
 
 
 def _normalize_moe_stat_value(value: Any, path: str = "moe_stats") -> Any:
-    """Detach runtime MoE statistics and convert them to JSON-safe Python values."""
+    """分离运行时 MoE 统计数据，并转换为可安全写入 JSON 的 Python 类型。"""
     if torch.is_tensor(value):
         tensor = value.detach().cpu()
         if tensor.is_complex():
@@ -2456,7 +2456,7 @@ def _normalize_moe_stat_value(value: Any, path: str = "moe_stats") -> Any:
 
 
 def _normalize_moe_stats(stats: Mapping[str, Any] | None) -> Dict[str, Any]:
-    """Normalize a ModelOutput.moe_stats mapping into detached Python values."""
+    """将 ModelOutput.moe_stats 映射规范化为已分离的 Python 数据。"""
     if stats is None:
         return {}
     if not isinstance(stats, Mapping):
@@ -2514,7 +2514,7 @@ def _merge_additive_moe_stats(total: Any, current: Any, path: str = "moe_stats")
 
 
 def _extract_aux_loss_by_layer(values: Mapping[str, Any] | None) -> Dict[str, float]:
-    """Validate and detach per-layer scalar auxiliary losses."""
+    """校验并分离各层的标量辅助损失。"""
     if values is None:
         return {}
     if not isinstance(values, Mapping):
@@ -2614,7 +2614,7 @@ DATASET_INFO: Dict[str, Dict[str, Any]] = {
 
 
 class _ArrayImageDataset(Dataset):
-    """Image dataset backed by uint8 numpy arrays and integer targets."""
+    """使用 uint8 NumPy 数组和整数标签存储图像的数据集。"""
 
     def __init__(
         self,
@@ -2644,7 +2644,7 @@ class _ArrayImageDataset(Dataset):
 
 
 class _TinyImageNetValDataset(Dataset):
-    """Read the original Tiny-ImageNet validation layout without reorganizing files."""
+    """直接读取 Tiny-ImageNet 原始验证集目录结构，不要求重新整理文件。"""
 
     def __init__(
         self,
@@ -2698,7 +2698,7 @@ def _resolve_local_dataset_root(
     required_entries: Sequence[str],
     dataset_name: str,
 ) -> Path:
-    """Resolve a manually downloaded dataset directory from common layouts."""
+    """根据常见目录结构定位用户手动下载的数据集目录。"""
     roots = [data_root]
     roots.extend(data_root / candidate for candidate in candidates)
 
@@ -2714,7 +2714,7 @@ def _resolve_local_dataset_root(
 
 
 def _resolve_femnist_root(data_root: Path) -> Path:
-    """Resolve LEAF FEMNIST processed train/test JSON directories."""
+    """定位 LEAF FEMNIST 预处理后的 train/test JSON 目录。"""
     candidates = [
         data_root,
         data_root / "femnist",
@@ -2734,7 +2734,7 @@ def _resolve_femnist_root(data_root: Path) -> Path:
 def _load_femnist_split_storage(
     split_dir: Path,
 ) -> Tuple[np.ndarray, List[int]]:
-    """Flatten all LEAF users in one split into centralized uint8 images/targets."""
+    """将 LEAF 某个数据划分中的所有用户样本合并为集中式 uint8 图像和标签数组。"""
     json_files = sorted(split_dir.glob("*.json"))
     if not json_files:
         raise FileNotFoundError(f"FEMNIST split 中没有 JSON 文件：{split_dir}")
@@ -2817,7 +2817,7 @@ class DatasetBundle:
 
 
 def build_datasets(cfg: Any) -> DatasetBundle:
-    """Build centralized train/evidence/test datasets for the configured benchmark."""
+    """为当前基准数据集构建集中式训练、Evidence 和测试数据集。"""
     dataset_name = normalize_dataset_name(str(cfg.dataset))
     data_root = Path(cfg.data_root).expanduser()
 
@@ -3047,7 +3047,7 @@ def select_server_evidence_indices(
     seed: int,
     class_balanced: bool = True,
 ) -> List[int]:
-    """Select deterministic holdout indices without touching global RNG state."""
+    """在不影响全局随机数状态的前提下，选择确定性的留出样本索引。"""
     size = int(size)
     if size < 0:
         raise ValueError(f"size 不能小于 0，当前值：{size}")
@@ -3106,7 +3106,7 @@ def build_train_transform(
     dataset_name: str,
     use_augmentation: bool = True,
 ) -> Callable:
-    """Build dataset-aware train transforms while preserving the CIFAR path."""
+    """根据数据集类型构建训练变换，同时保持 CIFAR 原有处理流程。"""
     dataset_name = normalize_dataset_name(dataset_name)
     mean, std = get_normalization_stats(dataset_name)
     input_shape = tuple(DATASET_INFO[dataset_name]["input_shape"])
@@ -3139,7 +3139,7 @@ def build_train_transform(
 
 
 def build_test_transform(dataset_name: str) -> Callable:
-    """Build deterministic evaluation/evidence preprocessing."""
+    """构建用于评估和 Evidence 的确定性预处理流程。"""
     dataset_name = normalize_dataset_name(dataset_name)
     mean, std = get_normalization_stats(dataset_name)
     return transforms.Compose(
@@ -4009,7 +4009,7 @@ def build_server_evidence_loader(
     pin_memory: bool,
     seed: int,
 ) -> Optional[DataLoader]:
-    """Build the optional deterministic server-side method evidence loader."""
+    """构建可选的确定性服务端算法 Evidence DataLoader。"""
     if server_evidence_dataset is None:
         return None
 
@@ -4123,7 +4123,7 @@ def _switch_model_config(cfg: Any) -> Dict[str, Any]:
 
 
 class SwitchFeedForward(nn.Module):
-    """Standard dense Transformer FFN used by non-MoE blocks."""
+    """供非 MoE Block 使用的标准 Dense Transformer FFN。"""
 
     def __init__(
         self,
@@ -4146,7 +4146,7 @@ class SwitchFeedForward(nn.Module):
 
 
 class SwitchExpert(nn.Module):
-    """One independent two-layer feed-forward expert."""
+    """由两层前馈网络构成的独立 Expert。"""
 
     def __init__(
         self,
@@ -4169,7 +4169,7 @@ class SwitchExpert(nn.Module):
 
 
 class SwitchRouter(nn.Module):
-    """Top-1 token router. It returns probabilities and selected expert ids."""
+    """执行 Top-1 Token 路由，并返回路由概率和选中的 Expert ID。"""
 
     def __init__(self, hidden_dim: int, num_experts: int) -> None:
         super().__init__()
@@ -4457,7 +4457,7 @@ class SwitchMoE(nn.Module):
 
 
 class SwitchTransformerBlock(nn.Module):
-    """Pre-LN Transformer block with either a dense FFN or a Switch MoE FFN."""
+    """采用 Pre-LN 结构、并包含 Dense FFN 或 Switch MoE FFN 的 Transformer Block。"""
 
     def __init__(
         self,
@@ -4713,7 +4713,7 @@ class SwitchViT(nn.Module):
 
 
 def build_switch_vit_model(cfg: Any) -> nn.Module:
-    """Build the default SwitchViT from the shared experiment configuration."""
+    """根据公共实验配置构建默认 SwitchViT 模型。"""
     model_cfg = _switch_model_config(cfg)
 
     if str(model_cfg.get("routing", "top1")).strip().lower() != "top1":
@@ -5810,7 +5810,7 @@ def average_client_metric(
 def average_client_aux_loss_by_layer(
     client_updates: Sequence[ClientUpdate],
 ) -> Dict[str, float]:
-    """Average per-layer auxiliary losses using processed-sample weights."""
+    """根据实际处理样本数加权平均各层 Auxiliary Loss。"""
     weighted_sums: Dict[str, float] = {}
     total_weights: Dict[str, int] = {}
     for update in client_updates:
@@ -5843,7 +5843,7 @@ def average_client_aux_loss_by_layer(
 def aggregate_client_moe_stats(
     client_updates: Sequence[ClientUpdate],
 ) -> Dict[str, Any]:
-    """Sum additive MoE runtime statistics across participating clients."""
+    """累加参与客户端产生的 MoE 运行时统计数据。"""
     aggregated: Any = None
     for update in client_updates:
         current = _normalize_moe_stats(update.moe_stats)
@@ -7029,7 +7029,7 @@ class Aggregator(ABC):
         self,
         method_context: Optional[MethodContext],
     ) -> None:
-        """Inject common server-side resources after the plugin is constructed."""
+        """在插件构建完成后注入公共服务端资源。"""
         if method_context is not None and not isinstance(method_context, MethodContext):
             raise TypeError(
                 "method_context 必须是 MethodContext 或 None，"
@@ -7038,16 +7038,16 @@ class Aggregator(ABC):
         self.method_context = method_context
 
     def initialize_model(self, model: nn.Module) -> None:
-        """Apply algorithm-owned initialization to the global model, if required."""
+        """在需要时，对全局模型执行算法专属初始化。"""
 
     def after_aggregate(self, model: nn.Module) -> None:
-        """Apply algorithm-owned post-aggregation operations, if required."""
+        """在需要时，执行算法专属的聚合后处理操作。"""
 
     def build_post_aggregate_diagnostics(
         self,
         model: nn.Module,
     ) -> Dict[str, Any]:
-        """Build diagnostics from the server model after after_aggregate."""
+        """在 after_aggregate 执行完成后，根据服务端模型构建诊断信息。"""
         return {}
 
     @property
@@ -7262,7 +7262,7 @@ def build_uniform_weights(
 # Fixed non-expert aggregation and expert extension interface.
 @dataclass
 class AggregatorBundle:
-    """Fixed non-expert aggregator plus an injected expert aggregator."""
+    """由固定的 Non-Expert 聚合器和注入式 Expert 聚合器组成的聚合器集合。"""
 
     non_expert: Aggregator
     expert: Aggregator
@@ -7306,7 +7306,7 @@ def build_aggregators(
     expert_aggregator_builder: ExpertAggregatorBuilder,
     method_context: Optional[MethodContext] = None,
 ) -> AggregatorBundle:
-    """Build fixed uniform non-expert aggregation and injected expert logic."""
+    """构建固定的 Non-Expert 等权聚合器及注入式 Expert 聚合逻辑。"""
     non_expert = FixedNonExpertUniformAggregator(
         cfg=cfg,
         param_group_name="non_expert",
@@ -8774,7 +8774,7 @@ MethodCliOverridesBuilder = Callable[[argparse.Namespace], Mapping[str, Any]]
 
 
 def _parse_bool_cli_value(value: str) -> bool:
-    """Parse explicit CLI boolean values such as True/False or true/false."""
+    """解析 True/False、true/false 等显式命令行布尔值。""
     normalized = str(value).strip().lower()
     if normalized in {"true", "1", "yes", "y", "on"}:
         return True
