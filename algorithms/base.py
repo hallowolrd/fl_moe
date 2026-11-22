@@ -1932,6 +1932,59 @@ StateDict = Mapping[str, torch.Tensor]
 MutableStateDict = Dict[str, torch.Tensor]
 
 
+def validate_state_dict_shapes(
+    reference_state: StateDict,
+    candidate_state: StateDict,
+    *,
+    context: str = "state_dict",
+) -> None:
+    """
+    验证两个 state_dict 的参数名称和 Tensor Shape 完全一致。
+
+    该检查用于聚合边界，避免不同客户端或自定义聚合器返回的错误维度
+    借助 PyTorch broadcasting 进入后续计算。
+    """
+    if not isinstance(reference_state, Mapping):
+        raise TypeError(
+            f"{context} 的参考 state_dict 必须是 Mapping，"
+            f"当前类型：{type(reference_state).__name__}"
+        )
+    if not isinstance(candidate_state, Mapping):
+        raise TypeError(
+            f"{context} 必须是 Mapping，"
+            f"当前类型：{type(candidate_state).__name__}"
+        )
+
+    expected_names = set(reference_state)
+    actual_names = set(candidate_state)
+    if actual_names != expected_names:
+        missing_names = sorted(expected_names - actual_names)
+        extra_names = sorted(actual_names - expected_names)
+        raise ValueError(
+            f"{context} 的参数名称与参考 state_dict 不一致。"
+            f" missing={missing_names[:10]}, extra={extra_names[:10]}"
+        )
+
+    for name, reference_tensor in reference_state.items():
+        candidate_tensor = candidate_state[name]
+        if not torch.is_tensor(reference_tensor):
+            raise TypeError(
+                f"参考 state_dict 中的 {name} 必须是 Tensor，"
+                f"当前类型：{type(reference_tensor).__name__}"
+            )
+        if not torch.is_tensor(candidate_tensor):
+            raise TypeError(
+                f"{context} 中的 {name} 必须是 Tensor，"
+                f"当前类型：{type(candidate_tensor).__name__}"
+            )
+        if tuple(candidate_tensor.shape) != tuple(reference_tensor.shape):
+            raise ValueError(
+                f"{context} 中参数 {name} 的 Tensor Shape 不匹配："
+                f"expected={tuple(reference_tensor.shape)}, "
+                f"actual={tuple(candidate_tensor.shape)}"
+            )
+
+
 def clone_state_dict(state_dict: StateDict) -> MutableStateDict:
     """
     深拷贝 state_dict。
@@ -2001,6 +2054,23 @@ def subtract_state_dict(
         local_tensor = local_state[name]
         global_tensor = global_state[name]
 
+        if not torch.is_tensor(local_tensor):
+            raise TypeError(
+                f"local_state 中的 {name} 必须是 Tensor，"
+                f"当前类型：{type(local_tensor).__name__}"
+            )
+        if not torch.is_tensor(global_tensor):
+            raise TypeError(
+                f"global_state 中的 {name} 必须是 Tensor，"
+                f"当前类型：{type(global_tensor).__name__}"
+            )
+        if tuple(local_tensor.shape) != tuple(global_tensor.shape):
+            raise ValueError(
+                f"本地模型与全局模型的 Tensor Shape 不一致：参数 {name}，"
+                f"expected={tuple(global_tensor.shape)}, "
+                f"actual={tuple(local_tensor.shape)}"
+            )
+
         if not _is_float_tensor(local_tensor):
             continue
 
@@ -2069,6 +2139,11 @@ def apply_weighted_delta(
     if base_state is None:
         new_state = clone_state_dict(global_state)
     else:
+        validate_state_dict_shapes(
+            reference_state=global_state,
+            candidate_state=base_state,
+            context="加权聚合 base_state",
+        )
         new_state = clone_state_dict(base_state)
 
     names = _resolve_param_names(
@@ -2102,12 +2177,30 @@ def apply_weighted_delta(
                 continue
 
             weight = float(weights[client_id])
-            delta_tensor = model_delta[name].to(global_tensor.device)
+            delta_value = model_delta[name]
+            if not torch.is_tensor(delta_value):
+                raise TypeError(
+                    f"客户端 {client_id} 的 model_delta[{name}] 必须是 Tensor，"
+                    f"当前类型：{type(delta_value).__name__}"
+                )
+            if tuple(delta_value.shape) != tuple(global_tensor.shape):
+                raise ValueError(
+                    f"客户端 {client_id} 的 model_delta 参数 {name} "
+                    f"Tensor Shape 不匹配："
+                    f"expected={tuple(global_tensor.shape)}, "
+                    f"actual={tuple(delta_value.shape)}"
+                )
+            delta_tensor = delta_value.to(global_tensor.device)
 
             total_delta = total_delta + weight * delta_tensor
 
         new_state[name] = global_tensor + total_delta
 
+    validate_state_dict_shapes(
+        reference_state=global_state,
+        candidate_state=new_state,
+        context="加权聚合结果",
+    )
     return new_state
 
 
@@ -7993,6 +8086,16 @@ class FLServer:
             base_state=None,
             strict=True,
         )
+        if not isinstance(non_expert_result, AggregationResult):
+            raise TypeError(
+                "非专家聚合器 aggregate() 必须返回 AggregationResult，"
+                f"当前类型：{type(non_expert_result).__name__}"
+            )
+        validate_state_dict_shapes(
+            reference_state=global_state_cpu,
+            candidate_state=non_expert_result.new_state_dict,
+            context="non_expert 聚合结果",
+        )
 
         expert_result = self.aggregators.expert.aggregate(
             global_state=global_state_cpu,
@@ -8012,16 +8115,11 @@ class FLServer:
                 f"当前类型：{type(expert_result.new_state_dict).__name__}"
             )
 
-        expected_state_names = set(global_state_cpu)
-        returned_state_names = set(expert_result.new_state_dict)
-        if returned_state_names != expected_state_names:
-            missing_names = sorted(expected_state_names - returned_state_names)
-            extra_names = sorted(returned_state_names - expected_state_names)
-            raise ValueError(
-                "专家聚合器必须返回完整模型 state_dict。"
-                f" missing={missing_names[:10]}, extra={extra_names[:10]}"
-            )
-
+        validate_state_dict_shapes(
+            reference_state=global_state_cpu,
+            candidate_state=expert_result.new_state_dict,
+            context="expert 聚合结果",
+        )
         new_state_dict = expert_result.new_state_dict
 
         check_finite_state_dict(new_state_dict)

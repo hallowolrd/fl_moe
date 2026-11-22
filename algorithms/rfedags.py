@@ -400,13 +400,15 @@ class RFedAGSExpertAggregator(base.Aggregator):
         local_steps = unique_local_steps.pop()
 
         source_state = base_state if base_state is not None else global_state
+        base.validate_state_dict_shapes(
+            reference_state=global_state,
+            candidate_state=source_state,
+            context="RFedAGS 聚合基础 state_dict",
+        )
         new_state_dict = {
             name: value.detach().clone()
             for name, value in source_state.items()
         }
-        if set(new_state_dict) != set(global_state):
-            raise ValueError("base_state 与 global_state 的 state_dict keys 不一致。")
-
         for name in expert_parameter_names:
             reference = global_state[name]
             aggregated_stream = _weighted_tensor_sum(
@@ -430,6 +432,11 @@ class RFedAGSExpertAggregator(base.Aggregator):
                 "rfedags 必须返回完整模型 state_dict。"
                 f" missing={missing[:10]}, extra={extra[:10]}"
             )
+        base.validate_state_dict_shapes(
+            reference_state=global_state,
+            candidate_state=new_state_dict,
+            context="RFedAGS 聚合结果",
+        )
         base.check_finite_state_dict(new_state_dict)
 
         diagnostic_param_names = (
