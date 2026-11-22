@@ -650,6 +650,7 @@ def _build_config_record(
         data_cfg["partition"] = partition_record
 
     # 记录 DataLoader 的最终行为，而不是只记录用户显式传入的字段。
+    # drop_last 仅控制客户端训练 loader；测试和 Evidence loader 固定为 False。
     num_workers = int(raw.get("num_workers", 0) or 0)
     data_cfg["loader"] = {
         "client_train_drop_last": bool(raw.get("drop_last", False)),
@@ -831,6 +832,7 @@ def _build_config_record(
     record["output"] = output_record
 
     return record
+
 
 def save_config(
     cfg: ConfigNode | Mapping[str, Any],
