@@ -278,6 +278,16 @@ class SwitchViTTests(unittest.TestCase):
             )
         return moe
 
+    def test_switch_moe_requires_positive_integer_expert_count(self) -> None:
+        common = {
+            "hidden_dim": 4,
+            "expert_hidden_dim": 8,
+        }
+        for value in (0, -1, 2.5, True):
+            with self.subTest(num_experts=value):
+                with self.assertRaisesRegex(ValueError, "num_experts"):
+                    base.SwitchMoE(**common, num_experts=value)
+
     def test_switch_moe_constructor_validates_boolean_options(self) -> None:
         common = {
             "hidden_dim": 4,

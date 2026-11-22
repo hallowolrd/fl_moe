@@ -1620,11 +1620,20 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _validate_logging_config(cfg)
 
 
+def _is_positive_int_value(value: Any) -> bool:
+    """判断值是否为严格意义上的正整数（不接受 bool）。"""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
 def _require_positive_int(cfg: Mapping[str, Any], key: str) -> None:
     """检查某个字段是否为正整数。"""
     value = cfg.get(key)
 
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if not _is_positive_int_value(value):
         raise ConfigError(f"{key} 必须是正整数，当前值：{value}")
 
 
@@ -4539,7 +4548,7 @@ class SwitchMoE(nn.Module):
         token_dropping: bool = False,
     ) -> None:
         super().__init__()
-        if num_experts <= 0:
+        if not _is_positive_int_value(num_experts):
             raise ValueError("num_experts 必须是正整数。")
         if type(collect_router_statistics) is not bool:
             raise TypeError(
@@ -4569,7 +4578,7 @@ class SwitchMoE(nn.Module):
                 "必须 >= 1.0，以保证总容量足以容纳全部 Token。"
             )
 
-        self.num_experts = int(num_experts)
+        self.num_experts = num_experts
         self.collect_router_statistics = collect_router_statistics
         self.auxiliary_loss = auxiliary_loss
         self.aux_loss_coef = aux_loss_coef
@@ -4909,12 +4918,11 @@ class SwitchViT(nn.Module):
             attention_heads,
             patch_size,
             expert_hidden_dim,
-            num_experts,
             num_classes,
         ) <= 0:
             raise ValueError(
                 "transformer_layers、hidden_dim、attention_heads、patch_size、"
-                "expert_hidden_dim、num_experts 和 num_classes 必须为正整数。"
+                "expert_hidden_dim 和 num_classes 必须为正整数。"
             )
         if not 0.0 <= float(dropout) < 1.0:
             raise ValueError(f"dropout 必须位于 [0, 1)，当前值：{dropout}")
