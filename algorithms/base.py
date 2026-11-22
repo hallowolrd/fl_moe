@@ -7,9 +7,9 @@
 
 from __future__ import annotations
 
-# ==============================================================================
+# ============================================================================
 # 0. 启动环境初始化（必须先于 torch 导入）
-# ==============================================================================
+# ============================================================================
 # 注意：
 # 下面这一段必须放在 import torch 之前。
 #
@@ -19,7 +19,7 @@ from __future__ import annotations
 #
 # 所以如果当前进程的 PYTHONHASHSEED 和配置文件里的 seed 不一致，
 # 这里会自动重新执行一次当前 Python 命令。
-# ============================================================
+# ============================================================================
 
 import os
 import sys
@@ -4088,9 +4088,9 @@ ModelBuilder = Callable[[Any], nn.Module]
 
 
 # ============================================================================
-# Built-in image-classification Switch Transformer.
-# The model lives in base.py so the FL framework can use it without an external
-# model package. MoE blocks are 1-indexed in configuration.
+# 内置图像分类 Switch Transformer。
+# 模型实现在 base.py 中，联邦学习框架无需依赖外部
+# 模型包即可使用。配置中的 MoE Block 编号从 1 开始。
 # ============================================================================
 
 SWITCH_VIT_DEFAULT_MODEL_CFG: Dict[str, Any] = {
@@ -5573,7 +5573,7 @@ class ClientUpdate:
 
     # 预留扩展字段
     # 后面可以放：
-    # method-specific evidence / statistics
+    # 算法专属 Evidence / 统计信息
     # method_evidence
     # method_evidence_summary
     # sgld_mean
@@ -5626,7 +5626,7 @@ class AggregationResult:
     # num_clients
     # total_samples
     # param_group
-    # num_state_entries: selected state_dict entries, including buffers
+    # num_state_entries：选中的 state_dict 条目数量，包括 buffer。
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
@@ -5714,9 +5714,9 @@ class TrainState:
 
     # 额外状态
     # 后面可以放：
-    # history filter state
-    # bayes prior state
-    # method-specific running state
+    # History Filter 状态
+    # Bayes 先验状态
+    # 算法专属运行状态
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(
@@ -7139,8 +7139,8 @@ class Aggregator(ABC):
         raw_weights = self.compute_weights(client_updates)
         weights = normalize_weights(raw_weights)
 
-        # The same parameter names are reused for aggregation, validation,
-        # and diagnostics; materialize one-shot iterables only once.
+        # 聚合、校验和诊断复用相同的参数名称，
+        # 因此一次性迭代对象只应物化一次。
         if param_names is not None:
             param_names = list(param_names)
 
@@ -7255,7 +7255,7 @@ def build_uniform_weights(
 
 
 
-# Fixed non-expert aggregation and expert extension interface.
+# 固定的 Non-Expert 聚合逻辑及 Expert 扩展接口。
 @dataclass
 class AggregatorBundle:
     """由固定的 Non-Expert 聚合器和注入式 Expert 聚合器组成的聚合器集合。"""
