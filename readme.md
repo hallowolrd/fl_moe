@@ -11,32 +11,35 @@ conda activate fl_moe
 普通客户端等权 FedAvg 基线：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python algorithms/uniform.py \
-  --dataset cifar10 \
-  --num-clients 5 \
-  --rounds 50 \
-  --local-epochs 5 \
-  --lr 0.01 \
-  --momentum 0 \
-  --weight-decay 0 \
-  --data-augmentation true \
-  --output-dir outputs/
+
+python algorithms/uniform.py \
+    --dataset cifar10 \
+    --num-clients 5 \
+    --alpha 0.1 \
+    --dirichlet-sample-balance unbalanced \
+    --rounds 50 \
+    --local-epochs 5 \
+    --batch-size 64 \
+    --data-augmentation true \
+    --num-experts 4 \
+    --transformer-layers 6 \
+    --hidden-dim 256 \
+    --attention-heads 4 \
+    --patch-size 4 \
+    --expert-hidden-dim 1024 \
+    --moe-block-indices 2 4 6 \
+    --dropout 0.0 \
+    --aux-loss-coef 0.0 \
+    --capacity-factor 0.0 \
+    --token-dropping false \
+    --optimizer sgd \
+    --lr 0.01 \
+    --momentum 0.9 \
+    --weight-decay 0.0005 \
+    --seed 0 \
+    --output-dir outputs
 ```
 
-Euclidean RFedAGS 梯度流版本：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python algorithms/rfedags.py \
-  --dataset cifar10 \
-  --num-clients 5 \
-  --rounds 50 \
-  --local-steps 5 \
-  --lr 0.01 \
-  --momentum 0 \
-  --weight-decay 0 \
-  --data-augmentation true \
-  --output-dir outputs/
-```
 
 ## 当前算法
 
