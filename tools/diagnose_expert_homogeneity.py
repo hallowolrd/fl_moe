@@ -505,6 +505,7 @@ def diagnose_model_experts(
         if device is not None
         else original_device
     )
+    input_dtype = parameters[0].dtype
 
     training_states = {
         module: module.training
@@ -562,7 +563,8 @@ def diagnose_model_experts(
                     break
 
                 images = _extract_images_from_batch(batch).to(
-                    target_device,
+                    device=target_device,
+                    dtype=input_dtype,
                     non_blocking=target_device.type == "cuda",
                 )
                 active_capture.clear()
