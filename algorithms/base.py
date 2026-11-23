@@ -167,15 +167,16 @@ def _get_cli_arg_value(name: str) -> str | None:
     """
     prefix = name + "="
     argv = sys.argv
+    matched_value = None
 
+    # argparse 对重复选项采用最后一次出现的值；启动预检必须保持相同优先级。
     for idx, arg in enumerate(argv):
-        if arg == name and idx + 1 < len(argv):
-            return argv[idx + 1]
+        if arg == name:
+            matched_value = argv[idx + 1] if idx + 1 < len(argv) else None
+        elif arg.startswith(prefix):
+            matched_value = arg[len(prefix):]
 
-        if arg.startswith(prefix):
-            return arg[len(prefix):]
-
-    return None
+    return matched_value
 
 
 def _clean_simple_yaml_value(value: str) -> str:
