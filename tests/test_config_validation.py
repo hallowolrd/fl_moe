@@ -153,8 +153,13 @@ class BooleanConfigValidationTests(unittest.TestCase):
         for field in self.BOOLEAN_FIELDS:
             for value in (True, False):
                 with self.subTest(field=field, value=value):
+                    overrides = self._nested_override(field, value)
+                    # Token Dropping requires an enabled expert capacity.
+                    if field == "model_cfg.token_dropping" and value:
+                        overrides["model_cfg"]["capacity_factor"] = 1.0
+
                     cfg = base.load_embedded_config(
-                        config_overrides=self._nested_override(field, value)
+                        config_overrides=overrides
                     )
                     self.assertIs(
                         base._cfg_get_bool(cfg, field, not value),
