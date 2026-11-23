@@ -151,10 +151,11 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
             self.assertEqual(len(layer_report["pairwise"]), 3)
             for pair_report in layer_report["pairwise"].values():
                 self.assertEqual(set(pair_report), expected_metrics)
+                self.assertEqual(pair_report["errors"], {})
                 for metric_name in expected_metrics - {"errors"}:
                     value = pair_report[metric_name]
-                    if value is not None:
-                        self.assertTrue(torch.isfinite(torch.tensor(value)))
+                    self.assertIsNotNone(value, metric_name)
+                    self.assertTrue(torch.isfinite(torch.tensor(value)))
                 for metric_name in (
                     "fc1_right_subspace_overlap",
                     "fc2_left_subspace_overlap",
