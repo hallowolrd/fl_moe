@@ -843,7 +843,7 @@ def diagnose_model_experts(
                 (expert_b_name, expert_b),
             ) in enumerate(itertools.combinations(expert_items, 2)):
                 pair_key = f"{expert_a_name}|{expert_b_name}"
-                metrics: dict[str, float | None] = {}
+                metrics: dict[str, Any] = {}
                 errors: dict[str, str] = {}
 
                 metric_functions = (
@@ -1140,6 +1140,9 @@ def save_initialization_controls(
                             continue
                         # 分位数、有效 Token 数等详细信息单独写为长表行。
                         for stat_name, stat_value in value.items():
+                            if stat_name == "mean":
+                                # 已经通过 token_output_cosine_mean 输出，避免重复行。
+                                continue
                             pair_rows.append({
                                 "seed": seed,
                                 "moe_layer": layer_name,
