@@ -2267,10 +2267,10 @@ def validate_state_dict_shapes(
     context: str = "state_dict",
 ) -> None:
     """
-    验证两个 state_dict 的参数名称和 Tensor Shape 完全一致。
+    验证两个 state_dict 的参数名称、Tensor Shape 和 Dtype 完全一致。
 
-    该检查用于聚合边界，避免不同客户端或自定义聚合器返回的错误维度
-    借助 PyTorch broadcasting 进入后续计算。
+    该检查用于聚合边界，避免不同客户端或自定义聚合器返回不兼容的参数
+    借助 PyTorch broadcasting 或隐式类型转换进入后续计算。
     """
     if not isinstance(reference_state, Mapping):
         raise TypeError(
@@ -2310,6 +2310,12 @@ def validate_state_dict_shapes(
                 f"{context} 中参数 {name} 的 Tensor Shape 不匹配："
                 f"expected={tuple(reference_tensor.shape)}, "
                 f"actual={tuple(candidate_tensor.shape)}"
+            )
+        if candidate_tensor.dtype != reference_tensor.dtype:
+            raise TypeError(
+                f"{context} 中参数 {name} 的 Tensor Dtype 不匹配："
+                f"expected={reference_tensor.dtype}, "
+                f"actual={candidate_tensor.dtype}"
             )
 
 
@@ -2397,6 +2403,11 @@ def subtract_state_dict(
                 f"本地模型与全局模型的 Tensor Shape 不一致：参数 {name}，"
                 f"expected={tuple(global_tensor.shape)}, "
                 f"actual={tuple(local_tensor.shape)}"
+            )
+        if local_tensor.dtype != global_tensor.dtype:
+            raise TypeError(
+                f"本地模型与全局模型的 Tensor Dtype 不一致：参数 {name}，"
+                f"expected={global_tensor.dtype}, actual={local_tensor.dtype}"
             )
 
         if not _is_float_tensor(local_tensor):
@@ -2517,6 +2528,13 @@ def apply_weighted_delta(
                     f"Tensor Shape 不匹配："
                     f"expected={tuple(global_tensor.shape)}, "
                     f"actual={tuple(delta_value.shape)}"
+                )
+            if delta_value.dtype != global_tensor.dtype:
+                raise TypeError(
+                    f"客户端 {client_id} 的 model_delta 参数 {name} "
+                    f"Tensor Dtype 不匹配："
+                    f"expected={global_tensor.dtype}, "
+                    f"actual={delta_value.dtype}"
                 )
             delta_tensor = delta_value.to(global_tensor.device)
 
@@ -3282,6 +3300,14 @@ class _TinyImageNetValDataset(Dataset):
         self.samples = samples
         self.targets = targets
         self.transform = transform
+        self.class_to_idx = dict(class_to_idx)
+        self.classes = [
+            class_name
+            for class_name, _ in sorted(
+                self.class_to_idx.items(),
+                key=lambda item: item[1],
+            )
+        ]
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -3293,6 +3319,60 @@ class _TinyImageNetValDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         return image, int(target)
+
+
+def _build_image_folder_with_class_mapping(
+    root: Path,
+    class_to_idx: Mapping[str, int],
+    transform: Optional[Callable] = None,
+) -> datasets.ImageFolder:
+    """
+    使用指定的类别映射构建 ImageFolder。
+
+    训练集负责建立唯一的 class_to_idx；Evidence 和测试集只复用该映射，
+    不允许根据各自目录中的类别子集重新生成标签编号。
+    """
+    if not isinstance(class_to_idx, Mapping) or not class_to_idx:
+        raise ValueError("ImageFolder 的 class_to_idx 必须是非空 Mapping。")
+
+    class_indices = list(class_to_idx.values())
+    if (
+        any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in class_indices
+        )
+        or sorted(class_indices) != list(range(len(class_to_idx)))
+    ):
+        raise ValueError(
+            "ImageFolder 的 class_to_idx 必须使用从 0 开始的连续整数编号。"
+        )
+
+    dataset = datasets.ImageFolder(root, transform=transform)
+    unknown_classes = sorted(set(dataset.classes) - set(class_to_idx))
+    if unknown_classes:
+        raise ValueError(
+            f"数据集 {root} 包含训练集类别映射中不存在的类别：{unknown_classes}"
+        )
+
+    remapped_samples = [
+        (image_path, int(class_to_idx[dataset.classes[local_target]]))
+        for image_path, local_target in dataset.samples
+    ]
+    canonical_classes = [
+        class_name
+        for class_name, _ in sorted(
+            class_to_idx.items(),
+            key=lambda item: item[1],
+        )
+    ]
+
+    # ImageFolder 的样本顺序保持不变，只将本地标签重映射到训练集编号。
+    dataset.classes = canonical_classes
+    dataset.class_to_idx = dict(class_to_idx)
+    dataset.samples = remapped_samples
+    dataset.imgs = remapped_samples
+    dataset.targets = [target for _, target in remapped_samples]
+    return dataset
 
 
 def _resolve_local_dataset_root(
@@ -3493,10 +3573,16 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             dataset_name="CINIC-10",
         )
         train_dataset = datasets.ImageFolder(root / "train", transform=train_transform)
-        train_evidence_dataset = datasets.ImageFolder(
-            root / "train", transform=train_evidence_transform
+        train_evidence_dataset = _build_image_folder_with_class_mapping(
+            root / "train",
+            class_to_idx=train_dataset.class_to_idx,
+            transform=train_evidence_transform,
         )
-        test_dataset = datasets.ImageFolder(root / "test", transform=test_transform)
+        test_dataset = _build_image_folder_with_class_mapping(
+            root / "test",
+            class_to_idx=train_dataset.class_to_idx,
+            transform=test_transform,
+        )
 
     elif dataset_name == "tiny-imagenet-200":
         root = _resolve_local_dataset_root(
@@ -3506,8 +3592,10 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             dataset_name="Tiny-ImageNet-200",
         )
         train_dataset = datasets.ImageFolder(root / "train", transform=train_transform)
-        train_evidence_dataset = datasets.ImageFolder(
-            root / "train", transform=train_evidence_transform
+        train_evidence_dataset = _build_image_folder_with_class_mapping(
+            root / "train",
+            class_to_idx=train_dataset.class_to_idx,
+            transform=train_evidence_transform,
         )
 
         val_root = root / "val"
@@ -3518,8 +3606,12 @@ def build_datasets(cfg: Any) -> DatasetBundle:
                 transform=test_transform,
             )
         else:
-            # 同时兼容用户已按类别目录重新整理的验证集。
-            test_dataset = datasets.ImageFolder(val_root, transform=test_transform)
+            # 同时兼容用户已按类别目录重新整理的验证集，并复用训练集映射。
+            test_dataset = _build_image_folder_with_class_mapping(
+                val_root,
+                class_to_idx=train_dataset.class_to_idx,
+                transform=test_transform,
+            )
 
     elif dataset_name == "femnist":
         # 方案 A：加载后不再区分书写者身份，
@@ -7184,7 +7276,8 @@ def train_local_model_with_expert_strategy(
         cfg=cfg,
         device=torch.device(device),
         model=model,
-        global_state=global_state,
+        # 策略只能访问独立快照，不能修改客户端计算 model_delta 的原始基准。
+        global_state=clone_state_dict(global_state),
         train_loader=train_loader,
         criterion=criterion,
         non_expert_optimizer=optimizer,
