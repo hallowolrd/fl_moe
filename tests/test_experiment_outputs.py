@@ -54,8 +54,16 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
             },
             best_acc=45.0,
             aggregation_info={
-                "non_expert": {"method": "uniform"},
-                "expert": {"method": "uniform"},
+                "non_expert": {
+                    "method": "uniform",
+                    "weights": {0: 0.25, 2: 0.75},
+                    "diagnostics": {"num_parameters": 12},
+                },
+                "expert": {
+                    "method": "uniform",
+                    "weights": {"layer_0": {0: 0.5, 2: 0.5}},
+                    "diagnostics": {"num_experts": 2},
+                },
             },
             client_diagnostics={
                 0: {
@@ -64,7 +72,14 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                     "avg_aux_loss_by_layer": {"layer_0": 0.2},
                     "moe_stats": {"layer_0": {"tokens_per_expert": [5, 3]}},
                     "expert_usage": None,
-                }
+                },
+                2: {
+                    "num_samples": 20,
+                    "metrics": {"train_loss": 1.3},
+                    "avg_aux_loss_by_layer": {"layer_0": 0.3},
+                    "moe_stats": {"layer_0": {"tokens_per_expert": [4, 4]}},
+                    "expert_usage": {"layer_0": [0.4, 0.6]},
+                },
             },
             avg_train_aux_loss_by_layer={"layer_0": 0.2},
             moe_stats={"layer_0": {"tokens_per_expert": [5, 3]}},
@@ -75,7 +90,14 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
             round_id=1,
             best_acc=45.0,
             best_round=1,
-            extra={"method_state": "ok"},
+            extra={
+                "method_state": {
+                    "status": "ok",
+                    "counter": 3,
+                    "history": [0.1, None, 0.2],
+                },
+                "optional_state": None,
+            },
         )
         return base.ServerTrainResult(
             round_results=[self.make_round_result()],
@@ -176,6 +198,38 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 [5, 3],
             )
 
+            round_summary = summary["round_results"][0]
+            self.assertEqual(
+                round_summary["aggregation_info"]["non_expert"]["weights"],
+                {"0": 0.25, "2": 0.75},
+            )
+            self.assertEqual(
+                round_summary["aggregation_info"]["expert"]["weights"]["layer_0"],
+                {"0": 0.5, "2": 0.5},
+            )
+            self.assertEqual(
+                round_summary["aggregation_info"]["non_expert"]["diagnostics"],
+                {"num_parameters": 12},
+            )
+            self.assertEqual(
+                round_summary["client_diagnostics"]["0"]["metrics"],
+                {"train_loss": 1.2},
+            )
+            self.assertEqual(
+                round_summary["client_diagnostics"]["2"]["expert_usage"],
+                {"layer_0": [0.4, 0.6]},
+            )
+            self.assertEqual(
+                summary["train_state"]["extra"]["method_state"],
+                {
+                    "status": "ok",
+                    "counter": 3,
+                    "history": [0.1, None, 0.2],
+                },
+            )
+            self.assertIsNone(summary["train_state"]["extra"]["optional_state"])
+            self.assertNotIn("client_indices", round_summary)
+
             with csv_path.open("r", encoding="utf-8", newline="") as file:
                 rows = list(csv.DictReader(file))
 
@@ -191,6 +245,13 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 json.loads(rows[0]["moe_stats_json"]),
                 {"layer_0": {"tokens_per_expert": [5, 3]}},
             )
+
+    def test_json_safe_rejects_unsupported_objects_and_colliding_keys(self) -> None:
+        with self.assertRaisesRegex(TypeError, r"\$\.plugin_state"):
+            base.make_json_safe({"plugin_state": object()})
+
+        with self.assertRaisesRegex(ValueError, "重复的字典键"):
+            base.make_json_safe({1: "integer key", "1": "string key"})
 
     def test_plot_metadata_reads_switchvit_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
