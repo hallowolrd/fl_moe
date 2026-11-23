@@ -362,6 +362,207 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
             for name, value in global_state.items()
         }
 
+
+    def test_after_aggregate_rejects_shape_dtype_and_non_finite_state(self) -> None:
+        class MutatingAfterAggregateAggregator(base.Aggregator):
+            def __init__(self, cfg: Any, mutation: str) -> None:
+                super().__init__(cfg=cfg, param_group_name="expert")
+                self.mutation = mutation
+
+            @property
+            def method_name(self) -> str:
+                return "test_mutating_after_aggregate"
+
+            def compute_weights(self, client_updates):
+                return base.build_uniform_weights(client_updates)
+
+            def after_aggregate(self, model: nn.Module) -> None:
+                parameter = model.classifier.weight
+                if self.mutation == "shape":
+                    parameter.data = parameter.data[:1].clone()
+                elif self.mutation == "dtype":
+                    parameter.data = parameter.data.to(dtype=torch.float64)
+                elif self.mutation == "nan":
+                    parameter.data.fill_(float("nan"))
+                elif self.mutation == "inf":
+                    parameter.data.fill_(float("inf"))
+                else:
+                    raise AssertionError(f"Unknown mutation: {self.mutation}")
+
+        cases = (
+            ("shape", ValueError, "聚合后处理结果.*Tensor Shape 不匹配"),
+            ("dtype", TypeError, "聚合后处理结果.*Tensor Dtype 不匹配"),
+            ("nan", ValueError, "classifier.weight 中存在 NaN 或 Inf"),
+            ("inf", ValueError, "classifier.weight 中存在 NaN 或 Inf"),
+        )
+
+        for mutation, exception_type, message_pattern in cases:
+            with self.subTest(mutation=mutation):
+                cfg = make_cfg()
+                model = TinyTwoLayerMoEClassifier()
+                server = base.FLServer(
+                    cfg=cfg,
+                    client_loaders=[make_loader(11), make_loader(22)],
+                    test_loader=make_loader(33, num_samples=4),
+                    device="cpu",
+                    expert_aggregator_builder=(
+                        lambda received_cfg, selected_mutation=mutation:
+                        MutatingAfterAggregateAggregator(
+                            received_cfg,
+                            selected_mutation,
+                        )
+                    ),
+                    global_model=model,
+                )
+
+                model_state = server.global_model.state_dict()
+                model_delta = {
+                    name: torch.zeros_like(tensor)
+                    for name, tensor in model_state.items()
+                    if torch.is_floating_point(tensor)
+                }
+                update = base.ClientUpdate(
+                    client_id=0,
+                    round_id=1,
+                    num_samples=4,
+                    model_delta=model_delta,
+                    metrics={"num_batches": 1},
+                )
+
+                with self.assertRaisesRegex(exception_type, message_pattern):
+                    server.aggregate_client_updates([update])
+
+    def test_server_aggregators_receive_independent_state_snapshots(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class MutatingExpertAggregator(base.Aggregator):
+            @property
+            def method_name(self) -> str:
+                return "test_snapshot_isolation"
+
+            def compute_weights(self, client_updates):
+                return base.build_uniform_weights(client_updates)
+
+            def aggregate(
+                self,
+                global_state,
+                client_updates,
+                param_names=None,
+                base_state=None,
+                strict=True,
+            ):
+                if base_state is None:
+                    raise AssertionError("Expert aggregation must receive base_state.")
+
+                captured["expert_global_ref"] = global_state
+                captured["expert_base_ref"] = base_state
+                captured["expert_global_before"] = base.clone_state_dict(global_state)
+                captured["expert_base_before"] = base.clone_state_dict(base_state)
+                result_state = base.clone_state_dict(base_state)
+
+                # Deliberately mutate both inputs to emulate an unsafe custom plugin.
+                for tensor in global_state.values():
+                    tensor.add_(100)
+                for tensor in base_state.values():
+                    tensor.add_(200)
+
+                return base.AggregationResult(
+                    new_state_dict=result_state,
+                    weights={0: 1.0},
+                )
+
+        cfg = make_cfg()
+        server = base.FLServer(
+            cfg=cfg,
+            client_loaders=[make_loader(11), make_loader(22)],
+            test_loader=make_loader(33, num_samples=4),
+            device="cpu",
+            expert_aggregator_builder=lambda received_cfg: MutatingExpertAggregator(
+                cfg=received_cfg,
+                param_group_name="expert",
+            ),
+            global_model=TinyTwoLayerMoEClassifier(),
+        )
+        initial_state = base.clone_state_dict(server.global_model.state_dict())
+
+        def destructive_non_expert_aggregate(
+            *,
+            global_state,
+            client_updates,
+            param_names,
+            base_state,
+            strict,
+        ):
+            captured["non_expert_global_ref"] = global_state
+            result_state = base.clone_state_dict(global_state)
+            result = base.AggregationResult(
+                new_state_dict=result_state,
+                weights={0: 1.0},
+            )
+            captured["non_expert_result"] = result
+            captured["non_expert_result_before_expert"] = base.clone_state_dict(
+                result.new_state_dict
+            )
+
+            # The non-expert plugin mutates its received global-state argument.
+            for tensor in global_state.values():
+                tensor.add_(10)
+
+            return result
+
+        # Replace the fixed aggregator method only for this adversarial isolation test.
+        server.aggregators.non_expert.aggregate = destructive_non_expert_aggregate
+
+        update = base.ClientUpdate(
+            client_id=0,
+            round_id=1,
+            num_samples=4,
+            model_delta={},
+            metrics={"num_batches": 1},
+        )
+        server.aggregate_client_updates([update])
+
+        non_expert_input = captured["non_expert_global_ref"]
+        expert_input = captured["expert_global_ref"]
+        expert_base_input = captured["expert_base_ref"]
+        non_expert_result = captured["non_expert_result"]
+        non_expert_result_before = captured["non_expert_result_before_expert"]
+
+        for name, original_tensor in initial_state.items():
+            with self.subTest(parameter=name):
+                torch.testing.assert_close(
+                    captured["expert_global_before"][name],
+                    original_tensor,
+                )
+                torch.testing.assert_close(
+                    captured["expert_base_before"][name],
+                    non_expert_result_before[name],
+                )
+                torch.testing.assert_close(
+                    non_expert_result.new_state_dict[name],
+                    non_expert_result_before[name],
+                )
+                torch.testing.assert_close(
+                    server.global_model.state_dict()[name],
+                    original_tensor,
+                )
+
+                self.assertNotEqual(
+                    non_expert_input[name].data_ptr(),
+                    expert_input[name].data_ptr(),
+                )
+                self.assertNotEqual(
+                    non_expert_result.new_state_dict[name].data_ptr(),
+                    expert_base_input[name].data_ptr(),
+                )
+                self.assertTrue(
+                    torch.equal(
+                        non_expert_input[name],
+                        original_tensor + 10,
+                    )
+                )
+
+
     def test_uniform_client_server_support_two_moe_layers(self) -> None:
         self._run_one_round(
             uniform,
