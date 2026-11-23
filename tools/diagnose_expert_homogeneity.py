@@ -317,7 +317,13 @@ def _discover_moe_layers(
         if not isinstance(experts, (nn.ModuleDict, nn.ModuleList)):
             continue
         if len(experts) == 0:
-            continue
+            raise ValueError(
+                f"MoE 层 {module_name!r} 的 experts 容器不能为空。"
+            )
+        if len(experts) < 2:
+            raise ValueError(
+                f"MoE 层 {module_name!r} 至少需要两个专家才能计算同质化指标。"
+            )
 
         if isinstance(experts, nn.ModuleDict):
             expert_items = list(experts.items())
