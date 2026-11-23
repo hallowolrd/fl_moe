@@ -6586,9 +6586,11 @@ class FLClient:
             ClientUpdate:
                 包含 model_delta、num_samples、metrics、extra 等信息。
         """
-        global_state_cpu = state_dict_to(
-            global_model.state_dict(),
-            device="cpu",
+        global_state_cpu = clone_state_dict(
+            state_dict_to(
+                global_model.state_dict(),
+                device="cpu",
+            )
         )
 
         local_model = copy.deepcopy(global_model)
@@ -8403,9 +8405,11 @@ class FLServer:
                 unique_steps.pop() if len(unique_steps) == 1 else None
             )
 
-        global_state_cpu = state_dict_to(
-            self.global_model.state_dict(),
-            device="cpu",
+        global_state_cpu = clone_state_dict(
+            state_dict_to(
+                self.global_model.state_dict(),
+                device="cpu",
+            )
         )
 
         non_expert_result = self.aggregators.non_expert.aggregate(
