@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import csv
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -189,6 +192,104 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
                     if value is not None:
                         self.assertGreaterEqual(value, 0.0)
                         self.assertLessEqual(value, 1.0)
+
+    def test_negative_controls_and_token_cosine_are_deterministic(self) -> None:
+        rng_before = torch.random.get_rng_state().clone()
+        kwargs = dict(
+            model=self.model,
+            data_loader=self.loader,
+            device="cpu",
+            max_batches=1,
+            max_tokens_per_layer=13,
+            subspace_k=2,
+            expert_batch_size=16,
+            shuffled_cka_repeats=2,
+            shuffle_seed=77,
+            token_output_cosine=True,
+        )
+        first = diagnostics.diagnose_model_experts(**kwargs)
+        second = diagnostics.diagnose_model_experts(**kwargs)
+        self.assertEqual(first, second)
+        self.assertTrue(torch.equal(rng_before, torch.random.get_rng_state()))
+
+        self.assertEqual(first["controls"]["shuffled_cka_repeats"], 2)
+        for layer_report in first["layers"].values():
+            self.assertIn("token_output_cosine_mean", layer_report["summary"])
+            self.assertIn("hidden_cka_vs_shuffled_gap", layer_report["summary"])
+            for pair_report in layer_report["pairwise"].values():
+                self.assertEqual(pair_report["errors"], {})
+                self.assertEqual(
+                    len(pair_report["hidden_cka_shuffled_values"]), 2
+                )
+                self.assertEqual(
+                    len(pair_report["output_cka_shuffled_values"]), 2
+                )
+                self.assertEqual(
+                    pair_report["token_output_cosine"]["total_tokens"], 13
+                )
+                self.assertEqual(
+                    pair_report["token_output_cosine"]["valid_tokens"], 13
+                )
+                self.assertAlmostEqual(
+                    pair_report["token_output_cosine_mean"],
+                    pair_report["token_output_cosine"]["mean"],
+                    places=12,
+                )
+
+    def test_control_validation_rejects_bad_configuration(self) -> None:
+        for kwargs in (
+            {"shuffled_cka_repeats": -1},
+            {"shuffled_cka_repeats": True},
+            {"shuffle_seed": -1},
+            {"token_output_cosine": "yes"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises((TypeError, ValueError)):
+                    diagnostics.diagnose_model_experts(
+                        model=self.model,
+                        data_loader=self.loader,
+                        **kwargs,
+                    )
+
+    def test_output_is_root_level_metadata_and_csv_without_checkpoints(self) -> None:
+        report = diagnostics.diagnose_model_experts(
+            model=self.model,
+            data_loader=self.loader,
+            max_batches=1,
+            max_tokens_per_layer=13,
+            subspace_k=2,
+            shuffled_cka_repeats=1,
+            shuffle_seed=5,
+            token_output_cosine=True,
+        )
+        report["seed"] = 5
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "expert_diagnosis" / "initialization_controls"
+            output_dir = diagnostics._create_unique_diagnosis_directory(root)
+            paths = diagnostics.save_initialization_controls(
+                [report],
+                output_dir,
+                metadata={"checkpoint_saved": False},
+            )
+            self.assertTrue(all(path.exists() for path in paths.values()))
+            self.assertTrue((output_dir / "seed_5.json").exists())
+            config = json.loads(
+                (output_dir / "diagnosis_config.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(config["checkpoint_saved"])
+            with paths["summary"].open(encoding="utf-8", newline="") as file:
+                summary_rows = list(csv.DictReader(file))
+            self.assertTrue(summary_rows)
+            self.assertTrue(
+                any(row["metric"] == "token_output_cosine_mean"
+                    for row in summary_rows)
+            )
+            self.assertFalse(
+                any(path.suffix in (".pt", ".pth", ".ckpt")
+                    for path in output_dir.rglob("*"))
+            )
+            second_run_dir = diagnostics._create_unique_diagnosis_directory(root)
+            self.assertEqual(second_run_dir.name, "initialization_controls_v2")
 
     def test_diagnostic_preserves_model_state_and_removes_hooks(self) -> None:
         self.model.train()
