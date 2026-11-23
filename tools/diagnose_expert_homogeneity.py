@@ -22,6 +22,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
+# 直接执行本文件时，必须先导入 base.py 完成确定性环境初始化，
+# 再导入 torch；作为普通模块导入时不引入训练框架依赖。
+if __name__ == "__main__":
+    project_root = Path(__file__).resolve().parents[1]
+    algorithms_dir = project_root / "algorithms"
+    if str(algorithms_dir) not in sys.path:
+        sys.path.insert(0, str(algorithms_dir))
+    import base  # noqa: F401
+
 import torch
 from torch import nn
 
