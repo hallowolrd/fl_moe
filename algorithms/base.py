@@ -1730,6 +1730,15 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_positive_int(cfg, "test_batch_size")
     _require_non_negative_int(cfg, "num_workers")
     _require_positive_int(cfg, "num_experts")
+    # 允许所有划分模式读取一致的合法参数，但不允许产生空客户端。
+    _require_positive_int(cfg, "min_samples_per_client")
+    _require_positive_int(cfg, "partition_max_retries")
+    _require_finite_number(
+        cfg.get("label_smooth", _default_config_value("label_smooth")),
+        "label_smooth",
+        minimum=0.0,
+        maximum=1.0,
+    )
 
     server_evidence_cfg = cfg.get(
         "server_evidence", _default_config_value("server_evidence")
@@ -1836,7 +1845,20 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     optimizer_cfg = cfg.get("optimizer", _default_config_value("optimizer"))
     if not isinstance(optimizer_cfg, Mapping):
         raise ConfigError("optimizer 必须是 dict。")
-    _require_bool_value(
+
+    # grad_clip=0 与旧行为一致：明确关闭梯度裁剪；负数或非有限值不再静默关闭。
+    for clip_name, clip_value in (
+        ("grad_clip", cfg.get("grad_clip", _default_config_value("grad_clip"))),
+        ("optimizer.grad_clip", optimizer_cfg.get("grad_clip")),
+    ):
+        if clip_value is not None:
+            _require_finite_number(
+                clip_value,
+                clip_name,
+                minimum=0.0,
+            )
+
+    nesterov = _require_bool_value(
         optimizer_cfg.get("nesterov", _default_config_value("optimizer.nesterov")),
         "optimizer.nesterov",
     )
@@ -1864,6 +1886,37 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError(
             f"optimizer.weight_decay 必须是有限的非负数，当前值：{weight_decay}"
         )
+
+    momentum = _require_finite_number(
+        optimizer_cfg.get("momentum", _default_config_value("optimizer.momentum")),
+        "optimizer.momentum",
+        minimum=0.0,
+    )
+    if optimizer_type == "sgd" and nesterov and momentum <= 0.0:
+        raise ConfigError(
+            "optimizer.nesterov=True 时，SGD 的 optimizer.momentum 必须大于 0。"
+        )
+
+    betas = optimizer_cfg.get("betas", _default_config_value("optimizer.betas"))
+    if not isinstance(betas, (list, tuple)) or len(betas) != 2:
+        raise ConfigError(
+            "optimizer.betas 必须是包含两个数值的 list/tuple，"
+            f"当前值：{betas!r}。"
+        )
+    for index, beta in enumerate(betas):
+        _require_finite_number(
+            beta,
+            f"optimizer.betas[{index}]",
+            minimum=0.0,
+            maximum=1.0,
+            maximum_inclusive=False,
+        )
+    _require_finite_number(
+        optimizer_cfg.get("eps", _default_config_value("optimizer.eps")),
+        "optimizer.eps",
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
 
     run_cfg = cfg.get("run", _default_config_value("run"))
     if not isinstance(run_cfg, Mapping):
@@ -1903,6 +1956,52 @@ def _require_non_negative_int(cfg: Mapping[str, Any], key: str) -> None:
 
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(f"{key} 必须是非负整数，当前值：{value}")
+
+
+def _require_finite_number(
+    value: Any,
+    name: str,
+    *,
+    minimum: float = 0.0,
+    maximum: Optional[float] = None,
+    minimum_inclusive: bool = True,
+    maximum_inclusive: bool = True,
+) -> float:
+    """校验数值是否有限及合法范围；兼容可被 float() 解析的数值配置。"""
+    if isinstance(value, bool):
+        raise ConfigError(f"{name} 必须是有限数值，不能是 bool：{value!r}。")
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(
+            f"{name} 必须是有限数值，当前值：{value!r}。"
+        ) from exc
+    if not math.isfinite(numeric_value):
+        raise ConfigError(f"{name} 必须是有限数值，当前值：{value!r}。")
+
+    minimum_invalid = (
+        numeric_value < minimum
+        if minimum_inclusive
+        else numeric_value <= minimum
+    )
+    maximum_invalid = (
+        False
+        if maximum is None
+        else (
+            numeric_value > maximum
+            if maximum_inclusive
+            else numeric_value >= maximum
+        )
+    )
+    if minimum_invalid or maximum_invalid:
+        left = "[" if minimum_inclusive else "("
+        right = "]" if maximum_inclusive else ")"
+        upper = "+inf" if maximum is None else str(maximum)
+        raise ConfigError(
+            f"{name} 必须位于 {left}{minimum}, {upper}{right} 范围内，"
+            f"当前值：{value!r}。"
+        )
+    return numeric_value
 
 
 def _validate_switch_model_config(
@@ -7964,9 +8063,9 @@ def _get_grad_clip(cfg: Any) -> Optional[float]:
     if value is None:
         return None
 
-    value = float(value)
+    value = _require_finite_number(value, "grad_clip", minimum=0.0)
 
-    if value <= 0:
+    if value == 0:
         return None
 
     return value
@@ -8905,8 +9004,10 @@ class FLServer:
             )
         )
 
+        # 服务端保留私有基准快照；聚合器只能访问自己的独立副本。
+        # 即使聚合器执行原地操作，也不能污染后续专家聚合的参考状态。
         non_expert_result = self.aggregators.non_expert.aggregate(
-            global_state=global_state_cpu,
+            global_state=clone_state_dict(global_state_cpu),
             client_updates=client_updates,
             param_names=self.param_groups.non_expert,
             base_state=None,
@@ -8924,10 +9025,11 @@ class FLServer:
         )
 
         expert_result = self.aggregators.expert.aggregate(
-            global_state=global_state_cpu,
+            global_state=clone_state_dict(global_state_cpu),
             client_updates=client_updates,
             param_names=self.param_groups.expert,
-            base_state=non_expert_result.new_state_dict,
+            # 专家聚合器也不能原地修改非专家聚合器保存的输出。
+            base_state=clone_state_dict(non_expert_result.new_state_dict),
             strict=True,
         )
         if not isinstance(expert_result, AggregationResult):
