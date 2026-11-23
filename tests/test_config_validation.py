@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import torch.nn as nn
 
 os.environ.setdefault("PYTHONHASHSEED", "0")
 
@@ -176,7 +175,7 @@ class OptimizerConstructionTests(unittest.TestCase):
                         }
                     }
                 )
-                optimizer = base.build_optimizer(nn.Linear(3, 2), cfg)
+                optimizer = base.build_optimizer(base.nn.Linear(3, 2), cfg)
 
                 self.assertIsInstance(optimizer, expected_class)
                 param_group = optimizer.param_groups[0]
