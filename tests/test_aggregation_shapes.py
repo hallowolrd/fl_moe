@@ -124,5 +124,34 @@ class AggregationTensorShapeTests(unittest.TestCase):
         torch.testing.assert_close(result["bias"], torch.full((2,), 2.0))
 
 
+    def test_state_dict_shape_validator_rejects_dtype_mismatch(self) -> None:
+        candidate_state = {
+            "weight": self.global_state["weight"].to(dtype=torch.float64),
+            "bias": self.global_state["bias"].clone(),
+        }
+
+        with self.assertRaisesRegex(
+            TypeError,
+            r"expert 聚合结果.*weight.*Tensor Dtype 不匹配",
+        ):
+            base.validate_state_dict_shapes(
+                reference_state=self.global_state,
+                candidate_state=candidate_state,
+                context="expert 聚合结果",
+            )
+
+    def test_finite_state_dict_rejects_nan_and_infinity(self) -> None:
+        for invalid_value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(invalid_value=invalid_value):
+                candidate_state = base.clone_state_dict(self.global_state)
+                candidate_state["weight"][0, 0] = invalid_value
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"参数 weight 中存在 NaN 或 Inf",
+                ):
+                    base.check_finite_state_dict(candidate_state)
+
+
 if __name__ == "__main__":
     unittest.main()
