@@ -198,6 +198,8 @@ def compute_subspace_overlap(
             "权重矩阵 Shape 不一致："
             f"{tuple(weight_a.shape)} vs {tuple(weight_b.shape)}"
         )
+    if weight_a.device != weight_b.device:
+        raise ValueError("两个权重矩阵必须位于同一设备。")
     basis_a, _, _ = extract_topk_subspace(weight_a, k, side)
     basis_b, _, _ = extract_topk_subspace(weight_b, k, side)
     return compute_subspace_overlap_from_bases(basis_a, basis_b, k)
