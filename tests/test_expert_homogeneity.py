@@ -85,6 +85,30 @@ class SubspaceOverlapTests(unittest.TestCase):
             places=12,
         )
 
+    def test_cached_subspace_bases_match_direct_overlap(self) -> None:
+        weight_a = torch.randn(12, 8)
+        weight_b = torch.randn(12, 8)
+        basis_a, singular_values_a, rank_a = metrics.extract_topk_subspace(
+            weight_a, max_k=4, side="right"
+        )
+        basis_b, singular_values_b, rank_b = metrics.extract_topk_subspace(
+            weight_b, max_k=4, side="right"
+        )
+
+        self.assertEqual(basis_a.shape, (8, 4))
+        self.assertEqual(basis_b.shape, (8, 4))
+        self.assertEqual(singular_values_a.numel(), 8)
+        self.assertEqual(singular_values_b.numel(), 8)
+        self.assertEqual(rank_a, 8)
+        self.assertEqual(rank_b, 8)
+        cached = metrics.compute_subspace_overlap_from_bases(
+            basis_a, basis_b, k=3
+        )
+        direct = metrics.compute_subspace_overlap(
+            weight_a, weight_b, k=3, side="right"
+        )
+        self.assertAlmostEqual(cached, direct, places=12)
+
     def test_k_larger_than_effective_rank_is_rejected(self) -> None:
         weight = torch.diag(torch.tensor([1.0, 0.0, 0.0, 0.0]))
         with self.assertRaisesRegex(ValueError, "有效数值秩"):
