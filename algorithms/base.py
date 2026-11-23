@@ -1645,10 +1645,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         "pin_memory",
         allow_none=True,
     )
-    for key in ("token_dropping", "router_statistics"):
-        if key in model_cfg:
-            _require_bool_value(model_cfg[key], f"model_cfg.{key}")
-
     removed_model_fields = {"backbone", "moe_hidden_dim"}.intersection(model_cfg)
     if removed_model_fields:
         raise ConfigError(
@@ -1726,9 +1722,11 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             "请删除 input_shape 覆盖项，使用数据集默认输入尺寸。"
         )
 
+    _require_positive_int(cfg, "num_experts")
     _validate_switch_model_config(
         model_cfg=effective_model_cfg,
         input_shape=expected_input_shape,
+        num_experts=cfg["num_experts"],
     )
 
     _require_positive_int(cfg, "num_clients")
@@ -1745,7 +1743,6 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_positive_int(cfg, "batch_size")
     _require_positive_int(cfg, "test_batch_size")
     _require_non_negative_int(cfg, "num_workers")
-    _require_positive_int(cfg, "num_experts")
     # 允许所有划分模式读取一致的合法参数，但不允许产生空客户端。
     _require_positive_int(cfg, "min_samples_per_client")
     _require_positive_int(cfg, "partition_max_retries")
@@ -2029,84 +2026,259 @@ def _require_finite_number(
     return numeric_value
 
 
-def _validate_switch_model_config(
-    model_cfg: Mapping[str, Any],
+def _validate_switch_numeric_parameter(
+    value: Any,
+    name: str,
+    *,
+    minimum: float = 0.0,
+    maximum: Optional[float] = None,
+    maximum_inclusive: bool = True,
+) -> float:
+    """严格校验 Switch 模型的有限数值参数，不接受 bool 或数值字符串。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"{name} 必须是 int 或 float，"
+            f"当前值：{value!r}（类型：{type(value).__name__}）。"
+        )
+
+    try:
+        numeric_value = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} 必须是有限数值，当前值：{value!r}。") from exc
+    if not math.isfinite(numeric_value):
+        raise ValueError(f"{name} 必须是有限数值，当前值：{value!r}。")
+
+    minimum_invalid = numeric_value < minimum
+    maximum_invalid = (
+        False
+        if maximum is None
+        else (
+            numeric_value > maximum
+            if maximum_inclusive
+            else numeric_value >= maximum
+        )
+    )
+    if minimum_invalid or maximum_invalid:
+        upper = "+inf" if maximum is None else str(maximum)
+        right = "]" if maximum_inclusive else ")"
+        raise ValueError(
+            f"{name} 必须位于 [{minimum}, {upper}{right} 范围内，"
+            f"当前值：{value!r}。"
+        )
+    return numeric_value
+
+
+def _validate_switch_moe_parameters(
+    *,
+    num_experts: Any,
+    router_statistics: Any,
+    aux_loss_coef: Any,
+    capacity_factor: Any,
+    token_dropping: Any,
+    num_experts_name: str = "num_experts",
+    router_statistics_name: str = "router_statistics",
+    aux_loss_coef_name: str = "aux_loss_coef",
+    capacity_factor_name: str = "capacity_factor",
+    token_dropping_name: str = "token_dropping",
+) -> Tuple[float, float]:
+    """统一校验 SwitchMoE 的参数类型、数值范围及容量组合约束。"""
+    if not _is_positive_int_value(num_experts):
+        raise ValueError(f"{num_experts_name} 必须是正整数，当前值：{num_experts!r}。")
+    if type(router_statistics) is not bool:
+        raise TypeError(
+            f"{router_statistics_name} 必须是 bool，当前值：{router_statistics!r}"
+        )
+    if type(token_dropping) is not bool:
+        raise TypeError(
+            f"{token_dropping_name} 必须是 bool，当前值：{token_dropping!r}"
+        )
+
+    normalized_aux_loss_coef = _validate_switch_numeric_parameter(
+        aux_loss_coef,
+        aux_loss_coef_name,
+        minimum=0.0,
+    )
+    normalized_capacity_factor = _validate_switch_numeric_parameter(
+        capacity_factor,
+        capacity_factor_name,
+        minimum=0.0,
+    )
+
+    if token_dropping and normalized_capacity_factor <= 0.0:
+        raise ValueError(
+            f"{capacity_factor_name} 必须大于 0，"
+            f"因为 {token_dropping_name}=True。"
+        )
+    if (
+        normalized_capacity_factor > 0.0
+        and not token_dropping
+        and normalized_capacity_factor < 1.0
+    ):
+        raise ValueError(
+            f"启用容量限制但关闭 Token Dropping 时，{capacity_factor_name} "
+            "必须 >= 1.0，以保证总容量足以容纳全部 Token。"
+        )
+
+    return normalized_aux_loss_coef, normalized_capacity_factor
+
+
+def _validate_switch_vit_parameters(
+    *,
+    num_classes: Optional[int],
     input_shape: Sequence[int],
-) -> None:
-    """严格校验 SwitchViT 的整数结构参数及其组合约束。"""
-    if not isinstance(model_cfg, Mapping):
-        raise ConfigError("model_cfg 必须是 dict。")
+    transformer_layers: Any,
+    hidden_dim: Any,
+    attention_heads: Any,
+    patch_size: Any,
+    expert_hidden_dim: Any,
+    num_experts: Any,
+    moe_block_indices: Any,
+    dropout: Any,
+    routing: Any,
+    router_statistics: Any,
+    aux_loss_coef: Any,
+    capacity_factor: Any,
+    token_dropping: Any,
+    field_prefix: str = "",
+) -> Tuple[Tuple[int, int, int], Tuple[int, ...], float, float, float]:
+    """统一校验 SwitchViT 结构参数、MoE 参数及其组合约束。"""
+    if num_classes is not None and not _is_positive_int_value(num_classes):
+        raise ValueError(f"num_classes 必须是严格正整数，当前值：{num_classes!r}。")
 
     integer_fields = (
-        "transformer_layers",
-        "hidden_dim",
-        "attention_heads",
-        "patch_size",
-        "expert_hidden_dim",
+        ("transformer_layers", transformer_layers),
+        ("hidden_dim", hidden_dim),
+        ("attention_heads", attention_heads),
+        ("patch_size", patch_size),
+        ("expert_hidden_dim", expert_hidden_dim),
     )
-    for key in integer_fields:
-        value = model_cfg.get(key)
+    for key, value in integer_fields:
         if not _is_positive_int_value(value):
-            raise ConfigError(
-                f"model_cfg.{key} 必须是严格正整数，"
+            raise ValueError(
+                f"{field_prefix}{key} 必须是严格正整数，"
                 f"当前值：{value!r}（类型：{type(value).__name__}）。"
             )
 
-    transformer_layers = model_cfg["transformer_layers"]
-    hidden_dim = model_cfg["hidden_dim"]
-    attention_heads = model_cfg["attention_heads"]
-    patch_size = model_cfg["patch_size"]
-
-    if hidden_dim % attention_heads != 0:
-        raise ConfigError(
-            "model_cfg.hidden_dim 必须能被 model_cfg.attention_heads 整除，"
-            f"当前值：hidden_dim={hidden_dim}, "
-            f"attention_heads={attention_heads}。"
-        )
-
     if not isinstance(input_shape, (list, tuple)) or len(input_shape) != 3:
-        raise ConfigError(
-            "模型 input_shape 必须是包含 channels、height、width 的三元素序列。"
+        raise ValueError(
+            "input_shape 必须是包含 channels、height、width 的三元素 list/tuple，"
+            f"当前值：{input_shape!r}。"
         )
     if any(not _is_positive_int_value(value) for value in input_shape):
-        raise ConfigError(
-            f"模型 input_shape 必须全部由严格正整数组成，当前值：{input_shape!r}。"
+        raise ValueError(
+            "input_shape 的 channels、height、width 必须全部是严格正整数，"
+            f"当前值：{input_shape!r}。"
+        )
+
+    if hidden_dim % attention_heads != 0:
+        raise ValueError(
+            f"{field_prefix}hidden_dim 必须能被 {field_prefix}attention_heads 整除，"
+            f"当前值：hidden_dim={hidden_dim}, attention_heads={attention_heads}。"
         )
 
     image_height, image_width = input_shape[1], input_shape[2]
     if image_height % patch_size != 0 or image_width % patch_size != 0:
-        raise ConfigError(
-            "数据集图像尺寸必须能被 model_cfg.patch_size 整除，"
+        raise ValueError(
+            f"数据集图像尺寸必须能被 {field_prefix}patch_size 整除，"
             f"当前值：image_size={(image_height, image_width)}, "
             f"patch_size={patch_size}。"
         )
 
-    moe_block_indices = model_cfg.get("moe_block_indices")
     if not isinstance(moe_block_indices, (list, tuple)) or not moe_block_indices:
-        raise ConfigError(
-            "model_cfg.moe_block_indices 必须是非空 list/tuple。"
+        raise ValueError(
+            f"{field_prefix}moe_block_indices 必须是非空 list/tuple。"
         )
     if any(not _is_positive_int_value(index) for index in moe_block_indices):
-        raise ConfigError(
-            "model_cfg.moe_block_indices 中的每个层号都必须是严格正整数，"
+        raise ValueError(
+            f"{field_prefix}moe_block_indices 中的每个层号都必须是严格正整数，"
             f"当前值：{moe_block_indices!r}。"
         )
     if len(set(moe_block_indices)) != len(moe_block_indices):
-        raise ConfigError(
-            "model_cfg.moe_block_indices 不允许出现重复层号，"
+        raise ValueError(
+            f"{field_prefix}moe_block_indices 不允许出现重复层号，"
             f"当前值：{moe_block_indices!r}。"
         )
     invalid_indices = [
-        index
-        for index in moe_block_indices
-        if index > transformer_layers
+        index for index in moe_block_indices if index > transformer_layers
     ]
     if invalid_indices:
-        raise ConfigError(
-            "model_cfg.moe_block_indices 必须位于 "
+        raise ValueError(
+            f"{field_prefix}moe_block_indices 必须位于 "
             f"1 到 transformer_layers={transformer_layers} 的范围内，"
             f"非法层号：{invalid_indices}。"
         )
+
+    normalized_dropout = _validate_switch_numeric_parameter(
+        dropout,
+        f"{field_prefix}dropout",
+        minimum=0.0,
+        maximum=1.0,
+        maximum_inclusive=False,
+    )
+    if not isinstance(routing, str):
+        raise TypeError(
+            f"{field_prefix}routing 必须是字符串，当前值：{routing!r}。"
+        )
+    normalized_routing = routing.strip().lower()
+    if normalized_routing not in SUPPORTED_ROUTING_TYPES:
+        raise ValueError(
+            f"{field_prefix}routing 不受支持：{routing!r}。"
+            f"当前支持：{', '.join(SUPPORTED_ROUTING_TYPES)}。"
+        )
+
+    normalized_aux_loss_coef, normalized_capacity_factor = (
+        _validate_switch_moe_parameters(
+            num_experts=num_experts,
+            router_statistics=router_statistics,
+            aux_loss_coef=aux_loss_coef,
+            capacity_factor=capacity_factor,
+            token_dropping=token_dropping,
+            router_statistics_name=f"{field_prefix}router_statistics",
+            aux_loss_coef_name=f"{field_prefix}aux_loss_coef",
+            capacity_factor_name=f"{field_prefix}capacity_factor",
+            token_dropping_name=f"{field_prefix}token_dropping",
+        )
+    )
+
+    return (
+        tuple(input_shape),
+        tuple(moe_block_indices),
+        normalized_dropout,
+        normalized_aux_loss_coef,
+        normalized_capacity_factor,
+    )
+
+
+def _validate_switch_model_config(
+    model_cfg: Mapping[str, Any],
+    input_shape: Sequence[int],
+    num_experts: Any = DEFAULT_CONFIG["num_experts"],
+) -> None:
+    """统一校验配置加载和模型构建阶段使用的 SwitchViT 参数。"""
+    if not isinstance(model_cfg, Mapping):
+        raise ConfigError("model_cfg 必须是 dict。")
+
+    try:
+        _validate_switch_vit_parameters(
+            num_classes=None,
+            input_shape=input_shape,
+            transformer_layers=model_cfg.get("transformer_layers"),
+            hidden_dim=model_cfg.get("hidden_dim"),
+            attention_heads=model_cfg.get("attention_heads"),
+            patch_size=model_cfg.get("patch_size"),
+            expert_hidden_dim=model_cfg.get("expert_hidden_dim"),
+            num_experts=num_experts,
+            moe_block_indices=model_cfg.get("moe_block_indices"),
+            dropout=model_cfg.get("dropout"),
+            routing=model_cfg.get("routing"),
+            router_statistics=model_cfg.get("router_statistics"),
+            aux_loss_coef=model_cfg.get("aux_loss_coef"),
+            capacity_factor=model_cfg.get("capacity_factor"),
+            token_dropping=model_cfg.get("token_dropping"),
+            field_prefix="model_cfg.",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 # 各公共功能模块统一通过此接口读取配置。
@@ -5280,35 +5452,29 @@ class SwitchMoE(nn.Module):
         token_dropping: bool = DEFAULT_CONFIG["model_cfg"]["token_dropping"],
     ) -> None:
         super().__init__()
-        if not _is_positive_int_value(num_experts):
-            raise ValueError("num_experts 必须是正整数。")
-        if type(collect_router_statistics) is not bool:
-            raise TypeError(
-                "collect_router_statistics 必须是 bool，"
-                f"当前值：{collect_router_statistics!r}"
+        if not _is_positive_int_value(hidden_dim):
+            raise ValueError(f"hidden_dim 必须是正整数，当前值：{hidden_dim!r}。")
+        if not _is_positive_int_value(expert_hidden_dim):
+            raise ValueError(
+                f"expert_hidden_dim 必须是正整数，当前值：{expert_hidden_dim!r}。"
             )
-        if type(token_dropping) is not bool:
-            raise TypeError(
-                f"token_dropping 必须是 bool，当前值：{token_dropping!r}"
-            )
-
-        aux_loss_coef = float(aux_loss_coef)
-        capacity_factor = float(capacity_factor)
-        if not math.isfinite(aux_loss_coef) or aux_loss_coef < 0.0:
-            raise ValueError("aux_loss_coef 必须是非负有限数。")
-        if not math.isfinite(capacity_factor) or capacity_factor < 0.0:
-            raise ValueError("capacity_factor 必须是非负有限数。")
-        expert_capacity = capacity_factor > 0.0
+        dropout = _validate_switch_numeric_parameter(
+            dropout,
+            "dropout",
+            minimum=0.0,
+            maximum=1.0,
+            maximum_inclusive=False,
+        )
+        aux_loss_coef, capacity_factor = _validate_switch_moe_parameters(
+            num_experts=num_experts,
+            router_statistics=collect_router_statistics,
+            aux_loss_coef=aux_loss_coef,
+            capacity_factor=capacity_factor,
+            token_dropping=token_dropping,
+            router_statistics_name="collect_router_statistics",
+        )
         auxiliary_loss = aux_loss_coef > 0.0
-        if token_dropping and not expert_capacity:
-            raise ValueError(
-                "token_dropping=True 时 capacity_factor 必须大于 0。"
-            )
-        if expert_capacity and not token_dropping and capacity_factor < 1.0:
-            raise ValueError(
-                "启用容量限制但关闭 Token Dropping 时，capacity_factor "
-                "必须 >= 1.0，以保证总容量足以容纳全部 Token。"
-            )
+        expert_capacity = capacity_factor > 0.0
 
         self.num_experts = num_experts
         self.collect_router_statistics = collect_router_statistics
@@ -5631,61 +5797,37 @@ class SwitchViT(nn.Module):
         token_dropping: bool = DEFAULT_CONFIG["model_cfg"]["token_dropping"],
     ) -> None:
         super().__init__()
-
-        if len(input_shape) != 3:
-            raise ValueError(
-                "input_shape 必须为 (channels, height, width)，"
-                f"当前值：{input_shape}"
-            )
-        in_channels, image_height, image_width = (
-            int(input_shape[0]),
-            int(input_shape[1]),
-            int(input_shape[2]),
+        (
+            self.input_shape,
+            normalized_moe_blocks,
+            dropout,
+            aux_loss_coef,
+            capacity_factor,
+        ) = _validate_switch_vit_parameters(
+            num_classes=num_classes,
+            input_shape=input_shape,
+            transformer_layers=transformer_layers,
+            hidden_dim=hidden_dim,
+            attention_heads=attention_heads,
+            patch_size=patch_size,
+            expert_hidden_dim=expert_hidden_dim,
+            num_experts=num_experts,
+            moe_block_indices=moe_block_indices,
+            dropout=dropout,
+            routing=ROUTING_TOP1,
+            router_statistics=router_statistics,
+            aux_loss_coef=aux_loss_coef,
+            capacity_factor=capacity_factor,
+            token_dropping=token_dropping,
         )
-        if min(in_channels, image_height, image_width) <= 0:
-            raise ValueError(f"非法 input_shape：{input_shape}")
-        if min(
-            transformer_layers,
-            hidden_dim,
-            attention_heads,
-            patch_size,
-            expert_hidden_dim,
-            num_classes,
-        ) <= 0:
-            raise ValueError(
-                "transformer_layers、hidden_dim、attention_heads、patch_size、"
-                "expert_hidden_dim 和 num_classes 必须为正整数。"
-            )
-        if not 0.0 <= float(dropout) < 1.0:
-            raise ValueError(f"dropout 必须位于 [0, 1)，当前值：{dropout}")
-        if image_height % patch_size != 0 or image_width % patch_size != 0:
-            raise ValueError(
-                f"图像尺寸 {(image_height, image_width)} 必须能被 "
-                f"patch_size={patch_size} 整除。"
-            )
-        if hidden_dim % attention_heads != 0:
-            raise ValueError(
-                f"hidden_dim={hidden_dim} 必须能被 "
-                f"attention_heads={attention_heads} 整除。"
-            )
+        in_channels, image_height, image_width = self.input_shape
 
-        normalized_moe_blocks = tuple(int(index) for index in moe_block_indices)
-        if (
-            not normalized_moe_blocks
-            or len(set(normalized_moe_blocks)) != len(normalized_moe_blocks)
-            or any(index < 1 or index > transformer_layers for index in normalized_moe_blocks)
-        ):
-            raise ValueError(
-                "moe_block_indices 必须是无重复且位于模型层数范围内的 1-based 层号。"
-            )
-
-        self.num_classes = int(num_classes)
-        self.input_shape = (in_channels, image_height, image_width)
-        self.transformer_layers = int(transformer_layers)
-        self.hidden_dim = int(hidden_dim)
+        self.num_classes = num_classes
+        self.transformer_layers = transformer_layers
+        self.hidden_dim = hidden_dim
         self.num_experts = num_experts
         self.moe_block_indices = normalized_moe_blocks
-        self.patch_size = int(patch_size)
+        self.patch_size = patch_size
 
         grid_height = image_height // patch_size
         grid_width = image_width // patch_size
@@ -5791,15 +5933,6 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
     """根据公共实验配置构建默认 SwitchViT 模型。"""
     model_cfg = _switch_model_config(cfg)
 
-    if str(model_cfg["routing"]).strip().lower() not in SUPPORTED_ROUTING_TYPES:
-        raise ValueError("当前 SwitchViT 仅实现 Top-1 Routing。")
-
-    # MoE 自身的选项约束由 SwitchMoE.__init__ 统一负责。
-    token_dropping = model_cfg["token_dropping"]
-    router_statistics = model_cfg["router_statistics"]
-    aux_loss_coef = model_cfg["aux_loss_coef"]
-    capacity_factor = model_cfg["capacity_factor"]
-
     num_experts = _cfg_get(
         cfg,
         "num_experts",
@@ -5816,27 +5949,29 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
 
     # 数据集注册信息是类别数和输入尺寸的唯一来源。
     input_shape = tuple(dataset_info["input_shape"])
-    num_classes = int(dataset_info["num_classes"])
+    num_classes = dataset_info["num_classes"]
     _validate_switch_model_config(
         model_cfg=model_cfg,
         input_shape=input_shape,
+        num_experts=num_experts,
     )
 
+    # 配置值已通过统一校验；构造器仍会调用相同规则进行防御性检查。
     return SwitchViT(
-        num_classes=int(num_classes),
+        num_classes=num_classes,
         input_shape=input_shape,
-        transformer_layers=int(model_cfg["transformer_layers"]),
-        hidden_dim=int(model_cfg["hidden_dim"]),
-        attention_heads=int(model_cfg["attention_heads"]),
-        patch_size=int(model_cfg["patch_size"]),
-        expert_hidden_dim=int(model_cfg["expert_hidden_dim"]),
+        transformer_layers=model_cfg["transformer_layers"],
+        hidden_dim=model_cfg["hidden_dim"],
+        attention_heads=model_cfg["attention_heads"],
+        patch_size=model_cfg["patch_size"],
+        expert_hidden_dim=model_cfg["expert_hidden_dim"],
         num_experts=num_experts,
         moe_block_indices=model_cfg["moe_block_indices"],
-        dropout=float(model_cfg["dropout"]),
-        router_statistics=router_statistics,
-        aux_loss_coef=aux_loss_coef,
-        capacity_factor=capacity_factor,
-        token_dropping=token_dropping,
+        dropout=model_cfg["dropout"],
+        router_statistics=model_cfg["router_statistics"],
+        aux_loss_coef=model_cfg["aux_loss_coef"],
+        capacity_factor=model_cfg["capacity_factor"],
+        token_dropping=model_cfg["token_dropping"],
     )
 
 

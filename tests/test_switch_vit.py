@@ -27,6 +27,47 @@ class SwitchViTTests(unittest.TestCase):
             "model_cfg": {},
         }
 
+    def test_invalid_switch_parameters_are_rejected_during_config_loading(self) -> None:
+        invalid_model_values = (
+            ("transformer_layers", 0),
+            ("hidden_dim", True),
+            ("attention_heads", 3),
+            ("patch_size", 7),
+            ("expert_hidden_dim", 0),
+            ("moe_block_indices", [2, 2]),
+            ("dropout", 1.0),
+            ("routing", "top2"),
+            ("aux_loss_coef", -0.1),
+            ("capacity_factor", float("nan")),
+            ("capacity_factor", 0.5),
+            ("token_dropping", 1),
+            ("token_dropping", True),
+            ("router_statistics", 1),
+        )
+        for field, value in invalid_model_values:
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(base.ConfigError):
+                    base.load_embedded_config(
+                        config_overrides={"model_cfg": {field: value}}
+                    )
+
+        with self.assertRaisesRegex(base.ConfigError, "num_experts"):
+            base.load_embedded_config(config_overrides={"num_experts": 0})
+
+    def test_switch_vit_constructor_uses_shared_parameter_validation(self) -> None:
+        common = {
+            "num_classes": 10,
+            "input_shape": (3, 32, 32),
+        }
+        with self.assertRaisesRegex(ValueError, "hidden_dim"):
+            base.SwitchViT(**common, hidden_dim=255)
+        with self.assertRaisesRegex(ValueError, "dropout"):
+            base.SwitchViT(**common, dropout=1.0)
+        with self.assertRaisesRegex(TypeError, "router_statistics"):
+            base.SwitchViT(**common, router_statistics=1)
+        with self.assertRaisesRegex(ValueError, "moe_block_indices"):
+            base.SwitchViT(**common, moe_block_indices=(2, 2))
+
     def test_switch_vit_cli_options_map_to_model_cfg(self) -> None:
         argv = [
             "uniform.py",
@@ -285,7 +326,7 @@ class SwitchViTTests(unittest.TestCase):
                     **self.cfg,
                     "num_experts": value,
                 }
-                with self.assertRaisesRegex(ValueError, "num_experts"):
+                with self.assertRaisesRegex(base.ConfigError, "num_experts"):
                     base.build_switch_vit_model(cfg)
 
     def test_switch_moe_requires_positive_integer_expert_count(self) -> None:
@@ -309,6 +350,21 @@ class SwitchViTTests(unittest.TestCase):
                 with self.assertRaisesRegex(TypeError, field):
                     base.SwitchMoE(**common, **{field: 1})
 
+    def test_switch_moe_constructor_validates_dimensions_and_dropout(self) -> None:
+        common = {
+            "hidden_dim": 4,
+            "expert_hidden_dim": 8,
+            "num_experts": 2,
+        }
+        with self.assertRaisesRegex(ValueError, "hidden_dim"):
+            base.SwitchMoE(**{**common, "hidden_dim": 0})
+        with self.assertRaisesRegex(ValueError, "expert_hidden_dim"):
+            base.SwitchMoE(**{**common, "expert_hidden_dim": 0})
+        with self.assertRaisesRegex(ValueError, "dropout"):
+            base.SwitchMoE(**common, dropout=1.0)
+        with self.assertRaisesRegex(TypeError, "dropout"):
+            base.SwitchMoE(**common, dropout="0.1")
+
     def test_switch_moe_constructor_validates_numeric_and_capacity_options(self) -> None:
         common = {
             "hidden_dim": 4,
@@ -316,6 +372,11 @@ class SwitchViTTests(unittest.TestCase):
             "num_experts": 2,
         }
         for field in ("aux_loss_coef", "capacity_factor"):
+            for value in ("0.1", True):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(TypeError, field):
+                        base.SwitchMoE(**common, **{field: value})
+
             for value in (-0.1, float("inf"), float("nan")):
                 with self.subTest(field=field, value=value):
                     with self.assertRaisesRegex(ValueError, field):
@@ -334,15 +395,21 @@ class SwitchViTTests(unittest.TestCase):
                 token_dropping=False,
             )
 
-    def test_switch_vit_builder_relies_on_switch_moe_boolean_validation(self) -> None:
+    def test_switch_vit_builder_rejects_invalid_moe_boolean_options(self) -> None:
         for field in ("token_dropping", "router_statistics"):
             with self.subTest(field=field):
                 cfg = {
                     **self.cfg,
                     "model_cfg": {field: 1},
                 }
-                with self.assertRaisesRegex(TypeError, field):
+                with self.assertRaisesRegex(base.ConfigError, field):
                     base.build_switch_vit_model(cfg)
+
+        with self.assertRaisesRegex(base.ConfigError, "routing"):
+            base.build_switch_vit_model({
+                **self.cfg,
+                "model_cfg": {"routing": "top2"},
+            })
 
     def test_capacity_reroutes_overflow_across_all_experts_without_dropping(self) -> None:
         moe = self._make_constant_router_moe(
@@ -416,7 +483,7 @@ class SwitchViTTests(unittest.TestCase):
         self.assertEqual(int(stats["overflow_tokens_per_expert"].sum().item()), 6)
 
     def test_capacity_and_token_dropping_configuration_validation(self) -> None:
-        with self.assertRaisesRegex(ValueError, "capacity_factor"):
+        with self.assertRaisesRegex(base.ConfigError, "capacity_factor"):
             base.build_switch_vit_model({
                 **self.cfg,
                 "model_cfg": {
@@ -425,7 +492,7 @@ class SwitchViTTests(unittest.TestCase):
                 },
             })
 
-        with self.assertRaisesRegex(ValueError, "capacity_factor"):
+        with self.assertRaisesRegex(base.ConfigError, "capacity_factor"):
             base.build_switch_vit_model({
                 **self.cfg,
                 "model_cfg": {
