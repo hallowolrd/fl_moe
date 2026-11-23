@@ -137,19 +137,15 @@ def _parse_startup_seed_value(
             raise ValueError("seed 不能为空。")
         try:
             if yaml_scalar:
-                unsigned_value = value.lstrip("+-").lower()
-                if unsigned_value.startswith(("0x", "0o", "0b")):
-                    base = 0
-                elif len(unsigned_value) > 1 and unsigned_value.startswith("0"):
-                    # PyYAML 的 YAML 1.1 整数解析会将前导零整数解释为八进制。
-                    base = 8
-                else:
-                    base = 10
+                # 使用与正式配置加载相同的 YAML 标量语义，避免将带引号的
+                # 数字字符串误判为整数，也兼容 PyYAML 支持的整数表示。
+                import yaml
+
+                parsed_seed = yaml.safe_load(value)
             else:
                 # argparse 的 type=int 使用十进制解析，CLI 启动预检必须保持一致。
-                base = 10
-            parsed_seed = int(value, base)
-        except ValueError as exc:
+                parsed_seed = int(value, 10)
+        except Exception as exc:
             raise ValueError(
                 f"seed 必须是整数标量，当前值：{raw_seed!r}。"
             ) from exc
@@ -280,7 +276,8 @@ def _read_top_level_scalar_from_yaml_like_file(
                 continue
 
             if name == key and indent == 0:
-                local_value = value
+                # 保留原始标量的引号信息，启动阶段才能区分 YAML 整数与数字字符串。
+                local_value = raw_value
                 continue
 
     # 当前配置里的 seed 优先级高于 include；多个 include 按正式加载器的
