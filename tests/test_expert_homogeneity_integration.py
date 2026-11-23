@@ -55,6 +55,29 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
                 ["expert_0", "expert_1", "expert_2"],
             )
 
+    def test_discovers_three_moe_layers_from_switch_vit_block_indices(self) -> None:
+        model = base.SwitchViT(
+            num_classes=4,
+            input_shape=(3, 8, 8),
+            transformer_layers=6,
+            hidden_dim=8,
+            attention_heads=2,
+            patch_size=4,
+            expert_hidden_dim=16,
+            num_experts=3,
+            moe_block_indices=(2, 4, 6),
+            router_statistics=False,
+        )
+        layers = diagnostics._discover_moe_layers(model)
+        self.assertEqual(
+            set(layers),
+            {
+                "blocks.1.mlp",
+                "blocks.3.mlp",
+                "blocks.5.mlp",
+            },
+        )
+
     def test_collects_all_experts_on_identical_layer_inputs(self) -> None:
         captured_inputs: dict[str, list[torch.Tensor]] = {}
         grad_modes: list[bool] = []
