@@ -51,6 +51,8 @@ def compute_weight_cosine(
             "权重 Tensor Shape 不一致："
             f"{tuple(weight_a.shape)} vs {tuple(weight_b.shape)}"
         )
+    if weight_a.device != weight_b.device:
+        raise ValueError("两个权重 Tensor 必须位于同一设备。")
 
     a = _to_float64(weight_a).reshape(-1)
     b = _to_float64(weight_b).reshape(-1)
@@ -148,6 +150,19 @@ def compute_subspace_overlap_from_bases(
 
     a = _to_float64(basis_a[:, :k])
     b = _to_float64(basis_b[:, :k])
+    identity = torch.eye(k, dtype=torch.float64, device=a.device)
+    if not torch.allclose(
+        a.transpose(0, 1) @ a,
+        identity,
+        atol=1e-5,
+        rtol=1e-5,
+    ) or not torch.allclose(
+        b.transpose(0, 1) @ b,
+        identity,
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise ValueError("输入必须是列正交归一的子空间基。")
     cross = a.transpose(0, 1) @ b
     overlap = cross.square().sum() / k
     return float(overlap.clamp(min=0.0, max=1.0).item())
@@ -212,6 +227,8 @@ def compute_linear_cka(
             "CKA 输入样本数不一致："
             f"{features_a.shape[0]} vs {features_b.shape[0]}"
         )
+    if features_a.device != features_b.device:
+        raise ValueError("CKA 两个特征 Tensor 必须位于同一设备。")
     if features_a.shape[0] < 2:
         raise ValueError("Linear CKA 至少需要两个对齐样本。")
     if features_a.shape[1] == 0 or features_b.shape[1] == 0:
@@ -256,6 +273,8 @@ def compute_normalized_output_mse(
             "专家输出 Shape 不一致："
             f"{tuple(output_a.shape)} vs {tuple(output_b.shape)}"
         )
+    if output_a.device != output_b.device:
+        raise ValueError("两个专家输出必须位于同一设备。")
     if not math.isfinite(eps) or eps <= 0.0:
         raise ValueError(f"eps 必须是有限正数，当前值：{eps!r}")
 
