@@ -419,7 +419,7 @@ def _collect_expert_representations(
 
 def _summarize_pairwise_metrics(
     pairwise: Mapping[str, Mapping[str, Any]],
-) -> dict[str, dict[str, float | None]]:
+) -> dict[str, dict[str, float | int | None]]:
     """汇总所有专家对的指标均值、最小值和最大值。"""
     metric_names = (
         "fc1_weight_cosine",
@@ -811,17 +811,19 @@ def main(argv: list[str] | None = None) -> int:
     if num_workers < 0:
         raise ValueError("--num-workers 必须是非负整数。")
 
-    test_loader = base.build_test_loader(
-        test_dataset=dataset_bundle.test_dataset,
+    diagnostic_loader = base._build_dataloader(
+        dataset=dataset_bundle.train_evidence_dataset,
         batch_size=batch_size,
+        shuffle=False,
         num_workers=num_workers,
-        pin_memory=device.type == "cuda",
+        pin_memory=base._infer_pin_memory(cfg),
+        drop_last=False,
         seed=int(cfg.seed),
     )
     model = base.build_switch_vit_model(cfg).to(device)
     report = diagnose_model_experts(
         model=model,
-        data_loader=test_loader,
+        data_loader=diagnostic_loader,
         device=device,
         max_batches=args.max_batches,
         max_tokens_per_layer=args.max_tokens_per_layer,
@@ -831,6 +833,7 @@ def main(argv: list[str] | None = None) -> int:
     report["dataset"] = str(cfg.dataset)
     report["model"] = "SwitchViT"
     report["model_state"] = "random_initialization"
+    report["data_split"] = "train_evidence_no_augmentation"
     report["device"] = str(device)
 
     output_path = args.output.expanduser().resolve()
