@@ -1294,11 +1294,17 @@ def _apply_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
     dataset_name = normalize_dataset_name(cfg["dataset"])
     cfg["dataset"] = dataset_name
 
-    cfg.setdefault("num_classes", _infer_num_classes(dataset_name))
-
     dataset_info = DATASET_INFO.get(dataset_name)
-    if dataset_info is not None:
-        cfg.setdefault("input_shape", tuple(dataset_info["input_shape"]))
+    if dataset_info is None:
+        raise ConfigError(
+            f"无法根据数据集 {dataset_name!r} 推断模型元信息。"
+        )
+
+    # 类别数和输入尺寸均由数据集注册信息决定；显式配置只允许与其一致。
+    if cfg.get("num_classes") is None:
+        cfg["num_classes"] = _infer_num_classes(dataset_name)
+    if cfg.get("input_shape") is None:
+        cfg["input_shape"] = tuple(dataset_info["input_shape"])
 
     return cfg
 
@@ -1532,6 +1538,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     model_cfg = cfg.get("model_cfg", _default_config_value("model_cfg"))
     if not isinstance(model_cfg, Mapping):
         raise ConfigError("model_cfg 必须是 dict。")
+    effective_model_cfg = _deep_merge(
+        base=_default_config_value("model_cfg"),
+        override=dict(model_cfg),
+    )
 
     for key in (
         "data_augmentation",
@@ -1592,6 +1602,46 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         )
 
     _require_positive_int(cfg, "num_classes")
+    dataset_info = DATASET_INFO.get(dataset)
+    if dataset_info is None:
+        raise ConfigError(
+            f"数据集 {dataset!r} 缺少 DATASET_INFO 注册信息。"
+        )
+
+    expected_num_classes = int(dataset_info["num_classes"])
+    if cfg["num_classes"] != expected_num_classes:
+        raise ConfigError(
+            f"num_classes 与数据集 {dataset!r} 不一致："
+            f"配置值为 {cfg['num_classes']}，"
+            f"数据集注册值为 {expected_num_classes}。"
+            "请删除 num_classes 覆盖项，或改为数据集对应的类别数。"
+        )
+
+    expected_input_shape = tuple(dataset_info["input_shape"])
+    input_shape = cfg.get("input_shape")
+    if not isinstance(input_shape, (list, tuple)) or len(input_shape) != 3:
+        raise ConfigError(
+            "input_shape 必须是包含 channels、height、width 的三元素 list/tuple，"
+            f"当前值：{input_shape!r}。"
+        )
+    if any(not _is_positive_int_value(value) for value in input_shape):
+        raise ConfigError(
+            "input_shape 的 channels、height、width 必须全部是严格正整数，"
+            f"当前值：{input_shape!r}。"
+        )
+    if tuple(input_shape) != expected_input_shape:
+        raise ConfigError(
+            f"input_shape 与数据集 {dataset!r} 不一致："
+            f"配置值为 {tuple(input_shape)}，"
+            f"数据集注册值为 {expected_input_shape}。"
+            "请删除 input_shape 覆盖项，使用数据集默认输入尺寸。"
+        )
+
+    _validate_switch_model_config(
+        model_cfg=effective_model_cfg,
+        input_shape=expected_input_shape,
+    )
+
     _require_positive_int(cfg, "num_clients")
     _require_positive_int(cfg, "rounds")
     _require_non_negative_int(cfg, "local_epochs")
@@ -1780,6 +1830,86 @@ def _require_non_negative_int(cfg: Mapping[str, Any], key: str) -> None:
 
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigError(f"{key} 必须是非负整数，当前值：{value}")
+
+
+def _validate_switch_model_config(
+    model_cfg: Mapping[str, Any],
+    input_shape: Sequence[int],
+) -> None:
+    """严格校验 SwitchViT 的整数结构参数及其组合约束。"""
+    if not isinstance(model_cfg, Mapping):
+        raise ConfigError("model_cfg 必须是 dict。")
+
+    integer_fields = (
+        "transformer_layers",
+        "hidden_dim",
+        "attention_heads",
+        "patch_size",
+        "expert_hidden_dim",
+    )
+    for key in integer_fields:
+        value = model_cfg.get(key)
+        if not _is_positive_int_value(value):
+            raise ConfigError(
+                f"model_cfg.{key} 必须是严格正整数，"
+                f"当前值：{value!r}（类型：{type(value).__name__}）。"
+            )
+
+    transformer_layers = model_cfg["transformer_layers"]
+    hidden_dim = model_cfg["hidden_dim"]
+    attention_heads = model_cfg["attention_heads"]
+    patch_size = model_cfg["patch_size"]
+
+    if hidden_dim % attention_heads != 0:
+        raise ConfigError(
+            "model_cfg.hidden_dim 必须能被 model_cfg.attention_heads 整除，"
+            f"当前值：hidden_dim={hidden_dim}, "
+            f"attention_heads={attention_heads}。"
+        )
+
+    if not isinstance(input_shape, (list, tuple)) or len(input_shape) != 3:
+        raise ConfigError(
+            "模型 input_shape 必须是包含 channels、height、width 的三元素序列。"
+        )
+    if any(not _is_positive_int_value(value) for value in input_shape):
+        raise ConfigError(
+            f"模型 input_shape 必须全部由严格正整数组成，当前值：{input_shape!r}。"
+        )
+
+    image_height, image_width = input_shape[1], input_shape[2]
+    if image_height % patch_size != 0 or image_width % patch_size != 0:
+        raise ConfigError(
+            "数据集图像尺寸必须能被 model_cfg.patch_size 整除，"
+            f"当前值：image_size={(image_height, image_width)}, "
+            f"patch_size={patch_size}。"
+        )
+
+    moe_block_indices = model_cfg.get("moe_block_indices")
+    if not isinstance(moe_block_indices, (list, tuple)) or not moe_block_indices:
+        raise ConfigError(
+            "model_cfg.moe_block_indices 必须是非空 list/tuple。"
+        )
+    if any(not _is_positive_int_value(index) for index in moe_block_indices):
+        raise ConfigError(
+            "model_cfg.moe_block_indices 中的每个层号都必须是严格正整数，"
+            f"当前值：{moe_block_indices!r}。"
+        )
+    if len(set(moe_block_indices)) != len(moe_block_indices):
+        raise ConfigError(
+            "model_cfg.moe_block_indices 不允许出现重复层号，"
+            f"当前值：{moe_block_indices!r}。"
+        )
+    invalid_indices = [
+        index
+        for index in moe_block_indices
+        if index > transformer_layers
+    ]
+    if invalid_indices:
+        raise ConfigError(
+            "model_cfg.moe_block_indices 必须位于 "
+            f"1 到 transformer_layers={transformer_layers} 的范围内，"
+            f"非法层号：{invalid_indices}。"
+        )
 
 
 # 各公共功能模块统一通过此接口读取配置。
@@ -5255,15 +5385,13 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
             f"无法根据数据集 {dataset_name!r} 推断模型输入尺寸和类别数量。"
         )
 
-    input_shape = _cfg_get(cfg, "input_shape", None)
-    if input_shape is None:
-        input_shape = tuple(dataset_info["input_shape"])
-    if not isinstance(input_shape, (tuple, list)):
-        raise TypeError("input_shape 必须是包含 channels、height、width 的序列。")
-
-    num_classes = _cfg_get(cfg, "num_classes", None)
-    if num_classes is None:
-        num_classes = int(dataset_info["num_classes"])
+    # 数据集注册信息是类别数和输入尺寸的唯一来源。
+    input_shape = tuple(dataset_info["input_shape"])
+    num_classes = int(dataset_info["num_classes"])
+    _validate_switch_model_config(
+        model_cfg=model_cfg,
+        input_shape=input_shape,
+    )
 
     return SwitchViT(
         num_classes=int(num_classes),
@@ -7954,48 +8082,112 @@ class ServerTrainResult:
         }
 
 
-def validate_equal_client_update_steps(
+def collect_client_update_steps(
     client_updates: Sequence[ClientUpdate],
-) -> int:
+) -> Dict[int, int]:
     """
-    检查本轮所有参与客户端实际执行的本地梯度更新次数是否一致。
+    校验并收集本轮每个客户端的实际本地梯度更新次数。
 
-    ClientTrainStats.num_batches 记录每次 optimizer/strategy 更新对应的 batch 数，
-    因此这里检查 metrics["num_batches"]，而不是只检查配置值。
+    Epoch 和 Steps 两种模式都必须满足更新次数为合法正整数值；
+    是否要求客户端之间一致，由训练模式单独决定。
     """
     if not client_updates:
         raise ValueError("client_updates 不能为空。")
 
     steps_by_client: Dict[int, int] = {}
     for update in client_updates:
-        client_id = int(update.client_id)
-        raw_steps = update.metrics.get("num_batches")
+        raw_client_id = update.client_id
         if (
-            isinstance(raw_steps, bool)
-            or not isinstance(raw_steps, (int, float))
-            or not math.isfinite(float(raw_steps))
-            or not float(raw_steps).is_integer()
-            or int(raw_steps) <= 0
+            isinstance(raw_client_id, bool)
+            or not isinstance(raw_client_id, int)
+            or raw_client_id < 0
         ):
             raise ValueError(
-                f"客户端 {client_id} 的实际本地更新次数无效："
-                f"metrics['num_batches']={raw_steps!r}。"
+                f"客户端 ID 必须是非负整数，当前值：{raw_client_id!r}。"
             )
+        client_id = raw_client_id
         if client_id in steps_by_client:
             raise ValueError(f"本轮出现重复的客户端更新：client_id={client_id}。")
+
+        metrics = update.metrics
+        if not isinstance(metrics, Mapping):
+            raise ValueError(
+                f"客户端 {client_id} 的 metrics 必须是 Mapping，"
+                f"当前类型：{type(metrics).__name__}。"
+            )
+        raw_steps = metrics.get("num_batches")
+        valid_steps = (
+            not isinstance(raw_steps, bool)
+            and (
+                isinstance(raw_steps, int)
+                or (
+                    isinstance(raw_steps, float)
+                    and math.isfinite(raw_steps)
+                    and raw_steps.is_integer()
+                )
+            )
+            and int(raw_steps) > 0
+        )
+        if not valid_steps:
+            raise ValueError(
+                f"客户端 {client_id} 的实际本地更新次数无效："
+                f"metrics['num_batches']={raw_steps!r}；"
+                "必须是有限的正整数值。"
+            )
         steps_by_client[client_id] = int(raw_steps)
+
+    return steps_by_client
+
+
+def _validate_equal_client_update_steps_by_client(
+    steps_by_client: Mapping[int, int],
+    expected_steps: Optional[int] = None,
+) -> int:
+    """检查 Steps 模式的客户端实际更新次数一致性及配置值约束。"""
+    if not steps_by_client:
+        raise ValueError("steps_by_client 不能为空。")
+    if expected_steps is not None and not _is_positive_int_value(expected_steps):
+        raise ValueError(
+            f"expected_steps 必须是严格正整数，当前值：{expected_steps!r}。"
+        )
+
+    if expected_steps is not None:
+        mismatched_steps = {
+            client_id: steps
+            for client_id, steps in steps_by_client.items()
+            if steps != expected_steps
+        }
+        if mismatched_steps:
+            raise ValueError(
+                "Steps 模式要求每个客户端的实际更新次数严格等于 "
+                f"local_steps={expected_steps}；"
+                f"当前不符合要求的客户端更新次数：{mismatched_steps}。"
+            )
 
     unique_steps = set(steps_by_client.values())
     if len(unique_steps) != 1:
         raise ValueError(
-            "本轮所有参与客户端必须执行相同数量的本地梯度更新；"
-            f"当前实际更新次数：{steps_by_client}。"
-            "请设置统一的顶层 local_steps（命令行使用 --local-steps K）；"
-            "如果使用 Epoch 模式，请确保各客户端 DataLoader 的 batch 数一致，"
-            "例如采用 sample_balance=balanced。"
+            "Steps 模式要求本轮所有参与客户端执行相同数量的本地梯度更新；"
+            f"当前实际更新次数：{dict(steps_by_client)}。"
         )
 
     return unique_steps.pop()
+
+
+def validate_equal_client_update_steps(
+    client_updates: Sequence[ClientUpdate],
+    expected_steps: Optional[int] = None,
+) -> int:
+    """
+    检查 Steps 模式下所有客户端的实际本地梯度更新次数。
+
+    可选 expected_steps 用于进一步确保实际更新次数严格等于配置的 local_steps。
+    """
+    steps_by_client = collect_client_update_steps(client_updates)
+    return _validate_equal_client_update_steps_by_client(
+        steps_by_client,
+        expected_steps=expected_steps,
+    )
 
 
 class FLServer:
@@ -8384,22 +8576,21 @@ class FLServer:
         if len(client_updates) == 0:
             raise ValueError("client_updates 不能为空。")
 
-        # 每轮客户端真实更新步数由 num_batches 记录；Epoch 模式允许客户端不同步数。
-        actual_local_steps_by_client = {
-            int(update.client_id): int(update.metrics["num_batches"])
-            for update in client_updates
-        }
+        # 两种模式统一严格校验更新次数合法性；只有 Steps 模式要求客户端一致。
+        actual_local_steps_by_client = collect_client_update_steps(client_updates)
         configured_local_steps = _cfg_get(
             self.cfg,
             "local_steps",
             _default_config_value("local_steps"),
         )
         if configured_local_steps is not None:
-            # 固定 Steps 模式保持原有严格一致性校验。
-            actual_local_steps = validate_equal_client_update_steps(client_updates)
+            actual_local_steps = _validate_equal_client_update_steps_by_client(
+                actual_local_steps_by_client,
+                expected_steps=configured_local_steps,
+            )
         else:
-            # Epoch 模式仅在步数碰巧一致时保留原有标量记录。
-            # 不一致时标量记为 None，具体步数通过每客户端诊断读取。
+            # Epoch 模式允许客户端因本地样本量不同而执行不同更新次数。
+            # 只有步数恰好一致时才保留标量记录，否则使用 None。
             unique_steps = set(actual_local_steps_by_client.values())
             actual_local_steps = (
                 unique_steps.pop() if len(unique_steps) == 1 else None
