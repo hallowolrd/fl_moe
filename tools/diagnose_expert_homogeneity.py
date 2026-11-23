@@ -405,27 +405,48 @@ def _collect_expert_representations(
     device: torch.device,
     batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """在相同 Token 输入上计算单个专家的隐藏表示和未门控输出。"""
+    """复用专家自身 forward，并通过 activation hook 提取隐藏表示。"""
     hidden_chunks: list[torch.Tensor] = []
     output_chunks: list[torch.Tensor] = []
+    captured_hidden: list[torch.Tensor] = []
     parameter = next(expert.parameters(), None)
     if parameter is None:
         raise ValueError("专家模块没有参数，无法确定计算设备和数据类型。")
 
-    for start in range(0, tokens.shape[0], batch_size):
-        token_batch = tokens[start : start + batch_size].to(
-            device=device,
-            dtype=parameter.dtype,
+    def capture_activation(
+        _module: nn.Module,
+        _inputs: tuple[Any, ...],
+        output: torch.Tensor,
+    ) -> None:
+        if not torch.is_tensor(output):
+            raise TypeError("专家 activation 必须返回 Tensor。")
+        captured_hidden.append(
+            output.detach().to(device="cpu").clone()
         )
-        hidden = expert.activation(expert.fc1(token_batch))
-        expert_output = expert.fc2(expert.dropout(hidden))
-        expert_output = expert.dropout(expert_output)
 
-        hidden_chunks.append(hidden.detach().to(device="cpu"))
-        output_chunks.append(expert_output.detach().to(device="cpu"))
+    handle = expert.activation.register_forward_hook(capture_activation)
+    try:
+        for start in range(0, tokens.shape[0], batch_size):
+            token_batch = tokens[start : start + batch_size].to(
+                device=device,
+                dtype=parameter.dtype,
+            )
+            captured_hidden.clear()
+            expert_output = expert(token_batch)
+            if len(captured_hidden) != 1:
+                raise RuntimeError(
+                    "专家 forward 必须且只能执行一次 activation；"
+                    f"实际执行次数：{len(captured_hidden)}。"
+                )
+
+            hidden_chunks.append(captured_hidden[0])
+            output_chunks.append(
+                expert_output.detach().to(device="cpu").clone()
+            )
+    finally:
+        handle.remove()
 
     return torch.cat(hidden_chunks, dim=0), torch.cat(output_chunks, dim=0)
-
 
 def _summarize_pairwise_metrics(
     pairwise: Mapping[str, Mapping[str, Any]],
