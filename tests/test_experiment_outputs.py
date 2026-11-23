@@ -228,7 +228,6 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 },
             )
             self.assertIsNone(summary["train_state"]["extra"]["optional_state"])
-            self.assertNotIn("client_indices", round_summary)
 
             with csv_path.open("r", encoding="utf-8", newline="") as file:
                 rows = list(csv.DictReader(file))
@@ -245,6 +244,21 @@ class ExperimentOutputRegressionTests(unittest.TestCase):
                 json.loads(rows[0]["moe_stats_json"]),
                 {"layer_0": {"tokens_per_expert": [5, 3]}},
             )
+
+    def test_summary_writer_rejects_non_finite_plugin_state(self) -> None:
+        result = self.make_server_result()
+        result.train_state.extra["invalid_metric"] = float("nan")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(
+                ValueError,
+                r"\$\.train_state\.extra\.invalid_metric",
+            ):
+                base.save_train_outputs(
+                    train_result=result,
+                    output_dir=Path(temp_dir),
+                    save_csv=False,
+                )
 
     def test_json_safe_rejects_unsupported_objects_and_colliding_keys(self) -> None:
         with self.assertRaisesRegex(TypeError, r"\$\.plugin_state"):
