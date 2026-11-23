@@ -83,10 +83,13 @@ class PartitionSummaryTests(unittest.TestCase):
         self.assertNotIn("client_indices", summary)
 
         total_samples = sum(summary["client_sample_counts"].values())
+        self.assertEqual(total_samples, 5)
         self.assertEqual(
             total_samples,
             sum(len(indices) for indices in partition.client_indices),
         )
+        for client_id, indices in enumerate(partition.client_indices):
+            self.assertEqual(summary["client_sample_counts"][client_id], len(indices))
         for client_id, sample_count in summary["client_sample_counts"].items():
             self.assertEqual(
                 sum(summary["client_class_counts"][client_id].values()),
