@@ -298,33 +298,122 @@ class PublicHyperparameterValidationTests(unittest.TestCase):
                 self._load({"label_smooth": value})
 
     def test_label_smoothing_rejects_out_of_range_and_non_finite_values(self) -> None:
-        for value in (-0.01, 1.01, float("nan"), float("inf"), float("-inf"), True, "invalid"):
+        for value in (
+            -0.01,
+            1.01,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            "0.5",
+            "invalid",
+        ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(base.ConfigError, "label_smooth"):
                     self._load({"label_smooth": value})
 
-    def test_top_level_and_optimizer_gradient_clip_validation(self) -> None:
+    def test_gradient_clip_has_one_optimizer_config_entry(self) -> None:
         for value in (None, 0.0, 1.5):
-            with self.subTest(location="top-level", value=value):
-                self._load({"grad_clip": value})
-            with self.subTest(location="optimizer", value=value):
-                self._load({"optimizer": {"grad_clip": value}})
+            with self.subTest(value=value):
+                cfg = self._load({"optimizer": {"grad_clip": value}})
+                expected = None if value in (None, 0.0) else value
+                self.assertEqual(base._get_grad_clip(cfg), expected)
 
-        invalid_values = (-1.0, float("nan"), float("inf"), float("-inf"), True, "invalid")
+        invalid_values = (
+            -1.0,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            "1.5",
+            "invalid",
+        )
         for value in invalid_values:
-            with self.subTest(location="top-level", value=value):
-                with self.assertRaises(base.ConfigError):
-                    self._load({"grad_clip": value})
-            with self.subTest(location="optimizer", value=value):
-                with self.assertRaises(base.ConfigError):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(base.ConfigError, "optimizer.grad_clip"):
                     self._load({"optimizer": {"grad_clip": value}})
+
+        # 顶层旧入口即使为 None 也不再接受，避免形成第二套配置来源。
+        for value in (None, 0.0, 1.5):
+            with self.subTest(legacy_top_level_value=value):
+                with self.assertRaisesRegex(base.ConfigError, "grad_clip"):
+                    self._load({"grad_clip": value})
+
+        with self.assertRaisesRegex(base.ConfigError, "grad_clip"):
+            self._load(
+                {
+                    "grad_clip": 2.0,
+                    "optimizer": {"grad_clip": 4.0},
+                }
+            )
+
+    def test_default_gradient_clip_is_nested_under_optimizer(self) -> None:
+        cfg = self._load({})
+        self.assertIsNone(cfg.optimizer.grad_clip)
+        self.assertFalse(hasattr(cfg, "grad_clip"))
+
+    def test_numeric_validator_accepts_only_int_and_float_values(self) -> None:
+        for value in (0, 1, 0.25):
+            with self.subTest(valid_value=value):
+                self.assertEqual(
+                    base._require_finite_number(value, "test.value"),
+                    float(value),
+                )
+
+        for value in (True, False, "0.5", None, [], {}):
+            with self.subTest(invalid_value=value):
+                with self.assertRaisesRegex(base.ConfigError, "test.value"):
+                    base._require_finite_number(value, "test.value")
+
+    def test_public_float_parameters_reject_bool_and_numeric_strings(self) -> None:
+        cases = (
+            ("frac", (True, "0.5", float("nan"), float("inf"), 0.0, 1.01)),
+            (
+                "partition.dirichlet.alpha",
+                (True, "0.5", float("nan"), float("inf"), 0.0, -0.1),
+            ),
+            (
+                "optimizer.lr",
+                (True, "0.01", float("nan"), float("inf"), 0.0, -0.1),
+            ),
+            (
+                "optimizer.weight_decay",
+                (True, "0.1", float("nan"), float("inf"), -0.1),
+            ),
+        )
+
+        for field, invalid_values in cases:
+            for value in invalid_values:
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(
+                        base.ConfigError,
+                        field.replace(".", r"\."),
+                    ):
+                        self._load(self._nested_override(field, value))
+
+        for field in (
+            "frac",
+            "partition.dirichlet.alpha",
+            "optimizer.lr",
+            "optimizer.weight_decay",
+        ):
+            with self.subTest(field=field):
+                self._load(self._nested_override(field, 1))
 
     def test_optimizer_momentum_must_be_finite_and_non_negative(self) -> None:
         for value in (0.0, 0.9):
             with self.subTest(value=value):
                 self._load({"optimizer": {"momentum": value}})
 
-        for value in (-0.01, float("nan"), float("inf"), float("-inf"), True, "invalid"):
+        for value in (
+            -0.01,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            "0.9",
+            "invalid",
+        ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(base.ConfigError, "optimizer.momentum"):
                     self._load({"optimizer": {"momentum": value}})
@@ -340,6 +429,7 @@ class PublicHyperparameterValidationTests(unittest.TestCase):
             [float("nan"), 0.9],
             [0.9, float("inf")],
             [True, 0.9],
+            [0.9, "0.99"],
         )
         for value in invalid_values:
             with self.subTest(value=value):
@@ -349,7 +439,16 @@ class PublicHyperparameterValidationTests(unittest.TestCase):
     def test_optimizer_eps_must_be_finite_and_positive(self) -> None:
         self._load({"optimizer": {"eps": 1e-12}})
 
-        for value in (0.0, -1.0, float("nan"), float("inf"), float("-inf"), True, "invalid"):
+        for value in (
+            0.0,
+            -1.0,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            "1e-8",
+            "invalid",
+        ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(base.ConfigError, "optimizer.eps"):
                     self._load({"optimizer": {"eps": value}})
@@ -387,8 +486,8 @@ class PublicHyperparameterValidationTests(unittest.TestCase):
                 "min_samples_per_client": 1,
                 "partition_max_retries": 1,
                 "label_smooth": 1.0,
-                "grad_clip": 0.0,
                 "optimizer": {
+                    "grad_clip": 0.0,
                     "momentum": 0.0,
                     "betas": [0.0, 0.999999],
                     "eps": 1e-12,
