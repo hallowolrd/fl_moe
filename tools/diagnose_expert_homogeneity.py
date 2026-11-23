@@ -398,6 +398,7 @@ def _validate_optional_positive_int(value: int | None, name: str) -> None:
         raise ValueError(f"{name} 必须是正整数或 None，当前值：{value!r}。")
 
 
+@torch.inference_mode()
 def _collect_expert_representations(
     expert: nn.Module,
     tokens: torch.Tensor,
