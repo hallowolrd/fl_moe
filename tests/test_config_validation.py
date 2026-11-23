@@ -17,6 +17,26 @@ if str(ALGORITHMS_DIR) not in sys.path:
 import base  # noqa: E402
 
 
+class DatasetRegistryTests(unittest.TestCase):
+    def test_supported_datasets_are_derived_from_dataset_info(self) -> None:
+        self.assertIsInstance(base.SUPPORTED_DATASETS, frozenset)
+        self.assertEqual(base.SUPPORTED_DATASETS, frozenset(base.DATASET_INFO))
+
+    def test_all_dataset_aliases_target_registered_datasets(self) -> None:
+        self.assertTrue(base.DATASET_ALIASES)
+        self.assertTrue(
+            set(base.DATASET_ALIASES.values()).issubset(base.DATASET_INFO)
+        )
+
+    def test_registered_dataset_names_normalize_to_themselves(self) -> None:
+        for dataset_name in base.DATASET_INFO:
+            with self.subTest(dataset_name=dataset_name):
+                self.assertEqual(
+                    base.normalize_dataset_name(dataset_name),
+                    dataset_name,
+                )
+
+
 class BooleanConfigValidationTests(unittest.TestCase):
     BOOLEAN_FIELDS = (
         "data_augmentation",

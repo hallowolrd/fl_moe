@@ -416,18 +416,6 @@ from tqdm.auto import tqdm
 # ------------------------------------------------------------------------------
 # 1.1 可扩展的合法取值注册区
 # ------------------------------------------------------------------------------
-# 后续新增数据集时，优先改这里。
-
-SUPPORTED_DATASETS = {
-    "cifar10",
-    "cifar100",
-    "cinic10",
-    "fashionmnist",
-    "stl10",
-    "tiny-imagenet-200",
-    "femnist",
-}
-
 DATASET_ALIASES = {
     "cifar10": "cifar10",
     "cifar-10": "cifar10",
@@ -3408,6 +3396,9 @@ DATASET_INFO: Dict[str, Dict[str, Any]] = {
     },
 }
 
+
+# 支持的数据集名称从元信息注册表派生，避免重复维护。
+SUPPORTED_DATASETS = frozenset(DATASET_INFO)
 
 
 class _ArrayImageDataset(Dataset):
