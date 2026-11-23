@@ -57,6 +57,7 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
 
     def test_collects_all_experts_on_identical_layer_inputs(self) -> None:
         captured_inputs: dict[str, list[torch.Tensor]] = {}
+        grad_modes: list[bool] = []
         handles = []
 
         for layer_name, expert_items in diagnostics._discover_moe_layers(
@@ -72,6 +73,7 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
                     *,
                     capture_key: str = key,
                 ) -> None:
+                    grad_modes.append(torch.is_grad_enabled())
                     captured_inputs[capture_key].append(
                         inputs[0].detach().cpu().clone()
                     )
@@ -96,6 +98,8 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(report["num_batches"], 2)
         self.assertEqual(report["num_images"], 4)
+        self.assertTrue(grad_modes)
+        self.assertFalse(any(grad_modes))
         self.assertEqual(set(report["layers"]), {
             "blocks.0.mlp",
             "blocks.1.mlp",
