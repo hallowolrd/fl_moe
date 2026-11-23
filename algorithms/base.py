@@ -3997,14 +3997,22 @@ def build_datasets(cfg: Any) -> DatasetBundle:
     info = DATASET_INFO[dataset_name]
     train_transform = build_train_transform(
         dataset_name=dataset_name,
-        use_augmentation=_cfg_get_bool(cfg, "data_augmentation", True),
+        use_augmentation=_cfg_get_bool(
+            cfg,
+            "data_augmentation",
+            _default_config_value("data_augmentation"),
+        ),
     )
     train_evidence_transform = build_train_transform(
         dataset_name=dataset_name,
         use_augmentation=False,
     )
     test_transform = build_test_transform(dataset_name=dataset_name)
-    download = _cfg_get_bool(cfg, "download_data", True)
+    download = _cfg_get_bool(
+        cfg,
+        "download_data",
+        _default_config_value("download_data"),
+    )
 
     if dataset_name == "cifar10":
         train_dataset = datasets.CIFAR10(
@@ -5160,6 +5168,30 @@ def build_client_datasets(
     return client_datasets
 
 
+def _build_dataloader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    drop_last: bool,
+    seed: int,
+) -> DataLoader:
+    """统一构造 DataLoader 的公共参数，调用方负责提供具体加载策略。"""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        worker_init_fn=seed_worker,
+        generator=build_torch_generator(seed),
+        persistent_workers=num_workers > 0,
+    )
+
+
 def build_client_train_loaders(
     cfg: Any,
     client_datasets: Sequence[Dataset],
@@ -5174,26 +5206,24 @@ def build_client_train_loaders(
     训练集默认 shuffle=True。
     每个客户端使用不同的 generator seed，避免所有客户端 shuffle 顺序完全一致。
     """
-    client_loaders: List[DataLoader] = []
-    drop_last = _cfg_get_bool(cfg, "drop_last", False)
-    persistent_workers = num_workers > 0
-
+    drop_last = _cfg_get_bool(
+        cfg,
+        "drop_last",
+        _default_config_value("drop_last"),
+    )
+    client_loaders = []
     for client_id, client_dataset in enumerate(client_datasets):
-        generator = build_torch_generator(seed + client_id)
-
-        loader = DataLoader(
-            client_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=drop_last,
-            worker_init_fn=seed_worker,
-            generator=generator,
-            persistent_workers=persistent_workers,
+        client_loaders.append(
+            _build_dataloader(
+                client_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                drop_last=drop_last,
+                seed=seed + client_id,
+            )
         )
-        client_loaders.append(loader)
-
     return client_loaders
 
 
@@ -5217,25 +5247,19 @@ def build_client_evidence_loaders(
         不能关闭 torchvision 的 RandomCrop / RandomHorizontalFlip。
         因此必须在 dataset 层面单独使用无增强 transform。
     """
-    client_evidence_loaders: List[DataLoader] = []
-    persistent_workers = num_workers > 0
-
+    client_evidence_loaders = []
     for client_id, client_evidence_dataset in enumerate(client_evidence_datasets):
-        generator = build_torch_generator(seed + 100000 + client_id)
-
-        loader = DataLoader(
-            client_evidence_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=False,
-            worker_init_fn=seed_worker,
-            generator=generator,
-            persistent_workers=persistent_workers,
+        client_evidence_loaders.append(
+            _build_dataloader(
+                client_evidence_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                drop_last=False,
+                seed=seed + 100000 + client_id,
+            )
         )
-        client_evidence_loaders.append(loader)
-
     return client_evidence_loaders
 
 
@@ -5265,18 +5289,15 @@ def build_server_evidence_loader(
             _default_config_value("server_evidence.batch_size"),
         )
     )
-    persistent_workers = num_workers > 0
 
-    return DataLoader(
+    return _build_dataloader(
         server_evidence_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
-        worker_init_fn=seed_worker,
-        generator=build_torch_generator(int(seed) + 300000),
-        persistent_workers=persistent_workers,
+        seed=int(seed) + 300000,
     )
 
 
@@ -5292,18 +5313,14 @@ def build_test_loader(
 
     测试集必须 shuffle=False，保证每次评估顺序稳定。
     """
-    persistent_workers = num_workers > 0
-
-    return DataLoader(
+    return _build_dataloader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
-        worker_init_fn=seed_worker,
-        generator=build_torch_generator(seed),
-        persistent_workers=persistent_workers,
+        seed=seed,
     )
 
 
@@ -7911,6 +7928,26 @@ def build_criterion(cfg: Any) -> nn.Module:
     )
 
 
+def _get_adam_common_kwargs(optimizer_cfg: Any) -> Dict[str, Any]:
+    """读取 Adam 与 AdamW 共用的配置参数。"""
+    betas = _cfg_get(
+        optimizer_cfg,
+        "betas",
+        _default_config_value("optimizer.betas"),
+    )
+    eps = float(
+        _cfg_get(
+            optimizer_cfg,
+            "eps",
+            _default_config_value("optimizer.eps"),
+        )
+    )
+    return {
+        "betas": tuple(betas),
+        "eps": eps,
+    }
+
+
 def build_optimizer(
     model: nn.Module,
     cfg: Any,
@@ -7994,48 +8031,17 @@ def build_optimizer(
             nesterov=nesterov,
         )
 
-    if optimizer_type == OPTIMIZER_ADAM:
-        betas = _cfg_get(
-            optimizer_cfg,
-            "betas",
-            _default_config_value("optimizer.betas"),
+    if optimizer_type in {OPTIMIZER_ADAM, OPTIMIZER_ADAMW}:
+        optimizer_class = (
+            optim.Adam
+            if optimizer_type == OPTIMIZER_ADAM
+            else optim.AdamW
         )
-        eps = float(
-            _cfg_get(
-                optimizer_cfg,
-                "eps",
-                _default_config_value("optimizer.eps"),
-            )
-        )
-
-        return optim.Adam(
+        return optimizer_class(
             params,
             lr=lr,
-            betas=tuple(betas),
-            eps=eps,
             weight_decay=weight_decay,
-        )
-
-    if optimizer_type == OPTIMIZER_ADAMW:
-        betas = _cfg_get(
-            optimizer_cfg,
-            "betas",
-            _default_config_value("optimizer.betas"),
-        )
-        eps = float(
-            _cfg_get(
-                optimizer_cfg,
-                "eps",
-                _default_config_value("optimizer.eps"),
-            )
-        )
-
-        return optim.AdamW(
-            params,
-            lr=lr,
-            betas=tuple(betas),
-            eps=eps,
-            weight_decay=weight_decay,
+            **_get_adam_common_kwargs(optimizer_cfg),
         )
 
     raise ValueError(
@@ -10142,6 +10148,72 @@ def _parse_bool_cli_value(value: str) -> bool:
     )
 
 
+CLI_CONFIG_FIELD_MAP: Mapping[str, Tuple[str, ...]] = {
+    # Dataset 的名称规范化及派生字段在 build_common_cli_overrides 中处理。
+    "dataset": ("dataset",),
+    "data_augmentation": ("data_augmentation",),
+    "data_root": ("data_root",),
+    "num_clients": ("num_clients",),
+    "partition_method": ("partition", "method"),
+    "alpha": ("partition", "dirichlet", "alpha"),
+    "dirichlet_sample_balance": ("partition", "dirichlet", "sample_balance"),
+    "frac": ("frac",),
+    "rounds": ("rounds",),
+    "local_epochs": ("local_epochs",),
+    "local_steps": ("local_steps",),
+    "batch_size": ("batch_size",),
+    "test_batch_size": ("test_batch_size",),
+    "num_workers": ("num_workers",),
+    "num_experts": ("num_experts",),
+    "transformer_layers": ("model_cfg", "transformer_layers"),
+    "hidden_dim": ("model_cfg", "hidden_dim"),
+    "attention_heads": ("model_cfg", "attention_heads"),
+    "patch_size": ("model_cfg", "patch_size"),
+    "expert_hidden_dim": ("model_cfg", "expert_hidden_dim"),
+    "moe_block_indices": ("model_cfg", "moe_block_indices"),
+    "routing": ("model_cfg", "routing"),
+    "dropout": ("model_cfg", "dropout"),
+    "aux_loss_coef": ("model_cfg", "aux_loss_coef"),
+    "capacity_factor": ("model_cfg", "capacity_factor"),
+    "token_dropping": ("model_cfg", "token_dropping"),
+    "router_statistics": ("model_cfg", "router_statistics"),
+    "optimizer_type": ("optimizer", "type"),
+    "lr": ("optimizer", "lr"),
+    "momentum": ("optimizer", "momentum"),
+    "weight_decay": ("optimizer", "weight_decay"),
+    "seed": ("seed",),
+    "device": ("device",),
+    "output_dir": ("output_dir",),
+    "run_name": ("run_name",),
+    "server_evidence_size": ("server_evidence", "size"),
+    "server_evidence_batch_size": ("server_evidence", "batch_size"),
+}
+
+
+def _set_nested_config_value(
+    config: Dict[str, Any],
+    path: Tuple[str, ...],
+    value: Any,
+) -> None:
+    """按配置路径写入嵌套字典，供公共 CLI 覆盖统一使用。"""
+    if not path:
+        raise ValueError("配置路径不能为空。")
+
+    current = config
+    for key in path[:-1]:
+        child = current.get(key)
+        if child is None:
+            child = {}
+            current[key] = child
+        if not isinstance(child, dict):
+            raise TypeError(
+                f"配置路径 {path} 与已有非映射字段 {key!r} 冲突。"
+            )
+        current = child
+
+    current[path[-1]] = value
+
+
 def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistrar] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FL + MoE training entrypoint")
     parser.add_argument("--config", type=str, default=None, help="可选外部配置文件；显式 CLI 参数优先。")
@@ -10248,82 +10320,31 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
 
 
 def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    """根据统一映射表，将公共 CLI 参数转换为嵌套配置覆盖。"""
     overrides: Dict[str, Any] = {}
-    top_level={
-        "model":"model","data_root":"data_root","num_clients":"num_clients","frac":"frac",
-        "rounds":"rounds","local_epochs":"local_epochs","local_steps":"local_steps","batch_size":"batch_size",
-        "test_batch_size":"test_batch_size","num_workers":"num_workers","num_experts":"num_experts",
-        "seed":"seed","device":"device","output_dir":"output_dir","run_name":"run_name",
-    }
-    for arg_name,config_key in top_level.items():
-        value=getattr(args,arg_name,None)
-        if value is not None: overrides[config_key]=value
 
-    data_augmentation = getattr(args, "data_augmentation", None)
-    if data_augmentation is not None:
-        overrides["data_augmentation"] = data_augmentation
+    for arg_name, config_path in CLI_CONFIG_FIELD_MAP.items():
+        value = getattr(args, arg_name, None)
+        if value is None:
+            continue
 
-    partition_method = getattr(args, "partition_method", None)
-    if partition_method is not None:
-        overrides.setdefault("partition", {})["method"] = partition_method
+        if arg_name == "dataset":
+            value = normalize_dataset_name(value)
 
-    alpha = getattr(args, "alpha", None)
-    if alpha is not None:
-        overrides.setdefault("partition", {}).setdefault("dirichlet", {})[
-            "alpha"
-        ] = alpha
+        _set_nested_config_value(
+            config=overrides,
+            path=config_path,
+            value=value,
+        )
 
-    sample_balance = getattr(args, "dirichlet_sample_balance", None)
-    if sample_balance is not None:
-        overrides.setdefault("partition", {}).setdefault("dirichlet", {})[
-            "sample_balance"
-        ] = sample_balance
-
-    dataset=getattr(args,"dataset",None)
+    # Dataset 还决定类别数和输入形状，因此保留这部分派生配置逻辑。
+    dataset = getattr(args, "dataset", None)
     if dataset is not None:
         dataset = normalize_dataset_name(dataset)
-        overrides["dataset"]=dataset
-        overrides["num_classes"]=_infer_num_classes(dataset)
-        info=DATASET_INFO.get(dataset)
+        overrides["num_classes"] = _infer_num_classes(dataset)
+        info = DATASET_INFO.get(dataset)
         if info is not None:
-            overrides["input_shape"]=tuple(info["input_shape"])
-    opt={}
-    for an,ck in (("optimizer_type","type"),("lr","lr"),("momentum","momentum"),("weight_decay","weight_decay")):
-        v=getattr(args,an,None)
-        if v is not None: opt[ck]=v
-    if opt: overrides["optimizer"]=opt
-
-    server_evidence = {}
-    server_evidence_size = getattr(args, "server_evidence_size", None)
-    if server_evidence_size is not None:
-        server_evidence["size"] = server_evidence_size
-    server_evidence_batch_size = getattr(args, "server_evidence_batch_size", None)
-    if server_evidence_batch_size is not None:
-        server_evidence["batch_size"] = server_evidence_batch_size
-    if server_evidence:
-        overrides["server_evidence"] = server_evidence
-
-    model_cfg_overrides: Dict[str, Any] = {}
-    model_cfg_cli_fields = (
-        "transformer_layers",
-        "hidden_dim",
-        "attention_heads",
-        "patch_size",
-        "expert_hidden_dim",
-        "moe_block_indices",
-        "routing",
-        "dropout",
-        "aux_loss_coef",
-        "capacity_factor",
-        "token_dropping",
-        "router_statistics",
-    )
-    for field_name in model_cfg_cli_fields:
-        value = getattr(args, field_name, None)
-        if value is not None:
-            model_cfg_overrides[field_name] = value
-    if model_cfg_overrides:
-        overrides["model_cfg"] = model_cfg_overrides
+            overrides["input_shape"] = tuple(info["input_shape"])
 
     return overrides
 
@@ -10471,7 +10492,11 @@ def run_training(
     """
     device = resolve_device(cfg)
 
-    if _cfg_get_bool(cfg, "logging.save_config", True):
+    if _cfg_get_bool(
+            cfg,
+            "logging.save_config",
+            _default_config_value("logging.save_config"),
+        ):
         save_config(
             cfg=cfg,
             output_path=run_dir / "config_used.yaml",
@@ -10565,7 +10590,11 @@ def run_training(
     save_train_outputs(
         train_result=train_result,
         output_dir=run_dir,
-        save_csv=_cfg_get_bool(cfg, "logging.save_results_csv", True),
+        save_csv=_cfg_get_bool(
+            cfg,
+            "logging.save_results_csv",
+            _default_config_value("logging.save_results_csv"),
+        ),
     )
 
     print()

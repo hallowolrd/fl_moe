@@ -20,7 +20,12 @@ import base  # noqa: E402
 
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
-from torch.utils.data import DataLoader, TensorDataset  # noqa: E402
+from torch.utils.data import (
+    DataLoader,
+    RandomSampler,
+    SequentialSampler,
+    TensorDataset,
+)  # noqa: E402
 import uniform  # noqa: E402
 import rfedags  # noqa: E402
 
@@ -188,6 +193,79 @@ def make_loader(seed: int, num_samples: int = 8) -> DataLoader:
         batch_size=4,
         shuffle=False,
     )
+
+
+class DataLoaderConstructionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dataset = TensorDataset(
+            torch.arange(10, dtype=torch.float32).reshape(10, 1),
+            torch.arange(10, dtype=torch.long) % 2,
+        )
+
+    def test_client_train_loaders_keep_shuffle_drop_last_and_seed_policy(self) -> None:
+        loaders = base.build_client_train_loaders(
+            cfg={"drop_last": True},
+            client_datasets=[self.dataset, self.dataset],
+            batch_size=4,
+            num_workers=0,
+            pin_memory=False,
+            seed=17,
+        )
+
+        self.assertEqual(len(loaders), 2)
+        for client_id, loader in enumerate(loaders):
+            with self.subTest(client_id=client_id):
+                self.assertIsInstance(loader.sampler, RandomSampler)
+                self.assertTrue(loader.drop_last)
+                self.assertEqual(loader.generator.initial_seed(), 17 + client_id)
+                self.assertIs(loader.worker_init_fn, base.seed_worker)
+                self.assertEqual(loader.num_workers, 0)
+                self.assertFalse(loader.persistent_workers)
+
+    def test_evidence_server_and_test_loaders_keep_order_and_seed_offsets(self) -> None:
+        client_evidence_loaders = base.build_client_evidence_loaders(
+            client_evidence_datasets=[self.dataset, self.dataset],
+            batch_size=3,
+            num_workers=0,
+            pin_memory=False,
+            seed=17,
+        )
+        for client_id, loader in enumerate(client_evidence_loaders):
+            with self.subTest(loader="client_evidence", client_id=client_id):
+                self.assertIsInstance(loader.sampler, SequentialSampler)
+                self.assertFalse(loader.drop_last)
+                self.assertEqual(
+                    loader.generator.initial_seed(),
+                    17 + 100000 + client_id,
+                )
+
+        server_evidence_loader = base.build_server_evidence_loader(
+            cfg={"server_evidence": {"batch_size": 3}},
+            server_evidence_dataset=self.dataset,
+            num_workers=0,
+            pin_memory=False,
+            seed=17,
+        )
+        self.assertIsNotNone(server_evidence_loader)
+        self.assertIsInstance(server_evidence_loader.sampler, SequentialSampler)
+        self.assertEqual(server_evidence_loader.batch_size, 3)
+        self.assertFalse(server_evidence_loader.drop_last)
+        self.assertEqual(
+            server_evidence_loader.generator.initial_seed(),
+            17 + 300000,
+        )
+
+        test_loader = base.build_test_loader(
+            test_dataset=self.dataset,
+            batch_size=4,
+            num_workers=0,
+            pin_memory=False,
+            seed=17,
+        )
+        self.assertIsInstance(test_loader.sampler, SequentialSampler)
+        self.assertFalse(test_loader.drop_last)
+        self.assertEqual(test_loader.generator.initial_seed(), 17)
+
 
 
 class MultiLayerClientServerIntegrationTests(unittest.TestCase):

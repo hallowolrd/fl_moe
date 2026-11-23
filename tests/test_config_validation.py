@@ -4,6 +4,8 @@ import os
 import sys
 import tempfile
 import unittest
+
+import torch.nn as nn
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,6 +89,101 @@ class PublicEnumRegistryTests(unittest.TestCase):
                 with patch.object(sys, "argv", ["train.py", option, value]):
                     with self.assertRaises(SystemExit):
                         base.parse_args()
+
+
+class CliConfigMappingTests(unittest.TestCase):
+    def test_mapping_covers_every_common_parser_argument(self) -> None:
+        with patch.object(sys, "argv", ["train.py"]):
+            args = base.parse_args()
+
+        self.assertEqual(
+            set(vars(args)) - {"config"},
+            set(base.CLI_CONFIG_FIELD_MAP),
+        )
+
+    def test_cli_values_are_written_to_their_nested_config_paths(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "train.py",
+                "--dataset", "cifar-100",
+                "--data-augmentation", "False",
+                "--partition-method", "iid",
+                "--alpha", "0.25",
+                "--dirichlet-sample-balance", "balanced",
+                "--optimizer", "adamw",
+                "--lr", "0.001",
+                "--transformer-layers", "4",
+                "--server-evidence-size", "20",
+                "--server-evidence-batch-size", "5",
+            ],
+        ):
+            args = base.parse_args()
+
+        overrides = base.build_common_cli_overrides(args)
+
+        self.assertEqual(overrides["dataset"], "cifar100")
+        self.assertEqual(overrides["num_classes"], 100)
+        self.assertEqual(
+            overrides["input_shape"],
+            tuple(base.DATASET_INFO["cifar100"]["input_shape"]),
+        )
+        self.assertFalse(overrides["data_augmentation"])
+        self.assertEqual(
+            overrides["partition"],
+            {
+                "method": "iid",
+                "dirichlet": {
+                    "alpha": 0.25,
+                    "sample_balance": "balanced",
+                },
+            },
+        )
+        self.assertEqual(
+            overrides["optimizer"],
+            {
+                "type": "adamw",
+                "lr": 0.001,
+            },
+        )
+        self.assertEqual(
+            overrides["model_cfg"],
+            {"transformer_layers": 4},
+        )
+        self.assertEqual(
+            overrides["server_evidence"],
+            {"size": 20, "batch_size": 5},
+        )
+
+
+class OptimizerConstructionTests(unittest.TestCase):
+    def test_adam_and_adamw_use_the_same_configured_common_parameters(self) -> None:
+        cases = (
+            (base.OPTIMIZER_ADAM, base.optim.Adam),
+            (base.OPTIMIZER_ADAMW, base.optim.AdamW),
+        )
+        for optimizer_type, expected_class in cases:
+            with self.subTest(optimizer_type=optimizer_type):
+                cfg = base.load_embedded_config(
+                    config_overrides={
+                        "optimizer": {
+                            "type": optimizer_type,
+                            "lr": 0.003,
+                            "weight_decay": 0.025,
+                            "betas": [0.8, 0.95],
+                            "eps": 1e-7,
+                        }
+                    }
+                )
+                optimizer = base.build_optimizer(nn.Linear(3, 2), cfg)
+
+                self.assertIsInstance(optimizer, expected_class)
+                param_group = optimizer.param_groups[0]
+                self.assertEqual(param_group["lr"], 0.003)
+                self.assertEqual(param_group["weight_decay"], 0.025)
+                self.assertEqual(param_group["betas"], (0.8, 0.95))
+                self.assertEqual(param_group["eps"], 1e-7)
 
 
 class DatasetRegistryTests(unittest.TestCase):
