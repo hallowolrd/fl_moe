@@ -265,5 +265,114 @@ class InputImmutabilityTests(unittest.TestCase):
             self.assertTrue(torch.equal(actual, expected))
 
 
+
+class TokenOutputCosineTests(unittest.TestCase):
+    def test_identical_and_opposite_outputs(self) -> None:
+        outputs = torch.tensor([[1.0, 2.0], [2.0, -1.0], [-1.0, 3.0]])
+        identical = metrics.compute_token_output_cosine_stats(outputs, outputs)
+        opposite = metrics.compute_token_output_cosine_stats(outputs, -outputs)
+        for key in ("mean", "median", "p05", "p95"):
+            self.assertAlmostEqual(identical[key], 1.0, places=12)
+            self.assertAlmostEqual(opposite[key], -1.0, places=12)
+        self.assertAlmostEqual(identical["std"], 0.0, places=12)
+        self.assertEqual(identical["valid_tokens"], 3)
+        self.assertEqual(identical["total_tokens"], 3)
+
+    def test_zero_token_rows_are_excluded_and_reported(self) -> None:
+        a = torch.tensor([[1.0, 0.0], [0.0, 0.0], [1.0, 0.0]])
+        b = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+        result = metrics.compute_token_output_cosine_stats(a, b)
+        self.assertEqual(result["valid_tokens"], 2)
+        self.assertEqual(result["total_tokens"], 3)
+        self.assertAlmostEqual(result["mean"], 0.0, places=12)
+        self.assertAlmostEqual(result["std"], 1.0, places=12)
+        with self.assertRaisesRegex(ValueError, "未定义"):
+            metrics.compute_token_output_cosine_stats(
+                torch.zeros(3, 2), torch.zeros(3, 2)
+            )
+
+    def test_bad_shape_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Shape"):
+            metrics.compute_token_output_cosine_stats(
+                torch.randn(3, 2), torch.randn(4, 2)
+            )
+
+
+class ShuffledCKANegativeControlTests(unittest.TestCase):
+    def test_shuffling_reduces_cka_for_independent_random_tokens(self) -> None:
+        generator = torch.Generator().manual_seed(17)
+        features = torch.randn(128, 8, generator=generator)
+        control = metrics.compute_shuffled_cka_controls(
+            features,
+            features.clone(),
+            repeats=3,
+            seed=29,
+        )
+        self.assertAlmostEqual(control["paired_cka"], 1.0, places=12)
+        self.assertLess(control["shuffled_mean"], 0.5)
+        self.assertGreater(control["paired_minus_shuffled_mean"], 0.5)
+        self.assertEqual(len(control["shuffled_values"]), 3)
+
+    def test_repeated_control_does_not_consume_training_rng(self) -> None:
+        features = torch.randn(128, 9)
+        rng_before = torch.random.get_rng_state().clone()
+        first = metrics.compute_shuffled_cka_controls(
+            features, features, repeats=4, seed=123
+        )
+        second = metrics.compute_shuffled_cka_controls(
+            features, features, repeats=4, seed=123
+        )
+        self.assertEqual(first, second)
+        self.assertTrue(torch.equal(rng_before, torch.random.get_rng_state()))
+
+    def test_invalid_shuffle_settings_are_rejected(self) -> None:
+        features = torch.randn(20, 5)
+        with self.assertRaisesRegex(ValueError, "repeats"):
+            metrics.compute_shuffled_cka_controls(
+                features, features, repeats=0, seed=0
+            )
+        with self.assertRaisesRegex(ValueError, "seed"):
+            metrics.compute_shuffled_cka_controls(
+                features, features, repeats=1, seed=-1
+            )
+        with self.assertRaisesRegex(ValueError, "至少需要三个"):
+            metrics.compute_shuffled_cka_controls(
+                torch.ones(2, 4), torch.ones(2, 4), repeats=1, seed=0
+            )
+
+
+class InitializationSummaryTests(unittest.TestCase):
+    def test_seed_summary_uses_equal_weight_per_seed(self) -> None:
+        reports = [
+            {
+                "seed": seed,
+                "layers": {
+                    "blocks.1.mlp": {
+                        "summary": {
+                            "hidden_cka": {
+                                "mean": mean,
+                                "min": mean,
+                                "max": mean,
+                                "valid_pairs": 1,
+                                "total_pairs": 1,
+                            },
+                        },
+                    },
+                },
+            }
+            for seed, mean in ((0, 0.2), (1, 0.6))
+        ]
+        summary = metrics.summarize_initialization_reports(reports)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["moe_layer"], "blocks.1.mlp")
+        self.assertEqual(summary[0]["metric"], "hidden_cka")
+        self.assertAlmostEqual(summary[0]["seed_mean"], 0.4, places=12)
+        self.assertAlmostEqual(summary[0]["seed_std"], 0.2, places=12)
+        self.assertEqual(summary[0]["valid_seeds"], 2)
+
+        with self.assertRaisesRegex(ValueError, "重复 seed"):
+            metrics.summarize_initialization_reports([reports[0], reports[0]])
+
+
 if __name__ == "__main__":
     unittest.main()
