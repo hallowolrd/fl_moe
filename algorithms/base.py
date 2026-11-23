@@ -53,7 +53,6 @@ DEFAULT_CONFIG = {
     "drop_last": False,
     "pin_memory": None,
     "label_smooth": 0.0,
-    "grad_clip": None,
     "model_cfg": {
         "transformer_layers": 6,
         "hidden_dim": 256,
@@ -77,6 +76,7 @@ DEFAULT_CONFIG = {
         "nesterov": False,
         "betas": [0.9, 0.999],
         "eps": 1e-8,
+        "grad_clip": None,
     },
     "agg": {
         "non_expert": {"method": "uniform"},
@@ -1780,9 +1780,13 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前值：{server_evidence_batch_size}"
         )
 
-    frac = float(cfg.get("frac", _default_config_value("frac")))
-    if not (0.0 < frac <= 1.0):
-        raise ConfigError(f"frac 必须在 (0, 1] 范围内，当前值：{frac}")
+    _require_finite_number(
+        cfg.get("frac", _default_config_value("frac")),
+        "frac",
+        minimum=0.0,
+        maximum=1.0,
+        minimum_inclusive=False,
+    )
 
     partition_cfg = cfg.get(
         "partition", _default_config_value("partition")
@@ -1805,16 +1809,15 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ConfigError("partition.dirichlet 必须是 dict。")
 
     if partition_method == "dirichlet":
-        alpha = float(
+        _require_finite_number(
             dirichlet_cfg.get(
-                "alpha", _default_config_value("partition.dirichlet.alpha")
-            )
+                "alpha",
+                _default_config_value("partition.dirichlet.alpha"),
+            ),
+            "partition.dirichlet.alpha",
+            minimum=0.0,
+            minimum_inclusive=False,
         )
-        if not math.isfinite(alpha) or alpha <= 0:
-            raise ConfigError(
-                "partition.dirichlet.alpha 必须是有限的正数，"
-                f"当前值：{alpha}"
-            )
 
         sample_balance = str(
             dirichlet_cfg.get(
@@ -1833,6 +1836,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         "lr",
         "momentum",
         "weight_decay",
+        "grad_clip",
     }
 
     for key in forbidden_top_level_optimizer_keys:
@@ -1846,17 +1850,17 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     if not isinstance(optimizer_cfg, Mapping):
         raise ConfigError("optimizer 必须是 dict。")
 
-    # grad_clip=0 与旧行为一致：明确关闭梯度裁剪；负数或非有限值不再静默关闭。
-    for clip_name, clip_value in (
-        ("grad_clip", cfg.get("grad_clip", _default_config_value("grad_clip"))),
-        ("optimizer.grad_clip", optimizer_cfg.get("grad_clip")),
-    ):
-        if clip_value is not None:
-            _require_finite_number(
-                clip_value,
-                clip_name,
-                minimum=0.0,
-            )
+    # 梯度裁剪只允许通过 optimizer.grad_clip 配置。
+    clip_value = optimizer_cfg.get(
+        "grad_clip",
+        _default_config_value("optimizer.grad_clip"),
+    )
+    if clip_value is not None:
+        _require_finite_number(
+            clip_value,
+            "optimizer.grad_clip",
+            minimum=0.0,
+        )
 
     nesterov = optimizer_cfg.get(
         "nesterov",
@@ -1871,22 +1875,21 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
             f"当前支持：sgd, adam, adamw"
         )
 
-    lr = float(optimizer_cfg.get("lr", _default_config_value("optimizer.lr")))
-    if not math.isfinite(lr) or lr <= 0:
-        raise ConfigError(
-            f"optimizer.lr 必须是有限的正数，当前值：{lr}"
-        )
+    _require_finite_number(
+        optimizer_cfg.get("lr", _default_config_value("optimizer.lr")),
+        "optimizer.lr",
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
 
-    weight_decay = float(
+    _require_finite_number(
         optimizer_cfg.get(
             "weight_decay",
             _default_config_value("optimizer.weight_decay"),
-        )
+        ),
+        "optimizer.weight_decay",
+        minimum=0.0,
     )
-    if not math.isfinite(weight_decay) or weight_decay < 0:
-        raise ConfigError(
-            f"optimizer.weight_decay 必须是有限的非负数，当前值：{weight_decay}"
-        )
 
     momentum = _require_finite_number(
         optimizer_cfg.get("momentum", _default_config_value("optimizer.momentum")),
@@ -1968,12 +1971,15 @@ def _require_finite_number(
     minimum_inclusive: bool = True,
     maximum_inclusive: bool = True,
 ) -> float:
-    """校验数值是否有限及合法范围；兼容可被 float() 解析的数值配置。"""
-    if isinstance(value, bool):
-        raise ConfigError(f"{name} 必须是有限数值，不能是 bool：{value!r}。")
+    """严格校验 int/float 数值类型、有限性及合法范围，不接受 bool 或数值字符串。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"{name} 必须是 int 或 float，"
+            f"当前值：{value!r}（类型：{type(value).__name__}）。"
+        )
     try:
         numeric_value = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except OverflowError as exc:
         raise ConfigError(
             f"{name} 必须是有限数值，当前值：{value!r}。"
         ) from exc
@@ -8030,46 +8036,27 @@ def train_selected_clients(
 
 
 def _get_grad_clip(cfg: Any) -> Optional[float]:
-    """
-    读取梯度裁剪配置。
-
-    支持两种写法：
-        optimizer:
-            grad_clip: 5.0
-
-    或者：
-        grad_clip: 5.0
-
-    如果没有配置，则返回 None。
-    """
+    """读取 optimizer.grad_clip；None 或 0 表示关闭梯度裁剪。"""
     optimizer_cfg = _cfg_get(
         cfg,
         "optimizer",
         _default_config_value("optimizer"),
     )
-
     value = _cfg_get(
         optimizer_cfg,
         "grad_clip",
-        _default_config_value("grad_clip"),
+        _default_config_value("optimizer.grad_clip"),
     )
 
     if value is None:
-        value = _cfg_get(
-            cfg,
-            "grad_clip",
-            _default_config_value("grad_clip"),
-        )
-
-    if value is None:
         return None
 
-    value = _require_finite_number(value, "grad_clip", minimum=0.0)
-
-    if value == 0:
-        return None
-
-    return value
+    value = _require_finite_number(
+        value,
+        "optimizer.grad_clip",
+        minimum=0.0,
+    )
+    return None if value == 0 else value
 
 
 # ============================================================================
