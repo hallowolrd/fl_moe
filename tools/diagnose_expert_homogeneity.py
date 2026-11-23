@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import itertools
 import json
 import math
@@ -1012,6 +1013,177 @@ def diagnose_model_experts(
         for module, was_training in training_states.items():
             module.training = was_training
 
+
+
+def summarize_initialization_reports(
+    reports: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """汇总随机初始化种子间的各层指标；每个种子权重相同。
+
+    先对该种子的六个专家对求均值，再对不同种子均匀求均值。
+    这不是独立 Token 样本的置信区间，不能用种子标准差代替统计检验。
+    """
+    if not reports:
+        raise ValueError("随机初始化诊断报告不能为空。")
+    seed_ids = [report["seed"] for report in reports]
+    if len(set(seed_ids)) != len(seed_ids):
+        raise ValueError("初始化诊断报告存在重复 seed。")
+
+    first_layer_names = set(reports[0]["layers"])
+    if any(set(report["layers"]) != first_layer_names for report in reports):
+        raise ValueError("不同随机种子的 MoE 层集合不一致。")
+
+    summary_rows: list[dict[str, Any]] = []
+    for layer_name in sorted(first_layer_names):
+        metric_names = set(reports[0]["layers"][layer_name]["summary"])
+        if any(
+            set(report["layers"][layer_name]["summary"]) != metric_names
+            for report in reports
+        ):
+            raise ValueError(
+                f"MoE 层 {layer_name} 各随机种子的诊断指标集合不一致。"
+            )
+        for metric_name in sorted(metric_names):
+            values = [
+                float(summary["mean"])
+                for report in reports
+                for summary in [
+                    report["layers"][layer_name]["summary"][metric_name]
+                ]
+                if summary["mean"] is not None
+            ]
+            mean = sum(values) / len(values) if values else None
+            std = (
+                math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
+                if values
+                else None
+            )
+            summary_rows.append({
+                "moe_layer": layer_name,
+                "metric": metric_name,
+                "seed_mean": mean,
+                "seed_std": std,
+                "seed_min": min(values) if values else None,
+                "seed_max": max(values) if values else None,
+                "valid_seeds": len(values),
+                "total_seeds": len(reports),
+            })
+    return summary_rows
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    with path.open("w", encoding="utf-8") as output:
+        json.dump(payload, output, indent=2, ensure_ascii=False, allow_nan=False)
+
+
+def _write_csv(
+    path: Path,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+) -> None:
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _create_unique_diagnosis_directory(base_dir: Path) -> Path:
+    """采用原子性 mkdir 分配实验目录，避免覆盖已有诊断结果。"""
+    for version in range(1, 10_000):
+        candidate = (
+            base_dir
+            if version == 1
+            else base_dir.with_name(f"{base_dir.name}_v{version}")
+        )
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError("无法为专家同质化诊断分配不重复的输出目录。")
+
+
+def save_initialization_controls(
+    reports: list[dict[str, Any]],
+    output_dir: Path,
+    *,
+    metadata: dict[str, Any],
+) -> dict[str, Path]:
+    """保存逐种子 JSON、逐专家对 CSV、逐种子 CSV 和跨种子汇总。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(output_dir / "diagnosis_config.json", metadata)
+    pair_rows: list[dict[str, Any]] = []
+    per_seed_rows: list[dict[str, Any]] = []
+    for report in reports:
+        seed = report["seed"]
+        _write_json(output_dir / f"seed_{seed}.json", report)
+        for layer_name, layer_report in report["layers"].items():
+            for metric_name, summary in layer_report["summary"].items():
+                per_seed_rows.append({
+                    "seed": seed,
+                    "moe_layer": layer_name,
+                    "metric": metric_name,
+                    "mean": summary["mean"],
+                    "min": summary["min"],
+                    "max": summary["max"],
+                    "valid_pairs": summary["valid_pairs"],
+                    "total_pairs": summary["total_pairs"],
+                })
+            for pair_name, metric_values in layer_report["pairwise"].items():
+                for metric_name, value in metric_values.items():
+                    if metric_name == "errors" or metric_name.endswith(
+                        "_shuffled_values"
+                    ):
+                        continue
+                    if metric_name == "token_output_cosine":
+                        if value is None:
+                            continue
+                        # 分位数、有效 Token 数等详细信息单独写为长表行。
+                        for stat_name, stat_value in value.items():
+                            pair_rows.append({
+                                "seed": seed,
+                                "moe_layer": layer_name,
+                                "expert_pair": pair_name,
+                                "metric": f"token_output_cosine_{stat_name}",
+                                "value": stat_value,
+                            })
+                        continue
+                    pair_rows.append({
+                        "seed": seed,
+                        "moe_layer": layer_name,
+                        "expert_pair": pair_name,
+                        "metric": metric_name,
+                        "value": value,
+                    })
+
+    summary_rows = summarize_initialization_reports(reports)
+    paths = {
+        "summary": output_dir / "initialization_summary.csv",
+        "per_seed": output_dir / "seed_summary.csv",
+        "pairwise": output_dir / "pairwise_metrics.csv",
+    }
+    _write_csv(
+        paths["summary"],
+        [
+            "moe_layer", "metric", "seed_mean", "seed_std",
+            "seed_min", "seed_max", "valid_seeds", "total_seeds",
+        ],
+        summary_rows,
+    )
+    _write_csv(
+        paths["per_seed"],
+        [
+            "seed", "moe_layer", "metric", "mean", "min", "max",
+            "valid_pairs", "total_pairs",
+        ],
+        per_seed_rows,
+    )
+    _write_csv(
+        paths["pairwise"],
+        ["seed", "moe_layer", "expert_pair", "metric", "value"],
+        pair_rows,
+    )
+    return paths
 
 def main(argv: list[str] | None = None) -> int:
     """构建随机初始化的 SwitchViT，并在无增强测试集上输出诊断 JSON。"""
