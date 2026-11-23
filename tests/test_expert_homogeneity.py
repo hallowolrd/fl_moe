@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +32,7 @@ class WeightCosineTests(unittest.TestCase):
         )
 
     def test_cosine_is_scale_invariant_for_positive_scaling(self) -> None:
-        weight = torch.randn(4, 5)
+        weight = torch.randn(4, 5, dtype=torch.float64)
         self.assertAlmostEqual(
             metrics.compute_weight_cosine(weight, 3.5 * weight),
             1.0,
