@@ -276,6 +276,22 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
                         **kwargs,
                     )
 
+    def test_single_expert_layer_is_rejected(self) -> None:
+        model = base.SwitchViT(
+            num_classes=4,
+            input_shape=(3, 8, 8),
+            transformer_layers=1,
+            hidden_dim=8,
+            attention_heads=2,
+            patch_size=4,
+            expert_hidden_dim=16,
+            num_experts=1,
+            moe_block_indices=(1,),
+            router_statistics=False,
+        )
+        with self.assertRaisesRegex(ValueError, "至少需要两个专家"):
+            diagnostics._discover_moe_layers(model)
+
     def test_model_without_moe_layers_is_rejected(self) -> None:
         model = torch.nn.Sequential(torch.nn.Linear(4, 4))
         with self.assertRaisesRegex(ValueError, "没有发现"):
