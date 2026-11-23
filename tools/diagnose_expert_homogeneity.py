@@ -307,6 +307,117 @@ def compute_normalized_output_mse(
     return float((numerator / (energy + eps)).item())
 
 
+
+def compute_token_output_cosine_stats(
+    output_a: torch.Tensor,
+    output_b: torch.Tensor,
+) -> dict[str, float | int]:
+    """同一批对齐 Token 的逐 Token 输出余弦相似度分布。
+
+    与 CKA 不同，此指标比较同一个 Transformer 残差坐标系中的输出方向。
+    零范数 Token 被排除，并显式报告 valid_tokens / total_tokens；
+    如果所有 Token 都退化，则报错而不伪造相似度。
+    """
+    _require_floating_tensor(output_a, "output_a")
+    _require_floating_tensor(output_b, "output_b")
+    if output_a.ndim != 2 or output_b.ndim != 2:
+        raise ValueError("逐 Token 余弦要求输入为 [tokens, hidden_dim]。")
+    if output_a.shape != output_b.shape:
+        raise ValueError(
+            "逐 Token 输出 Shape 不一致："
+            f"{tuple(output_a.shape)} vs {tuple(output_b.shape)}"
+        )
+    if output_a.device != output_b.device:
+        raise ValueError("逐 Token 输出必须位于同一设备。")
+    if output_a.shape[0] == 0 or output_a.shape[1] == 0:
+        raise ValueError("逐 Token 输出不能为空。")
+
+    a = _to_float64(output_a)
+    b = _to_float64(output_b)
+    norms_a = torch.linalg.vector_norm(a, dim=1)
+    norms_b = torch.linalg.vector_norm(b, dim=1)
+    valid_mask = (norms_a > 0) & (norms_b > 0)
+    valid_tokens = int(valid_mask.sum().item())
+    if valid_tokens == 0:
+        raise ValueError("所有 Token 的输出余弦均未定义：存在零范数输出。")
+
+    cosine = (
+        (a[valid_mask] * b[valid_mask]).sum(dim=1)
+        / (norms_a[valid_mask] * norms_b[valid_mask])
+    ).clamp(-1.0, 1.0)
+    quantiles = torch.quantile(
+        cosine,
+        torch.tensor([0.05, 0.50, 0.95], dtype=torch.float64),
+    )
+    return {
+        "mean": float(cosine.mean().item()),
+        "std": float(cosine.std(unbiased=False).item()),
+        "median": float(quantiles[1].item()),
+        "p05": float(quantiles[0].item()),
+        "p95": float(quantiles[2].item()),
+        "min": float(cosine.min().item()),
+        "max": float(cosine.max().item()),
+        "valid_tokens": valid_tokens,
+        "total_tokens": int(output_a.shape[0]),
+    }
+
+
+def compute_shuffled_cka_controls(
+    features_a: torch.Tensor,
+    features_b: torch.Tensor,
+    *,
+    repeats: int,
+    seed: int,
+) -> dict[str, Any]:
+    """把第二个专家的样本对应关系打乱，建立 Linear CKA 负对照。
+
+    每次置换使用局部 torch.Generator，不消耗全局训练 RNG。
+    若采样结果恰好是恒等置换，则循环平移一个位置。
+    返回每次置换的 CKA、均值、总体标准差及原始配对 CKA。
+    """
+    if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats <= 0:
+        raise ValueError("repeats 必须是正整数。")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed 必须是非负整数。")
+    _require_floating_tensor(features_a, "features_a")
+    _require_floating_tensor(features_b, "features_b")
+    if features_a.ndim != 2 or features_b.ndim != 2:
+        raise ValueError("CKA 负对照要求二维特征矩阵。")
+    if features_a.shape[0] != features_b.shape[0]:
+        raise ValueError("CKA 负对照两组特征的样本数必须一致。")
+    if features_a.shape[0] < 3:
+        raise ValueError("CKA 负对照至少需要三个 Token。")
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    n = int(features_a.shape[0])
+    identity = torch.arange(n)
+    shuffled_values: list[float] = []
+    for _ in range(repeats):
+        permutation = torch.randperm(n, generator=generator)
+        if torch.equal(permutation, identity):
+            permutation = permutation.roll(1)
+        reordered = features_b.index_select(
+            0,
+            permutation.to(device=features_b.device),
+        )
+        shuffled_values.append(compute_linear_cka(features_a, reordered))
+
+    mean = sum(shuffled_values) / repeats
+    std = math.sqrt(
+        sum((value - mean) ** 2 for value in shuffled_values) / repeats
+    )
+    paired = compute_linear_cka(features_a, features_b)
+    return {
+        "paired_cka": paired,
+        "shuffled_values": shuffled_values,
+        "shuffled_mean": mean,
+        "shuffled_std": std,
+        "paired_minus_shuffled_mean": paired - mean,
+        "repeats": repeats,
+        "seed": seed,
+    }
+
 def _discover_moe_layers(
     model: nn.Module,
 ) -> dict[str, list[tuple[str, nn.Module]]]:
