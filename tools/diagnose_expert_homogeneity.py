@@ -826,7 +826,10 @@ def main(argv: list[str] | None = None) -> int:
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=base._infer_pin_memory(cfg),
+        pin_memory=(
+            device.type == "cuda"
+            and base._infer_pin_memory(cfg)
+        ),
         drop_last=False,
         seed=int(cfg.seed),
     )
