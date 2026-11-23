@@ -199,9 +199,9 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
             module: module.training
             for module in self.model.modules()
         }
-        parameters_before = {
-            name: parameter.detach().clone()
-            for name, parameter in self.model.named_parameters()
+        state_before = {
+            name: value.detach().clone()
+            for name, value in self.model.state_dict().items()
         }
         moe_hook_counts = {
             name: len(module._forward_pre_hooks)
@@ -221,8 +221,8 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
 
         for module, was_training in training_states.items():
             self.assertEqual(module.training, was_training)
-        for name, parameter in self.model.named_parameters():
-            self.assertTrue(torch.equal(parameter, parameters_before[name]))
+        for name, value in self.model.state_dict().items():
+            self.assertTrue(torch.equal(value, state_before[name]))
         for name, module in self.model.named_modules():
             if isinstance(module, base.SwitchMoE):
                 self.assertEqual(
