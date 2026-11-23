@@ -36,7 +36,6 @@ class DirichletDefaultConfigTests(unittest.TestCase):
         )
 
 
-
 class _FakeCIFAR10Dataset:
     targets = list(range(10))
 

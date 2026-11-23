@@ -5211,7 +5211,7 @@ def build_client_train_loaders(
         "drop_last",
         _default_config_value("drop_last"),
     )
-    client_loaders = []
+    client_loaders: List[DataLoader] = []
     for client_id, client_dataset in enumerate(client_datasets):
         client_loaders.append(
             _build_dataloader(
@@ -5247,7 +5247,7 @@ def build_client_evidence_loaders(
         不能关闭 torchvision 的 RandomCrop / RandomHorizontalFlip。
         因此必须在 dataset 层面单独使用无增强 transform。
     """
-    client_evidence_loaders = []
+    client_evidence_loaders: List[DataLoader] = []
     for client_id, client_evidence_dataset in enumerate(client_evidence_datasets):
         client_evidence_loaders.append(
             _build_dataloader(
@@ -10338,9 +10338,8 @@ def build_common_cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     # Dataset 还决定类别数和输入形状，因此保留这部分派生配置逻辑。
-    dataset = getattr(args, "dataset", None)
+    dataset = overrides.get("dataset")
     if dataset is not None:
-        dataset = normalize_dataset_name(dataset)
         overrides["num_classes"] = _infer_num_classes(dataset)
         info = DATASET_INFO.get(dataset)
         if info is not None:
@@ -10493,10 +10492,10 @@ def run_training(
     device = resolve_device(cfg)
 
     if _cfg_get_bool(
-            cfg,
-            "logging.save_config",
-            _default_config_value("logging.save_config"),
-        ):
+        cfg,
+        "logging.save_config",
+        _default_config_value("logging.save_config"),
+    ):
         save_config(
             cfg=cfg,
             output_path=run_dir / "config_used.yaml",

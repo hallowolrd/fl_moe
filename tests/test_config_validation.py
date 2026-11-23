@@ -4,10 +4,10 @@ import os
 import sys
 import tempfile
 import unittest
-
-import torch.nn as nn
 from pathlib import Path
 from unittest.mock import patch
+
+import torch.nn as nn
 
 os.environ.setdefault("PYTHONHASHSEED", "0")
 

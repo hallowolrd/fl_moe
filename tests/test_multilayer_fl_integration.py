@@ -266,8 +266,6 @@ class DataLoaderConstructionTests(unittest.TestCase):
         self.assertFalse(test_loader.drop_last)
         self.assertEqual(test_loader.generator.initial_seed(), 17)
 
-
-
 class MultiLayerClientServerIntegrationTests(unittest.TestCase):
     def _run_one_round(
         self,
