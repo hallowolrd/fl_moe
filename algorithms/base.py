@@ -125,20 +125,28 @@ def _validate_seed_value(seed: object) -> int:
     return seed
 
 
-def _parse_startup_seed_value(raw_seed: object) -> int:
+def _parse_startup_seed_value(
+    raw_seed: object,
+    *,
+    yaml_scalar: bool = False,
+) -> int:
     """将启动阶段读取的 CLI/YAML 简单标量解析为严格合法的整数种子。"""
     if isinstance(raw_seed, str):
         value = raw_seed.strip()
         if not value:
             raise ValueError("seed 不能为空。")
         try:
-            unsigned_value = value.lstrip("+-").lower()
-            if unsigned_value.startswith(("0x", "0o", "0b")):
-                base = 0
-            elif len(unsigned_value) > 1 and unsigned_value.startswith("0"):
-                # PyYAML 的 YAML 1.1 整数解析会将前导零整数解释为八进制。
-                base = 8
+            if yaml_scalar:
+                unsigned_value = value.lstrip("+-").lower()
+                if unsigned_value.startswith(("0x", "0o", "0b")):
+                    base = 0
+                elif len(unsigned_value) > 1 and unsigned_value.startswith("0"):
+                    # PyYAML 的 YAML 1.1 整数解析会将前导零整数解释为八进制。
+                    base = 8
+                else:
+                    base = 10
             else:
+                # argparse 的 type=int 使用十进制解析，CLI 启动预检必须保持一致。
                 base = 10
             parsed_seed = int(value, base)
         except ValueError as exc:
@@ -324,7 +332,12 @@ def _prepare_deterministic_env_before_torch() -> None:
     )
     # 必须在设置 PYTHONHASHSEED 和重新执行进程之前校验，避免非法值导致
     # Python 解释器在重启阶段直接失败，而不是给出可读的配置错误。
-    target_hash_seed = str(_parse_startup_seed_value(raw_seed))
+    target_hash_seed = str(
+        _parse_startup_seed_value(
+            raw_seed,
+            yaml_scalar=cli_seed is None and config_seed is not None,
+        )
+    )
 
     current_hash_seed = os.environ.get("PYTHONHASHSEED")
     already_reexec = os.environ.get("CLEAN_REEXEC_FOR_PYTHONHASHSEED") == "1"
