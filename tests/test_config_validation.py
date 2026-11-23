@@ -17,6 +17,78 @@ if str(ALGORITHMS_DIR) not in sys.path:
 import base  # noqa: E402
 
 
+class PublicEnumRegistryTests(unittest.TestCase):
+    def test_partition_methods_use_the_public_registry(self) -> None:
+        for method in base.SUPPORTED_PARTITION_METHODS:
+            with self.subTest(method=method):
+                base.load_embedded_config(
+                    config_overrides={"partition": {"method": method}}
+                )
+
+        with self.assertRaisesRegex(base.ConfigError, "数据划分方法"):
+            base.load_embedded_config(
+                config_overrides={"partition": {"method": "unknown"}}
+            )
+
+    def test_dirichlet_sample_balance_uses_the_public_registry(self) -> None:
+        for sample_balance in base.SUPPORTED_DIRICHLET_SAMPLE_BALANCE:
+            with self.subTest(sample_balance=sample_balance):
+                base.load_embedded_config(
+                    config_overrides={
+                        "partition": {
+                            "method": base.PARTITION_METHOD_DIRICHLET,
+                            "dirichlet": {"sample_balance": sample_balance},
+                        }
+                    }
+                )
+
+        with self.assertRaisesRegex(base.ConfigError, "sample_balance"):
+            base.load_embedded_config(
+                config_overrides={
+                    "partition": {
+                        "method": base.PARTITION_METHOD_DIRICHLET,
+                        "dirichlet": {"sample_balance": "unknown"},
+                    }
+                }
+            )
+
+    def test_optimizer_types_use_the_public_registry(self) -> None:
+        for optimizer_type in base.SUPPORTED_OPTIMIZERS:
+            with self.subTest(optimizer_type=optimizer_type):
+                base.load_embedded_config(
+                    config_overrides={"optimizer": {"type": optimizer_type}}
+                )
+
+        with self.assertRaisesRegex(base.ConfigError, "优化器"):
+            base.load_embedded_config(
+                config_overrides={"optimizer": {"type": "unknown"}}
+            )
+
+    def test_cli_choices_are_derived_from_public_registries(self) -> None:
+        cli_cases = (
+            ("--partition-method", base.PARTITION_METHOD_IID),
+            ("--dirichlet-sample-balance", base.DIRICHLET_SAMPLE_BALANCED),
+            ("--optimizer", base.OPTIMIZER_ADAM),
+            ("--routing", base.ROUTING_TOP1),
+        )
+        for option, value in cli_cases:
+            with self.subTest(option=option, value=value):
+                with patch.object(sys, "argv", ["train.py", option, value]):
+                    base.parse_args()
+
+        invalid_cli_cases = (
+            ("--partition-method", "unknown"),
+            ("--dirichlet-sample-balance", "unknown"),
+            ("--optimizer", "unknown"),
+            ("--routing", "unknown"),
+        )
+        for option, value in invalid_cli_cases:
+            with self.subTest(option=option, value=value):
+                with patch.object(sys, "argv", ["train.py", option, value]):
+                    with self.assertRaises(SystemExit):
+                        base.parse_args()
+
+
 class DatasetRegistryTests(unittest.TestCase):
     def test_supported_datasets_are_derived_from_dataset_info(self) -> None:
         self.assertIsInstance(base.SUPPORTED_DATASETS, frozenset)

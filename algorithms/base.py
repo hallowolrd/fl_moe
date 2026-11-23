@@ -28,15 +28,43 @@ from pathlib import Path
 
 # 公共实验配置的唯一默认值来源。
 # 必须在 import torch 前定义，因为启动阶段需要读取默认 seed。
+# 公共枚举值统一定义；配置默认值、校验、命令行和功能分支共用这些常量。
+OPTIMIZER_SGD = "sgd"
+OPTIMIZER_ADAM = "adam"
+OPTIMIZER_ADAMW = "adamw"
+SUPPORTED_OPTIMIZERS = (
+    OPTIMIZER_SGD,
+    OPTIMIZER_ADAM,
+    OPTIMIZER_ADAMW,
+)
+
+PARTITION_METHOD_IID = "iid"
+PARTITION_METHOD_DIRICHLET = "dirichlet"
+SUPPORTED_PARTITION_METHODS = (
+    PARTITION_METHOD_IID,
+    PARTITION_METHOD_DIRICHLET,
+)
+
+DIRICHLET_SAMPLE_BALANCED = "balanced"
+DIRICHLET_SAMPLE_UNBALANCED = "unbalanced"
+SUPPORTED_DIRICHLET_SAMPLE_BALANCE = (
+    DIRICHLET_SAMPLE_BALANCED,
+    DIRICHLET_SAMPLE_UNBALANCED,
+)
+
+ROUTING_TOP1 = "top1"
+SUPPORTED_ROUTING_TYPES = (ROUTING_TOP1,)
+
+
 DEFAULT_CONFIG = {
     "dataset": "cifar10",
     "data_root": "./datasets",
     "num_clients": 5,
     "partition": {
-        "method": "dirichlet",
+        "method": PARTITION_METHOD_DIRICHLET,
         "dirichlet": {
             "alpha": 0.1,
-            "sample_balance": "unbalanced",
+            "sample_balance": DIRICHLET_SAMPLE_UNBALANCED,
         },
     },
     "min_samples_per_client": 1,
@@ -60,7 +88,7 @@ DEFAULT_CONFIG = {
         "patch_size": 4,
         "expert_hidden_dim": 1024,
         "moe_block_indices": [2, 4, 6],
-        "routing": "top1",
+        "routing": ROUTING_TOP1,
         "aux_loss_coef": 0.0,
         "capacity_factor": 0.0,
         "token_dropping": False,
@@ -69,7 +97,7 @@ DEFAULT_CONFIG = {
     },
     "num_experts": 4,
     "optimizer": {
-        "type": "sgd",
+        "type": OPTIMIZER_SGD,
         "lr": 0.01,
         "momentum": 0.9,
         "weight_decay": 0.0005,
@@ -703,7 +731,7 @@ def _build_config_record(
     ).strip().lower()
     if partition_method:
         partition_record: Dict[str, Any] = {"method": partition_method}
-        if partition_method == "dirichlet":
+        if partition_method == PARTITION_METHOD_DIRICHLET:
             dirichlet_cfg = as_mapping(partition_cfg.get("dirichlet"))
             alpha = dirichlet_cfg.get(
                 "alpha",
@@ -723,7 +751,7 @@ def _build_config_record(
                     _default_config_value("min_samples_per_client"),
                 )
             )
-            if sample_balance == "unbalanced":
+            if sample_balance == DIRICHLET_SAMPLE_UNBALANCED:
                 partition_record["max_retries"] = int(
                     raw.get(
                         "partition_max_retries",
@@ -850,7 +878,7 @@ def _build_config_record(
                 optimizer_cfg["weight_decay"]
             )
 
-        if optimizer_name == "sgd":
+        if optimizer_name == OPTIMIZER_SGD:
             optimizer_record["momentum"] = copy.deepcopy(
                 optimizer_cfg.get(
                     "momentum",
@@ -862,7 +890,7 @@ def _build_config_record(
                 "nesterov",
                 _default_config_value("optimizer.nesterov"),
             )
-        elif optimizer_name in {"adam", "adamw"}:
+        elif optimizer_name in {OPTIMIZER_ADAM, OPTIMIZER_ADAMW}:
             optimizer_record["betas"] = copy.deepcopy(
                 list(
                     optimizer_cfg.get("betas", _default_config_value("optimizer.betas"))
@@ -1785,9 +1813,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     partition_method = str(
         partition_cfg.get("method", _default_config_value("partition.method"))
     ).strip().lower()
-    if partition_method not in {"iid", "dirichlet"}:
+    if partition_method not in SUPPORTED_PARTITION_METHODS:
         raise ConfigError(
-            f"不支持的数据划分方法：{partition_method}。当前支持：iid, dirichlet"
+            f"不支持的数据划分方法：{partition_method}。"
+            f"当前支持：{', '.join(SUPPORTED_PARTITION_METHODS)}"
         )
 
     dirichlet_cfg = partition_cfg.get(
@@ -1796,7 +1825,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     if not isinstance(dirichlet_cfg, Mapping):
         raise ConfigError("partition.dirichlet 必须是 dict。")
 
-    if partition_method == "dirichlet":
+    if partition_method == PARTITION_METHOD_DIRICHLET:
         _require_finite_number(
             dirichlet_cfg.get(
                 "alpha",
@@ -1813,9 +1842,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
                 _default_config_value("partition.dirichlet.sample_balance"),
             )
         ).strip().lower()
-        if sample_balance not in {"balanced", "unbalanced"}:
+        if sample_balance not in SUPPORTED_DIRICHLET_SAMPLE_BALANCE:
             raise ConfigError(
-                "partition.dirichlet.sample_balance 只能是 balanced 或 unbalanced，"
+                "partition.dirichlet.sample_balance 只能是 "
+                f"{' 或 '.join(SUPPORTED_DIRICHLET_SAMPLE_BALANCE)}，"
                 f"当前值：{sample_balance!r}"
             )
 
@@ -1857,10 +1887,10 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     _require_bool_value(nesterov, "optimizer.nesterov")
     optimizer_type = optimizer_cfg.get("type", _default_config_value("optimizer.type"))
 
-    if optimizer_type not in {"sgd", "adam", "adamw"}:
+    if optimizer_type not in SUPPORTED_OPTIMIZERS:
         raise ConfigError(
             f"不支持的优化器：{optimizer_type}。"
-            f"当前支持：sgd, adam, adamw"
+            f"当前支持：{', '.join(SUPPORTED_OPTIMIZERS)}"
         )
 
     _require_finite_number(
@@ -1884,7 +1914,7 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         "optimizer.momentum",
         minimum=0.0,
     )
-    if optimizer_type == "sgd" and nesterov and momentum <= 0.0:
+    if optimizer_type == OPTIMIZER_SGD and nesterov and momentum <= 0.0:
         raise ConfigError(
             "optimizer.nesterov=True 时，SGD 的 optimizer.momentum 必须大于 0。"
         )
@@ -4256,7 +4286,7 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
     num_classes = infer_num_classes(targets)
     dirichlet_alpha: Optional[float] = None
 
-    if partition_method == "iid":
+    if partition_method == PARTITION_METHOD_IID:
         client_indices = build_iid_partition(
             targets=targets,
             num_clients=num_clients,
@@ -4264,7 +4294,7 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
         )
         sample_balance = "none"
 
-    elif partition_method == "dirichlet":
+    elif partition_method == PARTITION_METHOD_DIRICHLET:
         dirichlet_alpha = float(
             _cfg_get(
                 dirichlet_cfg,
@@ -4280,7 +4310,7 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
             )
         )
 
-        if sample_balance == "balanced":
+        if sample_balance == DIRICHLET_SAMPLE_BALANCED:
             client_indices = build_balanced_dirichlet_partition(
                 targets=targets,
                 num_clients=num_clients,
@@ -4288,7 +4318,7 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
                 seed=seed,
                 min_samples_per_client=min_samples_per_client,
             )
-        elif sample_balance == "unbalanced":
+        elif sample_balance == DIRICHLET_SAMPLE_UNBALANCED:
             max_retries = int(
                 _cfg_get(
                     cfg,
@@ -4306,7 +4336,8 @@ def partition_dataset(cfg: Any, dataset: Any) -> PartitionResult:
             )
         else:
             raise ValueError(
-                "partition.dirichlet.sample_balance 只能是 balanced 或 unbalanced，"
+                "partition.dirichlet.sample_balance 只能是 "
+                f"{' 或 '.join(SUPPORTED_DIRICHLET_SAMPLE_BALANCE)}，"
                 f"当前值：{sample_balance!r}"
             )
 
@@ -5760,7 +5791,7 @@ def build_switch_vit_model(cfg: Any) -> nn.Module:
     """根据公共实验配置构建默认 SwitchViT 模型。"""
     model_cfg = _switch_model_config(cfg)
 
-    if str(model_cfg["routing"]).strip().lower() != "top1":
+    if str(model_cfg["routing"]).strip().lower() not in SUPPORTED_ROUTING_TYPES:
         raise ValueError("当前 SwitchViT 仅实现 Top-1 Routing。")
 
     # MoE 自身的选项约束由 SwitchMoE.__init__ 统一负责。
@@ -7806,7 +7837,7 @@ def build_optimizer(
     if len(params) == 0:
         raise ValueError("模型没有可训练参数。")
 
-    if optimizer_type == "sgd":
+    if optimizer_type == OPTIMIZER_SGD:
         momentum = float(
             _cfg_get(
                 optimizer_cfg,
@@ -7828,7 +7859,7 @@ def build_optimizer(
             nesterov=nesterov,
         )
 
-    if optimizer_type == "adam":
+    if optimizer_type == OPTIMIZER_ADAM:
         betas = _cfg_get(
             optimizer_cfg,
             "betas",
@@ -7850,7 +7881,7 @@ def build_optimizer(
             weight_decay=weight_decay,
         )
 
-    if optimizer_type == "adamw":
+    if optimizer_type == OPTIMIZER_ADAMW:
         betas = _cfg_get(
             optimizer_cfg,
             "betas",
@@ -9991,7 +10022,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     parser.add_argument("--num-clients", type=int, default=None)
     parser.add_argument(
         "--partition-method",
-        choices=("iid", "dirichlet"),
+        choices=SUPPORTED_PARTITION_METHODS,
         default=None,
         help="数据划分方法；覆盖 partition.method。",
     )
@@ -10003,7 +10034,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
     )
     parser.add_argument(
         "--dirichlet-sample-balance",
-        choices=("balanced", "unbalanced"),
+        choices=SUPPORTED_DIRICHLET_SAMPLE_BALANCE,
         default=None,
         help="Dirichlet 客户端样本数均衡策略；覆盖 partition.dirichlet.sample_balance。",
     )
@@ -10035,7 +10066,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
         metavar="BLOCK",
         help="使用 MoE FFN 的 Transformer Block 编号，例如：--moe-block-indices 2 4 6。",
     )
-    parser.add_argument("--routing", choices=("top1",), default=None)
+    parser.add_argument("--routing", choices=SUPPORTED_ROUTING_TYPES, default=None)
     parser.add_argument("--dropout", type=float, default=None)
 
     # 数值为 0 时关闭对应功能；正数表示启用。
@@ -10066,7 +10097,7 @@ def parse_args(method_cli_argument_registrar: Optional[MethodCliArgumentRegistra
         help="是否收集 Router 统计。",
     )
 
-    parser.add_argument("--optimizer", dest="optimizer_type", choices=("sgd","adam","adamw"), default=None)
+    parser.add_argument("--optimizer", dest="optimizer_type", choices=SUPPORTED_OPTIMIZERS, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--momentum", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
