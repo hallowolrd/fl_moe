@@ -347,7 +347,11 @@ def compute_token_output_cosine_stats(
     ).clamp(-1.0, 1.0)
     quantiles = torch.quantile(
         cosine,
-        torch.tensor([0.05, 0.50, 0.95], dtype=torch.float64),
+        torch.tensor(
+            [0.05, 0.50, 0.95],
+            dtype=torch.float64,
+            device=cosine.device,
+        ),
     )
     return {
         "mean": float(cosine.mean().item()),
@@ -368,6 +372,7 @@ def compute_shuffled_cka_controls(
     *,
     repeats: int,
     seed: int,
+    paired_cka: float | None = None,
 ) -> dict[str, Any]:
     """把第二个专家的样本对应关系打乱，建立 Linear CKA 负对照。
 
@@ -407,7 +412,11 @@ def compute_shuffled_cka_controls(
     std = math.sqrt(
         sum((value - mean) ** 2 for value in shuffled_values) / repeats
     )
-    paired = compute_linear_cka(features_a, features_b)
+    paired = (
+        compute_linear_cka(features_a, features_b)
+        if paired_cka is None
+        else float(paired_cka)
+    )
     return {
         "paired_cka": paired,
         "shuffled_values": shuffled_values,
@@ -579,7 +588,18 @@ def _summarize_pairwise_metrics(
         "output_cka",
         "output_normalized_mse",
     )
-    summary: dict[str, dict[str, float | None]] = {}
+    optional_metrics = (
+        "hidden_cka_shuffled_mean",
+        "output_cka_shuffled_mean",
+        "hidden_cka_vs_shuffled_gap",
+        "output_cka_vs_shuffled_gap",
+        "token_output_cosine_mean",
+    )
+    metric_names += tuple(
+        name for name in optional_metrics
+        if any(name in pair for pair in pairwise.values())
+    )
+    summary: dict[str, dict[str, float | int | None]] = {}
     for metric_name in metric_names:
         values = [
             float(pair[metric_name])
@@ -605,6 +625,9 @@ def diagnose_model_experts(
     max_tokens_per_layer: int | None = 4096,
     subspace_k: int = 8,
     expert_batch_size: int = 1024,
+    shuffled_cka_repeats: int = 0,
+    shuffle_seed: int = 0,
+    token_output_cosine: bool = False,
 ) -> dict[str, Any]:
     """诊断 SwitchViT 各 MoE 层的专家参数、隐藏表示和输出相似性。
 
@@ -626,6 +649,18 @@ def diagnose_model_experts(
         raise TypeError("subspace_k 必须是严格正整数。")
     if subspace_k <= 0:
         raise ValueError(f"subspace_k 必须大于 0，当前值：{subspace_k}。")
+    if (
+        isinstance(shuffled_cka_repeats, bool)
+        or not isinstance(shuffled_cka_repeats, int)
+        or shuffled_cka_repeats < 0
+    ):
+        raise ValueError("shuffled_cka_repeats 必须是非负整数。")
+    if isinstance(shuffle_seed, bool) or not isinstance(shuffle_seed, int):
+        raise ValueError("shuffle_seed 必须是非负整数。")
+    if shuffle_seed < 0:
+        raise ValueError("shuffle_seed 必须是非负整数。")
+    if not isinstance(token_output_cosine, bool):
+        raise TypeError("token_output_cosine 必须是 bool。")
 
     moe_layers = _discover_moe_layers(model)
     parameters = list(model.parameters())
@@ -727,7 +762,9 @@ def diagnose_model_experts(
             raise ValueError("诊断 DataLoader 没有提供任何 batch。")
 
         layer_reports: dict[str, Any] = {}
-        for layer_name, expert_items in moe_layers.items():
+        for layer_index, (layer_name, expert_items) in enumerate(
+            moe_layers.items()
+        ):
             layer_inputs = torch.cat(
                 captured_batches[layer_name],
                 dim=0,
@@ -800,9 +837,10 @@ def diagnose_model_experts(
                         subspace_errors[cache_name][expert_name] = str(error)
 
             pairwise: dict[str, Any] = {}
-            for (expert_a_name, expert_a), (expert_b_name, expert_b) in (
-                itertools.combinations(expert_items, 2)
-            ):
+            for pair_index, (
+                (expert_a_name, expert_a),
+                (expert_b_name, expert_b),
+            ) in enumerate(itertools.combinations(expert_items, 2)):
                 pair_key = f"{expert_a_name}|{expert_b_name}"
                 metrics: dict[str, float | None] = {}
                 errors: dict[str, str] = {}
@@ -877,6 +915,62 @@ def diagnose_model_experts(
                         metrics[metric_name] = None
                         errors[metric_name] = str(error)
 
+                if shuffled_cka_repeats:
+                    # 层与专家对的种子不依赖 Python hash()；
+                    # 隐藏层、输出层使用相同的置换来构造负对照。
+                    control_seed = (
+                        shuffle_seed + layer_index * 100_003 + pair_index * 997
+                    )
+                    for prefix, features_x, features_y in (
+                        (
+                            "hidden_cka",
+                            hidden_by_expert[expert_a_name],
+                            hidden_by_expert[expert_b_name],
+                        ),
+                        (
+                            "output_cka",
+                            output_by_expert[expert_a_name],
+                            output_by_expert[expert_b_name],
+                        ),
+                    ):
+                        try:
+                            control = compute_shuffled_cka_controls(
+                                features_x,
+                                features_y,
+                                repeats=shuffled_cka_repeats,
+                                seed=control_seed,
+                                paired_cka=metrics[prefix],
+                            )
+                            metrics[f"{prefix}_shuffled_mean"] = (
+                                control["shuffled_mean"]
+                            )
+                            metrics[f"{prefix}_vs_shuffled_gap"] = (
+                                control["paired_minus_shuffled_mean"]
+                            )
+                            metrics[f"{prefix}_shuffled_std"] = (
+                                control["shuffled_std"]
+                            )
+                            metrics[f"{prefix}_shuffled_values"] = (
+                                control["shuffled_values"]
+                            )
+                        except (ValueError, RuntimeError) as error:
+                            metrics[f"{prefix}_shuffled_mean"] = None
+                            metrics[f"{prefix}_vs_shuffled_gap"] = None
+                            errors[f"{prefix}_shuffled"] = str(error)
+
+                if token_output_cosine:
+                    try:
+                        token_stats = compute_token_output_cosine_stats(
+                            output_by_expert[expert_a_name],
+                            output_by_expert[expert_b_name],
+                        )
+                        metrics["token_output_cosine"] = token_stats
+                        metrics["token_output_cosine_mean"] = token_stats["mean"]
+                    except (ValueError, RuntimeError) as error:
+                        metrics["token_output_cosine"] = None
+                        metrics["token_output_cosine_mean"] = None
+                        errors["token_output_cosine"] = str(error)
+
                 pairwise[pair_key] = {
                     **metrics,
                     "errors": errors,
@@ -903,6 +997,12 @@ def diagnose_model_experts(
             "max_batches": max_batches,
             "max_tokens_per_layer": max_tokens_per_layer,
             "subspace_k": subspace_k,
+            "controls": {
+                "shuffled_cka_repeats": shuffled_cka_repeats,
+                "shuffle_seed": shuffle_seed,
+                "token_output_cosine": token_output_cosine,
+                "shuffling_unit": "token",
+            },
             "layers": layer_reports,
         }
     finally:
