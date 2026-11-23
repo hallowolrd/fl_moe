@@ -839,11 +839,32 @@ def main(argv: list[str] | None = None) -> int:
         subspace_k=args.subspace_k,
         expert_batch_size=args.expert_batch_size,
     )
+    model_cfg = (
+        cfg.model_cfg.to_dict()
+        if hasattr(cfg.model_cfg, "to_dict")
+        else dict(cfg.model_cfg)
+    )
+    report["diagnostic_stage"] = "initialization"
     report["dataset"] = str(cfg.dataset)
+    report["data_split"] = "train_evidence_no_augmentation"
     report["model"] = "SwitchViT"
     report["model_state"] = "random_initialization"
-    report["data_split"] = "train_evidence_no_augmentation"
+    report["model_config"] = {
+        "num_experts": int(cfg.num_experts),
+        **model_cfg,
+    }
+    report["input_shape"] = list(dataset_bundle.input_shape)
+    report["seed"] = int(cfg.seed)
     report["device"] = str(device)
+    report["metric_directions"] = {
+        "fc1_weight_cosine": "higher means more similar; -1 means opposite",
+        "fc2_weight_cosine": "higher means more similar; -1 means opposite",
+        "fc1_right_subspace_overlap": "1 means identical; 0 means orthogonal",
+        "fc2_left_subspace_overlap": "1 means identical; 0 means orthogonal",
+        "hidden_cka": "1 means highly similar representations; 0 means dissimilar",
+        "output_cka": "1 means highly similar representations; 0 means dissimilar",
+        "output_normalized_mse": "0 means identical outputs; higher means larger difference",
+    }
 
     output_path = args.output.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
