@@ -1,21 +1,29 @@
-"""独立的 Switch Transformer 专家同质化诊断工具。
+"""Switch Transformer 专家同质化指标、模型诊断与初始化诊断入口。
 
-本模块首先提供可复用的数学指标：
+提供的指标：
 - 专家权重余弦相似度
 - Top-k 主奇异子空间重叠
 - Linear CKA
 - 归一化专家输出 MSE
 
-联邦训练接入、模型特征采集和结果输出在这些基础指标通过测试后接入。
-本文件不修改模型参数，也不负责保存模型 Checkpoint。
+模型诊断时，先通过正常 SwitchViT 前向传播捕获各 MoE 层输入，
+再将同一批 Token 输入该层的全部专家，计算未经过 Router Gate 的专家表示。
+本模块不修改模型参数，不参与训练和参数聚合，也不保存模型 Checkpoint。
 """
 
 from __future__ import annotations
 
+import argparse
+import itertools
+import json
 import math
-from typing import Literal
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Literal
 
 import torch
+from torch import nn
 
 
 SubspaceSide = Literal["left", "right"]
@@ -288,3 +296,567 @@ def compute_normalized_output_mse(
         raise ValueError("归一化输出 MSE 未定义：两个输出的总能量过低。")
 
     return float((numerator / (energy + eps)).item())
+
+
+def _discover_moe_layers(
+    model: nn.Module,
+) -> dict[str, list[tuple[str, nn.Module]]]:
+    """发现具有 ModuleDict / ModuleList experts 容器的 MoE 模块。"""
+    layers: dict[str, list[tuple[str, nn.Module]]] = {}
+    for module_name, module in model.named_modules():
+        experts = getattr(module, "experts", None)
+        if not isinstance(experts, (nn.ModuleDict, nn.ModuleList)):
+            continue
+        if len(experts) == 0:
+            continue
+
+        if isinstance(experts, nn.ModuleDict):
+            expert_items = list(experts.items())
+        else:
+            expert_items = [
+                (str(expert_id), expert)
+                for expert_id, expert in enumerate(experts)
+            ]
+
+        for expert_name, expert in expert_items:
+            required_modules = ("fc1", "activation", "dropout", "fc2")
+            missing = [
+                name
+                for name in required_modules
+                if not isinstance(getattr(expert, name, None), nn.Module)
+            ]
+            if missing:
+                raise TypeError(
+                    f"MoE 层 {module_name!r} 的专家 {expert_name!r} "
+                    f"缺少兼容的专家模块：{missing}"
+                )
+            if not isinstance(expert.fc1, nn.Linear) or not isinstance(
+                expert.fc2, nn.Linear
+            ):
+                raise TypeError(
+                    f"MoE 层 {module_name!r} 的专家 {expert_name!r} "
+                    "要求 fc1 和 fc2 均为 nn.Linear。"
+                )
+
+        layer_name = module_name or "<root>"
+        if layer_name in layers:
+            raise ValueError(f"发现重复的 MoE 层名称：{layer_name}")
+        layers[layer_name] = expert_items
+
+    if not layers:
+        raise ValueError(
+            "模型中没有发现包含 ModuleDict / ModuleList experts 的 MoE 层。"
+        )
+    return layers
+
+
+def _extract_images_from_batch(batch: Any) -> torch.Tensor:
+    """从常见 DataLoader batch 格式中提取图像 Tensor。"""
+    if isinstance(batch, Mapping):
+        for key in ("image", "images", "x"):
+            if key in batch:
+                images = batch[key]
+                break
+        else:
+            raise KeyError(
+                "诊断 DataLoader 的 batch dict 必须包含 image、images 或 x。"
+            )
+    elif isinstance(batch, (tuple, list)) and batch:
+        images = batch[0]
+    else:
+        raise TypeError(
+            "诊断 DataLoader 的 batch 必须是包含图像的 tuple/list 或 dict。"
+        )
+
+    if not torch.is_tensor(images):
+        raise TypeError(
+            f"batch 图像必须是 torch.Tensor，当前类型：{type(images).__name__}。"
+        )
+    if images.ndim != 4:
+        raise ValueError(
+            "SwitchViT 诊断图像必须是 [batch, channels, height, width]，"
+            f"当前 shape={tuple(images.shape)}。"
+        )
+    if not images.is_floating_point():
+        raise TypeError("诊断图像 Tensor 必须是浮点类型。")
+    return images
+
+
+def _validate_optional_positive_int(value: int | None, name: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} 必须是正整数或 None，当前值：{value!r}。")
+
+
+def _collect_expert_representations(
+    expert: nn.Module,
+    tokens: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """在相同 Token 输入上计算单个专家的隐藏表示和未门控输出。"""
+    hidden_chunks: list[torch.Tensor] = []
+    output_chunks: list[torch.Tensor] = []
+    parameter = next(expert.parameters(), None)
+    if parameter is None:
+        raise ValueError("专家模块没有参数，无法确定计算设备和数据类型。")
+
+    for start in range(0, tokens.shape[0], batch_size):
+        token_batch = tokens[start : start + batch_size].to(
+            device=device,
+            dtype=parameter.dtype,
+        )
+        hidden = expert.activation(expert.fc1(token_batch))
+        expert_output = expert.fc2(expert.dropout(hidden))
+        expert_output = expert.dropout(expert_output)
+
+        hidden_chunks.append(hidden.detach().to(device="cpu"))
+        output_chunks.append(expert_output.detach().to(device="cpu"))
+
+    return torch.cat(hidden_chunks, dim=0), torch.cat(output_chunks, dim=0)
+
+
+def _summarize_pairwise_metrics(
+    pairwise: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, float | None]]:
+    """汇总所有专家对的指标均值、最小值和最大值。"""
+    metric_names = (
+        "fc1_weight_cosine",
+        "fc2_weight_cosine",
+        "fc1_right_subspace_overlap",
+        "fc2_left_subspace_overlap",
+        "hidden_cka",
+        "output_cka",
+        "output_normalized_mse",
+    )
+    summary: dict[str, dict[str, float | None]] = {}
+    for metric_name in metric_names:
+        values = [
+            float(pair[metric_name])
+            for pair in pairwise.values()
+            if pair.get(metric_name) is not None
+        ]
+        summary[metric_name] = {
+            "mean": sum(values) / len(values) if values else None,
+            "min": min(values) if values else None,
+            "max": max(values) if values else None,
+            "valid_pairs": len(values),
+            "total_pairs": len(pairwise),
+        }
+    return summary
+
+
+def diagnose_model_experts(
+    model: nn.Module,
+    data_loader: Any,
+    *,
+    device: torch.device | str | None = None,
+    max_batches: int | None = 4,
+    max_tokens_per_layer: int | None = 4096,
+    subspace_k: int = 8,
+    expert_batch_size: int = 1024,
+) -> dict[str, Any]:
+    """诊断 SwitchViT 各 MoE 层的专家参数、隐藏表示和输出相似性。
+
+    正常模型前向传播负责生成各 MoE 层的真实输入。随后对每一层：
+    1. 将完全相同的输入 Token 分别送入该层的全部专家；
+    2. 提取 GELU 后的隐藏表示和未经过 Router Gate 的专家输出；
+    3. 计算所有专家对的权重、子空间、CKA 和输出差异指标。
+
+    模型在诊断期间切换到 eval 模式并禁用梯度；结束后恢复原有设备和
+    每个子模块各自的 training 状态。不会更新模型参数。
+    """
+    _validate_optional_positive_int(max_batches, "max_batches")
+    _validate_optional_positive_int(
+        max_tokens_per_layer,
+        "max_tokens_per_layer",
+    )
+    _validate_optional_positive_int(expert_batch_size, "expert_batch_size")
+    if isinstance(subspace_k, bool) or not isinstance(subspace_k, int):
+        raise TypeError("subspace_k 必须是严格正整数。")
+    if subspace_k <= 0:
+        raise ValueError(f"subspace_k 必须大于 0，当前值：{subspace_k}。")
+
+    moe_layers = _discover_moe_layers(model)
+    parameters = list(model.parameters())
+    if not parameters:
+        raise ValueError("待诊断模型没有参数。")
+
+    model_devices = {parameter.device for parameter in parameters}
+    model_devices.update(buffer.device for buffer in model.buffers())
+    if len(model_devices) != 1:
+        raise ValueError(
+            f"诊断暂不支持跨设备模型，当前设备集合：{sorted(map(str, model_devices))}。"
+        )
+    original_device = next(iter(model_devices))
+    target_device = (
+        torch.device(device)
+        if device is not None
+        else original_device
+    )
+
+    training_states = {
+        module: module.training
+        for module in model.modules()
+    }
+    captured_batches: dict[str, list[torch.Tensor]] = {
+        layer_name: []
+        for layer_name in moe_layers
+    }
+    active_capture: dict[str, torch.Tensor] = {}
+    hook_handles = []
+    num_batches = 0
+    num_images = 0
+
+    def make_pre_hook(layer_name: str):
+        def capture_input(
+            _module: nn.Module,
+            inputs: tuple[Any, ...],
+        ) -> None:
+            if not inputs or not torch.is_tensor(inputs[0]):
+                raise TypeError(
+                    f"MoE 层 {layer_name} 的第一个输入必须是 Tensor。"
+                )
+            if layer_name in active_capture:
+                raise RuntimeError(
+                    f"同一次模型前向中 MoE 层 {layer_name} 被重复调用。"
+                )
+            layer_input = inputs[0]
+            if layer_input.ndim != 3:
+                raise ValueError(
+                    f"MoE 层 {layer_name} 输入必须是 [batch, tokens, hidden_dim]，"
+                    f"当前 shape={tuple(layer_input.shape)}。"
+                )
+            active_capture[layer_name] = (
+                layer_input.detach().to(device="cpu").clone()
+            )
+
+        return capture_input
+
+    try:
+        model.to(target_device)
+        model.eval()
+        named_modules = dict(model.named_modules())
+        for layer_name in moe_layers:
+            module_path = "" if layer_name == "<root>" else layer_name
+            hook_handles.append(
+                named_modules[module_path].register_forward_pre_hook(
+                    make_pre_hook(layer_name)
+                )
+            )
+
+        with torch.inference_mode():
+            for batch_index, batch in enumerate(data_loader):
+                if max_batches is not None and batch_index >= max_batches:
+                    break
+
+                images = _extract_images_from_batch(batch).to(
+                    target_device,
+                    non_blocking=target_device.type == "cuda",
+                )
+                active_capture.clear()
+                model(images)
+
+                missing_layers = set(moe_layers) - set(active_capture)
+                if missing_layers:
+                    raise RuntimeError(
+                        "模型前向没有触发全部 MoE 层输入采集："
+                        f"{sorted(missing_layers)}。"
+                    )
+
+                for layer_name in moe_layers:
+                    captured_batches[layer_name].append(
+                        active_capture[layer_name]
+                    )
+                num_batches += 1
+                num_images += int(images.shape[0])
+
+        if num_batches == 0:
+            raise ValueError("诊断 DataLoader 没有提供任何 batch。")
+
+        layer_reports: dict[str, Any] = {}
+        for layer_name, expert_items in moe_layers.items():
+            layer_inputs = torch.cat(
+                captured_batches[layer_name],
+                dim=0,
+            )
+            if layer_inputs.ndim != 3:
+                raise ValueError(
+                    f"MoE 层 {layer_name} 累积输入维度异常："
+                    f"{tuple(layer_inputs.shape)}。"
+                )
+
+            tokens = layer_inputs.reshape(-1, layer_inputs.shape[-1])
+            total_tokens = int(tokens.shape[0])
+            if (
+                max_tokens_per_layer is not None
+                and total_tokens > max_tokens_per_layer
+            ):
+                selected_indices = torch.linspace(
+                    0,
+                    total_tokens - 1,
+                    steps=max_tokens_per_layer,
+                ).round().to(dtype=torch.long)
+                tokens = tokens.index_select(0, selected_indices)
+
+            if tokens.shape[0] < 2:
+                raise ValueError(
+                    f"MoE 层 {layer_name} 采集到的 Token 少于 2 个，"
+                    "无法计算 CKA。"
+                )
+
+            hidden_by_expert: dict[str, torch.Tensor] = {}
+            output_by_expert: dict[str, torch.Tensor] = {}
+            for expert_name, expert in expert_items:
+                hidden, expert_output = _collect_expert_representations(
+                    expert=expert,
+                    tokens=tokens,
+                    device=target_device,
+                    batch_size=expert_batch_size,
+                )
+                hidden_by_expert[expert_name] = hidden
+                output_by_expert[expert_name] = expert_output
+
+            subspace_bases: dict[str, dict[str, torch.Tensor]] = {
+                "fc1_right": {},
+                "fc2_left": {},
+            }
+            subspace_errors: dict[str, dict[str, str]] = {
+                "fc1_right": {},
+                "fc2_left": {},
+            }
+            for expert_name, expert in expert_items:
+                for cache_name, weight, side in (
+                    ("fc1_right", expert.fc1.weight, "right"),
+                    ("fc2_left", expert.fc2.weight, "left"),
+                ):
+                    weight_cpu = weight.detach().to(device="cpu")
+                    if subspace_k > min(weight_cpu.shape):
+                        raise ValueError(
+                            f"MoE 层 {layer_name} 专家 {expert_name} 的 "
+                            f"{cache_name} 权重维度为 {tuple(weight_cpu.shape)}，"
+                            f"无法提取 k={subspace_k} 的子空间。"
+                        )
+                    try:
+                        basis, _, _ = extract_topk_subspace(
+                            weight_cpu,
+                            max_k=subspace_k,
+                            side=side,
+                        )
+                        subspace_bases[cache_name][expert_name] = basis
+                    except (ValueError, RuntimeError) as error:
+                        subspace_errors[cache_name][expert_name] = str(error)
+
+            pairwise: dict[str, Any] = {}
+            for (expert_a_name, expert_a), (expert_b_name, expert_b) in (
+                itertools.combinations(expert_items, 2)
+            ):
+                pair_key = f"{expert_a_name}|{expert_b_name}"
+                metrics: dict[str, float | None] = {}
+                errors: dict[str, str] = {}
+
+                metric_functions = (
+                    (
+                        "fc1_weight_cosine",
+                        lambda: compute_weight_cosine(
+                            expert_a.fc1.weight.detach().cpu(),
+                            expert_b.fc1.weight.detach().cpu(),
+                        ),
+                    ),
+                    (
+                        "fc2_weight_cosine",
+                        lambda: compute_weight_cosine(
+                            expert_a.fc2.weight.detach().cpu(),
+                            expert_b.fc2.weight.detach().cpu(),
+                        ),
+                    ),
+                    (
+                        "hidden_cka",
+                        lambda: compute_linear_cka(
+                            hidden_by_expert[expert_a_name],
+                            hidden_by_expert[expert_b_name],
+                        ),
+                    ),
+                    (
+                        "output_cka",
+                        lambda: compute_linear_cka(
+                            output_by_expert[expert_a_name],
+                            output_by_expert[expert_b_name],
+                        ),
+                    ),
+                    (
+                        "output_normalized_mse",
+                        lambda: compute_normalized_output_mse(
+                            output_by_expert[expert_a_name],
+                            output_by_expert[expert_b_name],
+                        ),
+                    ),
+                )
+                for metric_name, metric_function in metric_functions:
+                    try:
+                        metrics[metric_name] = float(metric_function())
+                    except (ValueError, RuntimeError) as error:
+                        metrics[metric_name] = None
+                        errors[metric_name] = str(error)
+
+                for metric_name, cache_name in (
+                    ("fc1_right_subspace_overlap", "fc1_right"),
+                    ("fc2_left_subspace_overlap", "fc2_left"),
+                ):
+                    basis_a = subspace_bases[cache_name].get(expert_a_name)
+                    basis_b = subspace_bases[cache_name].get(expert_b_name)
+                    if basis_a is None or basis_b is None:
+                        metrics[metric_name] = None
+                        errors[metric_name] = (
+                            f"子空间无法计算："
+                            f"{expert_a_name}={subspace_errors[cache_name].get(expert_a_name)}, "
+                            f"{expert_b_name}={subspace_errors[cache_name].get(expert_b_name)}"
+                        )
+                        continue
+                    try:
+                        metrics[metric_name] = (
+                            compute_subspace_overlap_from_bases(
+                                basis_a,
+                                basis_b,
+                                k=subspace_k,
+                            )
+                        )
+                    except (ValueError, RuntimeError) as error:
+                        metrics[metric_name] = None
+                        errors[metric_name] = str(error)
+
+                pairwise[pair_key] = {
+                    **metrics,
+                    "errors": errors,
+                }
+
+            layer_reports[layer_name] = {
+                "num_experts": len(expert_items),
+                "num_tokens_before_sampling": total_tokens,
+                "num_tokens_used": int(tokens.shape[0]),
+                "input_hidden_dim": int(tokens.shape[-1]),
+                "subspace_k": subspace_k,
+                "router_gate_applied_to_expert_outputs": False,
+                "pairwise": pairwise,
+                "summary": _summarize_pairwise_metrics(pairwise),
+            }
+
+        return {
+            "schema_version": 1,
+            "diagnostic": "switch_transformer_expert_homogeneity",
+            "evaluation_mode": "eval_inference_mode",
+            "expert_comparison": "same_layer_input_all_experts_ungated",
+            "num_batches": num_batches,
+            "num_images": num_images,
+            "max_batches": max_batches,
+            "max_tokens_per_layer": max_tokens_per_layer,
+            "subspace_k": subspace_k,
+            "layers": layer_reports,
+        }
+    finally:
+        for handle in hook_handles:
+            handle.remove()
+        model.to(original_device)
+        for module, was_training in training_states.items():
+            module.training = was_training
+
+
+def main(argv: list[str] | None = None) -> int:
+    """构建随机初始化的 SwitchViT，并在无增强测试集上输出诊断 JSON。"""
+    parser = argparse.ArgumentParser(
+        description="Diagnose SwitchViT expert homogeneity before federated training."
+    )
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--max-batches", type=int, default=4)
+    parser.add_argument("--max-tokens-per-layer", type=int, default=4096)
+    parser.add_argument("--subspace-k", type=int, default=8)
+    parser.add_argument("--expert-batch-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--output", type=Path, default=Path("expert_homogeneity_initial.json"))
+    args = parser.parse_args(argv)
+
+    project_root = Path(__file__).resolve().parents[1]
+    algorithms_dir = project_root / "algorithms"
+    if str(algorithms_dir) not in sys.path:
+        sys.path.insert(0, str(algorithms_dir))
+
+    import base
+
+    cfg = (
+        base.load_config(args.config)
+        if args.config is not None
+        else base.load_embedded_config()
+    )
+    base.set_seed(
+        seed=int(cfg.seed),
+        deterministic=bool(cfg.deterministic),
+    )
+    device = base.resolve_device(cfg)
+    dataset_bundle = base.build_datasets(cfg)
+
+    batch_size = (
+        int(args.batch_size)
+        if args.batch_size is not None
+        else int(cfg.test_batch_size)
+    )
+    num_workers = (
+        int(args.num_workers)
+        if args.num_workers is not None
+        else int(cfg.num_workers)
+    )
+    if batch_size <= 0:
+        raise ValueError("--batch-size 必须是正整数。")
+    if num_workers < 0:
+        raise ValueError("--num-workers 必须是非负整数。")
+
+    test_loader = base.build_test_loader(
+        test_dataset=dataset_bundle.test_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        seed=int(cfg.seed),
+    )
+    model = base.build_switch_vit_model(cfg).to(device)
+    report = diagnose_model_experts(
+        model=model,
+        data_loader=test_loader,
+        device=device,
+        max_batches=args.max_batches,
+        max_tokens_per_layer=args.max_tokens_per_layer,
+        subspace_k=args.subspace_k,
+        expert_batch_size=args.expert_batch_size,
+    )
+    report["dataset"] = str(cfg.dataset)
+    report["model"] = "SwitchViT"
+    report["model_state"] = "random_initialization"
+    report["device"] = str(device)
+
+    output_path = args.output.expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            report,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+
+    print(f"[Expert Homogeneity] dataset={cfg.dataset}")
+    print(f"[Expert Homogeneity] device={device}")
+    print(f"[Expert Homogeneity] batches={report['num_batches']}")
+    print(f"[Expert Homogeneity] output={output_path}")
+    for layer_name, layer_report in report["layers"].items():
+        print(f"[Expert Homogeneity] layer={layer_name}")
+        for metric_name, summary in layer_report["summary"].items():
+            mean_value = summary["mean"]
+            value_text = "n/a" if mean_value is None else f"{mean_value:.6f}"
+            print(f"  {metric_name}: mean={value_text}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
