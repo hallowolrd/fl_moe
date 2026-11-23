@@ -127,7 +127,6 @@ class ConfigRecordTests(unittest.TestCase):
                 "min_samples_per_client": 3,
                 "partition_max_retries": 17,
                 "label_smooth": 0.15,
-                "grad_clip": 2.5,
                 "deterministic": False,
                 "optimizer": {
                     "type": "adamw",
@@ -135,7 +134,6 @@ class ConfigRecordTests(unittest.TestCase):
                     "weight_decay": 0.02,
                     "betas": [0.8, 0.95],
                     "eps": 1e-7,
-                    # Nested optimizer setting takes precedence over top-level.
                     "grad_clip": 4.0,
                 },
                 "server_evidence": {
@@ -247,8 +245,10 @@ class ConfigRecordTests(unittest.TestCase):
         cfg = base.load_embedded_config(
             method_overrides={
                 "data_augmentation": False,
-                "grad_clip": None,
                 "deterministic": False,
+                "optimizer": {
+                    "grad_clip": None,
+                },
                 "logging": {
                     "save_config": True,
                     "save_results_csv": False,
