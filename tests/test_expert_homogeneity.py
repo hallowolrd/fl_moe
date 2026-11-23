@@ -109,6 +109,16 @@ class SubspaceOverlapTests(unittest.TestCase):
         )
         self.assertAlmostEqual(cached, direct, places=12)
 
+    def test_overlap_from_bases_rejects_non_orthonormal_inputs(self) -> None:
+        invalid_basis = torch.tensor(
+            [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]
+        )
+        valid_basis = torch.eye(3, 2)
+        with self.assertRaisesRegex(ValueError, "列正交归一"):
+            metrics.compute_subspace_overlap_from_bases(
+                invalid_basis, valid_basis, k=2
+            )
+
     def test_k_larger_than_effective_rank_is_rejected(self) -> None:
         weight = torch.diag(torch.tensor([1.0, 0.0, 0.0, 0.0]))
         with self.assertRaisesRegex(ValueError, "有效数值秩"):
