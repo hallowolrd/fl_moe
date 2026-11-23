@@ -12,7 +12,7 @@ conda activate fl_moe
 
 ```bash
 
-python algorithms/uniform.py \
+CUDA_VISIBLE_DEVICES=1 python algorithms/uniform.py \
     --dataset cifar10 \
     --num-clients 5 \
     --alpha 0.1 \
@@ -37,7 +37,7 @@ python algorithms/uniform.py \
     --momentum 0.9 \
     --weight-decay 0.0005 \
     --seed 0 \
-    --output-dir outputs
+    --output-dir outputs/qingcai
 ```
 
 
