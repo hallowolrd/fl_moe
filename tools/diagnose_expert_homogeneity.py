@@ -1186,18 +1186,47 @@ def save_initialization_controls(
     return paths
 
 def main(argv: list[str] | None = None) -> int:
-    """构建随机初始化的 SwitchViT，并在无增强测试集上输出诊断 JSON。"""
+    """在固定 CIFAR 诊断图像上运行随机初始化专家对照实验 A/B/C。"""
     parser = argparse.ArgumentParser(
-        description="Diagnose SwitchViT expert homogeneity before federated training."
+        description="SwitchViT random-initialization expert homogeneity controls."
     )
     parser.add_argument("--config", type=str, default=None)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="独立初始化随机种子，例如 --seeds 0 1 2 3 4 5 6 7 8 9。",
+    )
     parser.add_argument("--max-batches", type=int, default=4)
     parser.add_argument("--max-tokens-per-layer", type=int, default=4096)
     parser.add_argument("--subspace-k", type=int, default=8)
     parser.add_argument("--expert-batch-size", type=int, default=1024)
+    parser.add_argument(
+        "--shuffle-repeats",
+        type=int,
+        default=1,
+        help="每个专家对负对照的随机 Token 置换次数；0 表示关闭。",
+    )
+    parser.add_argument(
+        "--no-token-cosine",
+        action="store_true",
+        help="关闭逐 Token 输出余弦统计。",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--output", type=Path, default=Path("expert_homogeneity_initial.json"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("expert_diagnosis/initialization_controls"),
+        help="相对项目根目录的输出路径；自动分配 _v2 等目录以避免覆盖。",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="兼容旧用法：仅一个 seed 时额外保存一份单独 JSON。",
+    )
     args = parser.parse_args(argv)
 
     project_root = Path(__file__).resolve().parents[1]
@@ -1217,8 +1246,17 @@ def main(argv: list[str] | None = None) -> int:
         deterministic=bool(cfg.deterministic),
     )
     device = base.resolve_device(cfg)
-    dataset_bundle = base.build_datasets(cfg)
-
+    seeds = list(args.seeds) if args.seeds is not None else [int(cfg.seed)]
+    if len(set(seeds)) != len(seeds):
+        parser.error("--seeds 不允许包含重复的种子。")
+    if any(seed < 0 or seed > 2**32 - 1 for seed in seeds):
+        parser.error("--seeds 的每个随机种子必须位于 [0, 2**32-1]。")
+    if args.output is not None and len(seeds) != 1:
+        parser.error("--output 仅支持单个 seed；多个 seed 请使用 --output-dir。")
+    if args.max_batches <= 0:
+        parser.error("--max-batches 必须是正整数。")
+    if args.shuffle_repeats < 0:
+        parser.error("--shuffle-repeats 必须是非负整数。")
     batch_size = (
         int(args.batch_size)
         if args.batch_size is not None
@@ -1229,11 +1267,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.num_workers is not None
         else int(cfg.num_workers)
     )
-    if batch_size <= 0:
-        raise ValueError("--batch-size 必须是正整数。")
-    if num_workers < 0:
-        raise ValueError("--num-workers 必须是非负整数。")
+    if batch_size <= 0 or num_workers < 0:
+        parser.error("--batch-size 必须为正数，--num-workers 不能为负数。")
 
+    dataset_bundle = base.build_datasets(cfg)
     diagnostic_loader = base._build_dataloader(
         dataset=dataset_bundle.train_evidence_dataset,
         batch_size=batch_size,
@@ -1246,65 +1283,114 @@ def main(argv: list[str] | None = None) -> int:
         drop_last=False,
         seed=int(cfg.seed),
     )
-    model = base.build_switch_vit_model(cfg).to(device)
-    report = diagnose_model_experts(
-        model=model,
-        data_loader=diagnostic_loader,
-        device=device,
-        max_batches=args.max_batches,
-        max_tokens_per_layer=args.max_tokens_per_layer,
-        subspace_k=args.subspace_k,
-        expert_batch_size=args.expert_batch_size,
-    )
+    # 数据集在这里只加载一次；各随机初始化模型使用完全相同的图像、
+    # 图像顺序和关闭随机增强的 Transform。
+    fixed_batches = [
+        (_extract_images_from_batch(batch).detach().cpu().clone(),)
+        for batch in itertools.islice(diagnostic_loader, args.max_batches)
+    ]
+    if not fixed_batches:
+        raise ValueError("诊断数据集为空，没有可用于初始化基线的图像。")
+
+    output_base = args.output_dir.expanduser()
+    if not output_base.is_absolute():
+        output_base = project_root / output_base
+    output_dir = _create_unique_diagnosis_directory(output_base)
+
     model_cfg = (
         cfg.model_cfg.to_dict()
         if hasattr(cfg.model_cfg, "to_dict")
         else dict(cfg.model_cfg)
     )
-    report["diagnostic_stage"] = "initialization"
-    report["dataset"] = str(cfg.dataset)
-    report["data_split"] = "train_evidence_no_augmentation"
-    report["model"] = "SwitchViT"
-    report["model_state"] = "random_initialization"
-    report["model_config"] = {
-        "num_experts": int(cfg.num_experts),
-        **model_cfg,
-    }
-    report["input_shape"] = list(dataset_bundle.input_shape)
-    report["seed"] = int(cfg.seed)
-    report["device"] = str(device)
-    report["metric_directions"] = {
-        "fc1_weight_cosine": "higher means more similar; -1 means opposite",
-        "fc2_weight_cosine": "higher means more similar; -1 means opposite",
-        "fc1_right_subspace_overlap": "1 means identical; 0 means orthogonal",
-        "fc2_left_subspace_overlap": "1 means identical; 0 means orthogonal",
-        "hidden_cka": "1 means highly similar representations; 0 means dissimilar",
-        "output_cka": "1 means highly similar representations; 0 means dissimilar",
-        "output_normalized_mse": "0 means identical outputs; higher means larger difference",
-    }
-
-    output_path = args.output.expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as file:
-        json.dump(
-            report,
-            file,
-            ensure_ascii=False,
-            indent=2,
-            allow_nan=False,
+    reports: list[dict[str, Any]] = []
+    for seed in seeds:
+        print(
+            f"[Expert Homogeneity] diagnosing initialization seed={seed} "
+            f"({len(reports) + 1}/{len(seeds)})",
+            flush=True,
         )
+        base.set_seed(
+            seed=seed,
+            deterministic=bool(cfg.deterministic),
+        )
+        model = base.build_switch_vit_model(cfg).to(device)
+        report = diagnose_model_experts(
+            model=model,
+            data_loader=fixed_batches,
+            device=device,
+            max_batches=args.max_batches,
+            max_tokens_per_layer=args.max_tokens_per_layer,
+            subspace_k=args.subspace_k,
+            expert_batch_size=args.expert_batch_size,
+            shuffled_cka_repeats=args.shuffle_repeats,
+            shuffle_seed=seed,
+            token_output_cosine=not args.no_token_cosine,
+        )
+        report["diagnostic_stage"] = "initialization"
+        report["dataset"] = str(cfg.dataset)
+        report["data_split"] = "train_evidence_no_augmentation"
+        report["sampling_policy"] = "fixed_first_batches_then_evenly_spaced_tokens"
+        report["model"] = "SwitchViT"
+        report["model_state"] = "random_initialization"
+        report["model_config"] = {
+            "num_experts": int(cfg.num_experts),
+            **model_cfg,
+        }
+        report["input_shape"] = list(dataset_bundle.input_shape)
+        report["seed"] = seed
+        report["device"] = str(device)
+        report["metric_directions"] = {
+            "weight_cosine": "near 1 means aligned parameter vectors",
+            "subspace_overlap": "1 means identical Top-k subspaces",
+            "cka": "high values mean similar sample geometry, not identical outputs",
+            "shuffled_cka": "negative control with broken token correspondence",
+            "cka_gap": "paired CKA minus shuffled CKA",
+            "output_normalized_mse": "0 means identical outputs",
+            "token_output_cosine_mean": "mean direction agreement per aligned token",
+        }
+        reports.append(report)
+        del model
 
-    print(f"[Expert Homogeneity] dataset={cfg.dataset}")
-    print(f"[Expert Homogeneity] device={device}")
-    print(f"[Expert Homogeneity] batches={report['num_batches']}")
-    print(f"[Expert Homogeneity] output={output_path}")
-    for layer_name, layer_report in report["layers"].items():
-        print(f"[Expert Homogeneity] layer={layer_name}")
-        for metric_name, summary in layer_report["summary"].items():
-            mean_value = summary["mean"]
-            value_text = "n/a" if mean_value is None else f"{mean_value:.6f}"
-            print(f"  {metric_name}: mean={value_text}")
+    if args.output is not None:
+        output_path = args.output.expanduser()
+        if not output_path.is_absolute():
+            output_path = project_root / output_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(output_path, reports[0])
 
+    metadata = {
+        "schema_version": 1,
+        "purpose": "random_initialization_baseline_and_negative_controls",
+        "seeds": seeds,
+        "dataset": str(cfg.dataset),
+        "input_shape": list(dataset_bundle.input_shape),
+        "num_fixed_images": sum(int(batch[0].shape[0]) for batch in fixed_batches),
+        "data_split": "train_evidence_no_augmentation",
+        "diagnosis_data_used_for_training": False,
+        "num_batches": len(fixed_batches),
+        "batch_size": batch_size,
+        "max_tokens_per_layer": args.max_tokens_per_layer,
+        "subspace_k": args.subspace_k,
+        "expert_batch_size": args.expert_batch_size,
+        "shuffle_repeats": args.shuffle_repeats,
+        "token_cosine_enabled": not args.no_token_cosine,
+        "device": str(device),
+        "deterministic": bool(cfg.deterministic),
+        "model_config": {"num_experts": int(cfg.num_experts), **model_cfg},
+        "checkpoint_saved": False,
+        "interpretation": (
+            "Compare initialization distributions across seeds; shuffled CKA "
+            "breaks token pairing. High CKA alone does not prove functional redundancy."
+        ),
+    }
+    files = save_initialization_controls(
+        reports,
+        output_dir,
+        metadata=metadata,
+    )
+    print(f"[Expert Homogeneity] saved to: {output_dir}")
+    for label, path in files.items():
+        print(f"  {label}: {path.name}")
     return 0
 
 
