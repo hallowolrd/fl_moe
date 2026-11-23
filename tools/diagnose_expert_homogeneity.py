@@ -448,6 +448,7 @@ def _collect_expert_representations(
 
     return torch.cat(hidden_chunks, dim=0), torch.cat(output_chunks, dim=0)
 
+
 def _summarize_pairwise_metrics(
     pairwise: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, dict[str, float | int | None]]:
