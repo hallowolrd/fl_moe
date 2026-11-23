@@ -107,6 +107,48 @@ DEFAULT_CONFIG = {
 }
 
 
+_MAX_EXPERIMENT_SEED = 2**32 - 1
+
+
+def _validate_seed_value(seed: object) -> int:
+    """校验实验主随机种子，确保 Python、NumPy 和 PYTHONHASHSEED 均可接受。"""
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            "seed 必须是严格整数，不接受 bool 或其他类型；"
+            f"当前值：{seed!r}（类型：{type(seed).__name__}）。"
+        )
+    if not 0 <= seed <= _MAX_EXPERIMENT_SEED:
+        raise ValueError(
+            f"seed 必须位于 [0, {_MAX_EXPERIMENT_SEED}] 范围内，"
+            f"当前值：{seed}。"
+        )
+    return seed
+
+
+def _parse_startup_seed_value(raw_seed: object) -> int:
+    """将启动阶段读取的 CLI/YAML 简单标量解析为严格合法的整数种子。"""
+    if isinstance(raw_seed, str):
+        value = raw_seed.strip()
+        if not value:
+            raise ValueError("seed 不能为空。")
+        try:
+            unsigned_value = value.lstrip("+-").lower()
+            if unsigned_value.startswith(("0x", "0o", "0b")):
+                base = 0
+            elif len(unsigned_value) > 1 and unsigned_value.startswith("0"):
+                # PyYAML 的 YAML 1.1 整数解析会将前导零整数解释为八进制。
+                base = 8
+            else:
+                base = 10
+            parsed_seed = int(value, base)
+        except ValueError as exc:
+            raise ValueError(
+                f"seed 必须是整数标量，当前值：{raw_seed!r}。"
+            ) from exc
+        return _validate_seed_value(parsed_seed)
+    return _validate_seed_value(raw_seed)
+
+
 def _get_cli_arg_value(name: str) -> str | None:
     """
     从命令行参数中读取指定参数值。
@@ -271,27 +313,39 @@ def _prepare_deterministic_env_before_torch() -> None:
     if config_arg is not None:
         config_seed = _read_top_level_scalar_from_yaml_like_file(path=Path(config_arg), key="seed")
 
-    target_hash_seed = str(
-        cli_seed if cli_seed is not None else (
-            config_seed if config_seed is not None else DEFAULT_CONFIG["seed"]
+    raw_seed = (
+        cli_seed
+        if cli_seed is not None
+        else (
+            config_seed
+            if config_seed is not None
+            else DEFAULT_CONFIG["seed"]
         )
     )
+    # 必须在设置 PYTHONHASHSEED 和重新执行进程之前校验，避免非法值导致
+    # Python 解释器在重启阶段直接失败，而不是给出可读的配置错误。
+    target_hash_seed = str(_parse_startup_seed_value(raw_seed))
 
     current_hash_seed = os.environ.get("PYTHONHASHSEED")
     already_reexec = os.environ.get("CLEAN_REEXEC_FOR_PYTHONHASHSEED") == "1"
 
     if current_hash_seed != target_hash_seed:
+        if already_reexec:
+            raise RuntimeError(
+                "PYTHONHASHSEED 在进程重新启动后仍与配置 seed 不一致；"
+                f"expected={target_hash_seed}, actual={current_hash_seed!r}。"
+            )
+
         os.environ["PYTHONHASHSEED"] = target_hash_seed
 
         # PYTHONHASHSEED 必须在 Python 解释器启动前生效。
         # 当前进程已经启动了，所以这里自动重启一次当前命令。
-        if not already_reexec:
-            os.environ["CLEAN_REEXEC_FOR_PYTHONHASHSEED"] = "1"
-            os.execvpe(
-                sys.executable,
-                [sys.executable] + sys.argv,
-                os.environ,
-            )
+        os.environ["CLEAN_REEXEC_FOR_PYTHONHASHSEED"] = "1"
+        os.execvpe(
+            sys.executable,
+            [sys.executable] + sys.argv,
+            os.environ,
+        )
 
 
 _prepare_deterministic_env_before_torch()
@@ -1523,6 +1577,14 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
     这个函数只检查通用配置。
     后面新增 方法插件 / history / Bayes 时，可以继续拆出新的 validate 函数。
     """
+    try:
+        _validate_seed_value(cfg.get("seed", DEFAULT_CONFIG["seed"]))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            "seed 必须是 [0, 4294967295] 范围内的严格非负整数；"
+            f"当前值：{cfg.get('seed', DEFAULT_CONFIG['seed'])!r}。"
+        ) from exc
+
     dataset = normalize_dataset_name(str(cfg.get("dataset")))
     if dataset not in SUPPORTED_DATASETS:
         raise ConfigError(
@@ -1997,11 +2059,7 @@ def set_seed(
             是否开启 cudnn.benchmark。
             如果为 None，则根据 deterministic 自动决定。
     """
-    if not isinstance(seed, int):
-        raise TypeError(f"seed 必须是 int，当前类型：{type(seed)}")
-
-    if seed < 0:
-        raise ValueError(f"seed 必须是非负整数，当前值：{seed}")
+    seed = _validate_seed_value(seed)
 
     # 固定 Python hash 随机性。
     #
@@ -2071,11 +2129,12 @@ def build_torch_generator(seed: int) -> torch.Generator:
 
     主要用于 DataLoader，保证 shuffle 更可复现。
     """
-    if not isinstance(seed, int):
-        raise TypeError(f"seed 必须是 int，当前类型：{type(seed)}")
-
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError(
+            f"DataLoader seed 必须是严格整数，当前类型：{type(seed).__name__}"
+        )
     if seed < 0:
-        raise ValueError(f"seed 必须是非负整数，当前值：{seed}")
+        raise ValueError(f"DataLoader seed 必须是非负整数，当前值：{seed}")
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -3499,6 +3558,122 @@ class DatasetBundle:
     server_evidence_dataset: Optional[Any] = None
 
 
+def _validate_dataset_split_classes(
+    dataset: Any,
+    dataset_name: str,
+    split_name: str,
+    expected_num_classes: int,
+    require_all_classes: bool,
+) -> set[int]:
+    """
+    检查数据集实际标签空间是否符合 DATASET_INFO。
+
+    训练集和 Evidence 集必须覆盖全部类别；测试集允许缺少部分类别，
+    但所有实际标签必须位于模型输出类别范围内。
+    """
+    if (
+        isinstance(expected_num_classes, bool)
+        or not isinstance(expected_num_classes, int)
+        or expected_num_classes <= 0
+    ):
+        raise ValueError(
+            f"{dataset_name} 的注册类别数必须是正整数，"
+            f"当前值：{expected_num_classes!r}。"
+        )
+
+    raw_targets = getattr(dataset, "targets", None)
+    if raw_targets is None:
+        raw_targets = getattr(dataset, "labels", None)
+    if raw_targets is None:
+        raise TypeError(
+            f"{dataset_name} {split_name} 缺少 targets/labels，"
+            "无法验证实际类别数量。"
+        )
+
+    dataset_size = len(dataset)
+    try:
+        target_count = len(raw_targets)
+    except TypeError as exc:
+        raise TypeError(
+            f"{dataset_name} {split_name} 的 targets/labels 必须是可计数序列。"
+        ) from exc
+    if target_count != dataset_size:
+        raise ValueError(
+            f"{dataset_name} {split_name} 的样本数与标签数不一致："
+            f"dataset={dataset_size}, labels={target_count}。"
+        )
+    if target_count == 0:
+        raise ValueError(f"{dataset_name} {split_name} 不能为空。")
+
+    expected_class_ids = set(range(expected_num_classes))
+    declared_classes = getattr(dataset, "classes", None)
+    if declared_classes is not None and len(declared_classes) != expected_num_classes:
+        raise ValueError(
+            f"{dataset_name} {split_name} 声明的类别数量与 DATASET_INFO 不一致："
+            f"expected={expected_num_classes}, actual={len(declared_classes)}。"
+        )
+
+    class_to_idx = getattr(dataset, "class_to_idx", None)
+    if class_to_idx is not None:
+        if not isinstance(class_to_idx, Mapping):
+            raise TypeError(
+                f"{dataset_name} {split_name} 的 class_to_idx 必须是 Mapping。"
+            )
+        class_indices = list(class_to_idx.values())
+        if (
+            len(class_to_idx) != expected_num_classes
+            or any(
+                isinstance(index, bool) or not isinstance(index, int)
+                for index in class_indices
+            )
+            or set(class_indices) != expected_class_ids
+        ):
+            raise ValueError(
+                f"{dataset_name} {split_name} 的 class_to_idx 与注册类别空间不一致："
+                f"expected={expected_num_classes} 个连续类别编号，"
+                f"actual={class_to_idx!r}。"
+            )
+
+    observed_class_ids: set[int] = set()
+    for sample_index, raw_label in enumerate(raw_targets):
+        if isinstance(raw_label, torch.Tensor):
+            if raw_label.numel() != 1:
+                raise TypeError(
+                    f"{dataset_name} {split_name} 第 {sample_index} 个标签不是标量。"
+                )
+            raw_label = raw_label.item()
+
+        if isinstance(raw_label, (bool, np.bool_)) or not isinstance(
+            raw_label,
+            (int, np.integer),
+        ):
+            raise TypeError(
+                f"{dataset_name} {split_name} 第 {sample_index} 个标签必须是整数，"
+                f"当前值：{raw_label!r}。"
+            )
+
+        label = int(raw_label)
+        if label not in expected_class_ids:
+            raise ValueError(
+                f"{dataset_name} {split_name} 出现超出模型类别范围的标签："
+                f"index={sample_index}, label={label}, "
+                f"valid_range=[0, {expected_num_classes - 1}]。"
+            )
+        observed_class_ids.add(label)
+
+    if require_all_classes:
+        missing_class_ids = sorted(expected_class_ids - observed_class_ids)
+        if missing_class_ids:
+            raise ValueError(
+                f"{dataset_name} {split_name} 未覆盖完整类别空间："
+                f"expected_num_classes={expected_num_classes}, "
+                f"observed_num_classes={len(observed_class_ids)}, "
+                f"missing_class_ids={missing_class_ids}。"
+            )
+
+    return observed_class_ids
+
+
 def build_datasets(cfg: Any) -> DatasetBundle:
     """为当前基准数据集构建集中式训练、Evidence 和测试数据集。"""
     dataset_name = normalize_dataset_name(str(cfg.dataset))
@@ -3649,12 +3824,35 @@ def build_datasets(cfg: Any) -> DatasetBundle:
             f"{len(train_dataset)} vs {len(train_evidence_dataset)}"
         )
 
+    num_classes = int(info["num_classes"])
+    _validate_dataset_split_classes(
+        dataset=train_dataset,
+        dataset_name=dataset_name,
+        split_name="train",
+        expected_num_classes=num_classes,
+        require_all_classes=True,
+    )
+    _validate_dataset_split_classes(
+        dataset=train_evidence_dataset,
+        dataset_name=dataset_name,
+        split_name="train_evidence",
+        expected_num_classes=num_classes,
+        require_all_classes=True,
+    )
+    _validate_dataset_split_classes(
+        dataset=test_dataset,
+        dataset_name=dataset_name,
+        split_name="test",
+        expected_num_classes=num_classes,
+        require_all_classes=False,
+    )
+
     bundle = DatasetBundle(
         name=dataset_name,
         train_dataset=train_dataset,
         train_evidence_dataset=train_evidence_dataset,
         test_dataset=test_dataset,
-        num_classes=int(info["num_classes"]),
+        num_classes=num_classes,
         input_shape=tuple(info["input_shape"]),
     )
 
@@ -8748,7 +8946,13 @@ class FLServer:
 
         # 聚合后的 QR / Retract 等操作由当前专家聚合算法决定。
         self.aggregators.expert.after_aggregate(self.global_model)
-        check_finite_state_dict(self.global_model.state_dict())
+        post_aggregate_state = self.global_model.state_dict()
+        validate_state_dict_shapes(
+            reference_state=new_state_dict,
+            candidate_state=post_aggregate_state,
+            context="聚合后处理结果",
+        )
+        check_finite_state_dict(post_aggregate_state)
 
         # 只有在最终服务端模型状态加载完成、
         # 且算法专属聚合后处理全部执行完毕后，才收集诊断信息。
@@ -9937,7 +10141,7 @@ def main(
         )
 
     set_seed(
-        seed=int(cfg.seed),
+        seed=cfg.seed,
         deterministic=_cfg_get_bool(
             cfg,
             "deterministic",
