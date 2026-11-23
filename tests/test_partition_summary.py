@@ -25,17 +25,14 @@ class PartitionSummaryTests(unittest.TestCase):
             client_indices=[
                 [0, 2, 4],
                 [1, 3],
-                [],
             ],
             client_sample_counts={
                 0: 3,
                 1: 2,
-                2: 0,
             },
             client_class_counts={
                 0: {0: 2, 1: 1, 2: 0},
                 1: {0: 0, 1: 1, 2: 1},
-                2: {0: 0, 1: 0, 2: 0},
             },
             num_classes=3,
             partition_method="dirichlet",
@@ -67,17 +64,16 @@ class PartitionSummaryTests(unittest.TestCase):
         self.assertEqual(summary["sample_balance"], "unbalanced")
         self.assertEqual(summary["dirichlet_alpha"], 0.1)
         self.assertEqual(summary["num_classes"], 3)
-        self.assertEqual(summary["num_clients"], 3)
-        self.assertEqual(summary["client_sample_counts"], {0: 3, 1: 2, 2: 0})
-        self.assertEqual(summary["client_sample_count_min"], 0)
+        self.assertEqual(summary["num_clients"], 2)
+        self.assertEqual(summary["client_sample_counts"], {0: 3, 1: 2})
+        self.assertEqual(summary["client_sample_count_min"], 2)
         self.assertEqual(summary["client_sample_count_max"], 3)
-        self.assertEqual(summary["client_sample_count_spread"], 3)
+        self.assertEqual(summary["client_sample_count_spread"], 1)
         self.assertEqual(
             summary["client_class_counts"],
             {
                 0: {0: 2, 1: 1, 2: 0},
                 1: {0: 0, 1: 1, 2: 1},
-                2: {0: 0, 1: 0, 2: 0},
             },
         )
         self.assertNotIn("client_indices", summary)
@@ -110,20 +106,19 @@ class PartitionSummaryTests(unittest.TestCase):
         self.assertEqual(saved["sample_balance"], "unbalanced")
         self.assertEqual(saved["dirichlet_alpha"], 0.1)
         self.assertEqual(saved["num_classes"], 3)
-        self.assertEqual(saved["num_clients"], 3)
+        self.assertEqual(saved["num_clients"], 2)
         self.assertEqual(
             saved["client_sample_counts"],
-            {"0": 3, "1": 2, "2": 0},
+            {"0": 3, "1": 2},
         )
-        self.assertEqual(saved["client_sample_count_min"], 0)
+        self.assertEqual(saved["client_sample_count_min"], 2)
         self.assertEqual(saved["client_sample_count_max"], 3)
-        self.assertEqual(saved["client_sample_count_spread"], 3)
+        self.assertEqual(saved["client_sample_count_spread"], 1)
         self.assertEqual(
             saved["client_class_counts"],
             {
                 "0": {"0": 2, "1": 1, "2": 0},
                 "1": {"0": 0, "1": 1, "2": 1},
-                "2": {"0": 0, "1": 0, "2": 0},
             },
         )
         self.assertNotIn("client_indices", saved)
@@ -152,14 +147,26 @@ class PartitionSummaryTests(unittest.TestCase):
         self.assertEqual(summary["client_sample_count_spread"], 0)
 
     def test_empty_client_keeps_zero_counts_for_every_class(self) -> None:
-        partition = self.make_dirichlet_partition()
+        partition = base.PartitionResult(
+            client_indices=[[0], [1], []],
+            client_sample_counts={0: 1, 1: 1, 2: 0},
+            client_class_counts={
+                0: {0: 1, 1: 0},
+                1: {0: 0, 1: 1},
+                2: {0: 0, 1: 0},
+            },
+            num_classes=2,
+            partition_method="iid",
+            sample_balance="none",
+            dirichlet_alpha=None,
+        )
 
         summary = base.partition_summary_to_dict(partition)
 
         self.assertEqual(summary["client_sample_counts"][2], 0)
         self.assertEqual(
             summary["client_class_counts"][2],
-            {0: 0, 1: 0, 2: 0},
+            {0: 0, 1: 0},
         )
         self.assertEqual(summary["client_sample_count_min"], 0)
 
