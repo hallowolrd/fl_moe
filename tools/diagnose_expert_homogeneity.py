@@ -176,6 +176,8 @@ def compute_subspace_overlap(
         只比较 Top-k 主子空间，不比较可能天然满秩且缺乏辨别力的完整行/列空间。
         如果数值秩小于 k，则拒绝计算，避免把任意零空间方向纳入结果。
     """
+    _require_floating_tensor(weight_a, "weight_a")
+    _require_floating_tensor(weight_b, "weight_b")
     if weight_a.shape != weight_b.shape:
         raise ValueError(
             "权重矩阵 Shape 不一致："
