@@ -79,6 +79,80 @@ def _effective_rank(
     return int((singular_values > tolerance).sum().item())
 
 
+def extract_topk_subspace(
+    weight: torch.Tensor,
+    max_k: int,
+    side: SubspaceSide,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """一次 SVD 提取可复用的 Top-k 子空间基、奇异值和有效数值秩。
+
+    返回的 basis Shape 为 [ambient_dim, max_k]。同一专家在多个 k 值和
+    多个专家对之间比较时，应只分解一次，并复用该 basis。
+    """
+    if isinstance(max_k, bool) or not isinstance(max_k, int) or max_k <= 0:
+        raise ValueError(f"max_k 必须是正整数，当前值：{max_k!r}")
+    if side not in ("left", "right"):
+        raise ValueError(f"side 只支持 'left' 或 'right'，当前值：{side!r}")
+
+    _require_floating_tensor(weight, "weight")
+    if weight.ndim != 2:
+        raise ValueError("子空间分解要求输入为二维权重矩阵。")
+    if max_k > min(weight.shape):
+        raise ValueError(
+            f"max_k={max_k} 超过矩阵可分解的最大维度 {min(weight.shape)}。"
+        )
+
+    matrix = _to_float64(weight)
+    u, singular_values, vh = torch.linalg.svd(matrix, full_matrices=False)
+    rank = _effective_rank(
+        singular_values,
+        weight.dtype,
+        tuple(weight.shape),
+    )
+    if rank < max_k:
+        raise ValueError(
+            "Top-k 子空间超出有效数值秩："
+            f"max_k={max_k}, rank={rank}。"
+        )
+
+    if side == "right":
+        basis = vh[:max_k, :].transpose(0, 1)
+    else:
+        basis = u[:, :max_k]
+    return basis, singular_values, rank
+
+
+def compute_subspace_overlap_from_bases(
+    basis_a: torch.Tensor,
+    basis_b: torch.Tensor,
+    k: int,
+) -> float:
+    """根据预先提取的正交基计算 Top-k 平均平方余弦重叠。"""
+    if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+        raise ValueError(f"k 必须是正整数，当前值：{k!r}")
+    _require_floating_tensor(basis_a, "basis_a")
+    _require_floating_tensor(basis_b, "basis_b")
+    if basis_a.ndim != 2 or basis_b.ndim != 2:
+        raise ValueError("子空间基必须是二维 Tensor。")
+    if basis_a.shape != basis_b.shape:
+        raise ValueError(
+            "子空间基 Shape 不一致："
+            f"{tuple(basis_a.shape)} vs {tuple(basis_b.shape)}"
+        )
+    if basis_a.device != basis_b.device:
+        raise ValueError("两个子空间基必须位于同一设备。")
+    if k > basis_a.shape[1]:
+        raise ValueError(
+            f"k={k} 超过已提取的子空间维度 {basis_a.shape[1]}。"
+        )
+
+    a = _to_float64(basis_a[:, :k])
+    b = _to_float64(basis_b[:, :k])
+    cross = a.transpose(0, 1) @ b
+    overlap = cross.square().sum() / k
+    return float(overlap.clamp(min=0.0, max=1.0).item())
+
+
 def compute_subspace_overlap(
     weight_a: torch.Tensor,
     weight_b: torch.Tensor,
@@ -102,49 +176,14 @@ def compute_subspace_overlap(
         只比较 Top-k 主子空间，不比较可能天然满秩且缺乏辨别力的完整行/列空间。
         如果数值秩小于 k，则拒绝计算，避免把任意零空间方向纳入结果。
     """
-    if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
-        raise ValueError(f"k 必须是正整数，当前值：{k!r}")
-    if side not in ("left", "right"):
-        raise ValueError(f"side 只支持 'left' 或 'right'，当前值：{side!r}")
-
-    _require_floating_tensor(weight_a, "weight_a")
-    _require_floating_tensor(weight_b, "weight_b")
-    if weight_a.ndim != 2 or weight_b.ndim != 2:
-        raise ValueError("子空间重叠计算要求输入为二维权重矩阵。")
     if weight_a.shape != weight_b.shape:
         raise ValueError(
             "权重矩阵 Shape 不一致："
             f"{tuple(weight_a.shape)} vs {tuple(weight_b.shape)}"
         )
-    if k > min(weight_a.shape):
-        raise ValueError(
-            f"k={k} 超过矩阵可分解的最大维度 {min(weight_a.shape)}。"
-        )
-
-    a = _to_float64(weight_a)
-    b = _to_float64(weight_b)
-    u_a, s_a, vh_a = torch.linalg.svd(a, full_matrices=False)
-    u_b, s_b, vh_b = torch.linalg.svd(b, full_matrices=False)
-
-    rank_a = _effective_rank(s_a, weight_a.dtype, tuple(weight_a.shape))
-    rank_b = _effective_rank(s_b, weight_b.dtype, tuple(weight_b.shape))
-    if rank_a < k or rank_b < k:
-        raise ValueError(
-            "Top-k 子空间超出有效数值秩："
-            f"k={k}, rank_a={rank_a}, rank_b={rank_b}。"
-        )
-
-    if side == "right":
-        basis_a = vh_a[:k, :].transpose(0, 1)
-        basis_b = vh_b[:k, :].transpose(0, 1)
-    else:
-        basis_a = u_a[:, :k]
-        basis_b = u_b[:, :k]
-
-    cross = basis_a.transpose(0, 1) @ basis_b
-    overlap = cross.square().sum() / k
-    return float(overlap.clamp(min=0.0, max=1.0).item())
-
+    basis_a, _, _ = extract_topk_subspace(weight_a, k, side)
+    basis_b, _, _ = extract_topk_subspace(weight_b, k, side)
+    return compute_subspace_overlap_from_bases(basis_a, basis_b, k)
 
 def compute_linear_cka(
     features_a: torch.Tensor,
