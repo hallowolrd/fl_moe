@@ -1858,10 +1858,11 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
                 minimum=0.0,
             )
 
-    nesterov = _require_bool_value(
-        optimizer_cfg.get("nesterov", _default_config_value("optimizer.nesterov")),
-        "optimizer.nesterov",
+    nesterov = optimizer_cfg.get(
+        "nesterov",
+        _default_config_value("optimizer.nesterov"),
     )
+    _require_bool_value(nesterov, "optimizer.nesterov")
     optimizer_type = optimizer_cfg.get("type", _default_config_value("optimizer.type"))
 
     if optimizer_type not in {"sgd", "adam", "adamw"}:
