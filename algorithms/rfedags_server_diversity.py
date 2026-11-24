@@ -1048,6 +1048,8 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
         }
         if not factor_a_names.issubset(euclidean_parameter_names):
             raise ValueError("低秩 A 因子必须全部属于欧氏 expert 参数组。")
+        if not factor_a_names.issubset(trainable_expert_parameter_names):
+            raise ValueError("低秩 A 因子必须全部属于可训练的 expert 参数组。")
         fedavg_euclidean_parameter_names = euclidean_parameter_names - factor_a_names
         expert_buffer_names = expert_state_names - parameter_state_names
 
