@@ -38,6 +38,7 @@ LOCAL_MANIFOLD_LR = None  # None -> use base.py's optimizer.lr.
 SERVER_MANIFOLD_LR = 1.0  # RFedAGS server step.
 SERVER_DIVERSITY_LR = 1e-3  # Additional server-side Stiefel correction step.
 SERVER_DIVERSITY_GRAD_CLIP = None  # None -> no product-manifold gradient clipping.
+# Prevent the hinge threshold from reaching the maximum overlap of 1.0.
 SUBSPACE_OVERLAP_THRESHOLD_CAP = 0.95
 
 METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
