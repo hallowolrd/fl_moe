@@ -746,6 +746,7 @@ def diagnose_model_experts(
             else []
         )
         with torch.random.fork_rng(devices=rng_devices):
+            with torch.inference_mode():
                 for batch_index, batch in enumerate(data_loader):
                     if max_batches is not None and batch_index >= max_batches:
                         break
