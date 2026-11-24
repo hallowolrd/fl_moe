@@ -1,8 +1,8 @@
 """RFedAGS with server-side expert subspace diversity correction.
 
 Clients optimize task and Switch auxiliary objectives, accumulate Stiefel
-gradient streams, and upload Euclidean expert deltas. The server performs
-RFedAGS aggregation followed by one diversity-aware Stiefel correction step.
+gradient streams, and upload raw expert factor deltas. The server performs
+RFedAGS aggregation, diversity correction, then final-gauge A alignment.
 """
 
 from __future__ import annotations
@@ -716,6 +716,7 @@ class RFedAGSServerDiversityClientStrategy(base.ExpertClientTrainingStrategy):
 
     @property
     def includes_expert_parameters_in_model_delta(self) -> bool:
+        # Raw A/P endpoints are retained so the server can align A to final P.
         return True
 
     @property
@@ -1010,6 +1011,9 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
         strict: bool = True,
     ) -> base.AggregationResult:
         self._validate_client_updates(client_updates)
+        self._pending_factor_updates = {}
+        self._last_factor_gauge_diagnostics = {}
+        self._last_server_correction_diagnostics = {}
         model, groups = self._get_context_resources()
 
         configured_num_clients = int(_cfg_get(self.cfg, "num_clients", 0))
