@@ -63,6 +63,26 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             },
         )
 
+    def test_scheme_two_is_independent_from_scheme_one(self) -> None:
+        self.assertEqual(algorithm.PAYLOAD_KEY, algorithm.ALGORITHM_NAME)
+        self.assertFalse(hasattr(algorithm, "subspace"))
+        self.assertIs(
+            algorithm.RFedAGSServerDiversityClientStrategy.__bases__[0],
+            base.ExpertClientTrainingStrategy,
+        )
+        self.assertIs(
+            algorithm.RFedAGSServerDiversityExpertAggregator.__bases__[0],
+            base.Aggregator,
+        )
+        self.assertFalse(
+            any("rfedags_subspace" in cls.__module__
+                for cls in algorithm.RFedAGSServerDiversityClientStrategy.__mro__)
+        )
+        self.assertFalse(
+            any("rfedags_subspace" in cls.__module__
+                for cls in algorithm.RFedAGSServerDiversityExpertAggregator.__mro__)
+        )
+
     def test_fixed_local_steps_and_full_participation_are_required(self) -> None:
         with self.assertRaisesRegex(ValueError, "local_steps"):
             self._build_cfg(local_steps=None)
@@ -104,7 +124,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
 
     @staticmethod
     def _set_overlapping_subspaces(model, angle: float) -> None:
-        records = model._rfedags_subspace_layer_records
+        records = model._rfedags_server_diversity_layer_records
         parameter_map = dict(model.named_parameters())
         basis = torch.eye(16)[:, :8]
         rotated = basis.clone()
@@ -124,12 +144,12 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         stiefel_layers = [
             module
             for module in model.modules()
-            if isinstance(module, algorithm.subspace.LowRankStiefelLinear)
+            if isinstance(module, algorithm.ServerDiversityLowRankStiefelLinear)
         ]
 
         self.assertEqual(len(stiefel_layers), 2 * 4)
         self.assertEqual(
-            len(model._rfedags_subspace_layer_records),
+            len(model._rfedags_server_diversity_layer_records),
             2,
         )
         for layer in stiefel_layers:
@@ -150,23 +170,23 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         cfg = self._build_cfg(tau_margin=0.99, threshold_cap=0.95)
         model = algorithm.build_rfedags_server_diversity_model(cfg)
 
-        self.assertTrue(model._rfedags_subspace_thresholds)
+        self.assertTrue(model._rfedags_server_diversity_thresholds)
         self.assertTrue(
             all(
                 0.0 <= threshold <= 0.95
-                for threshold in model._rfedags_subspace_thresholds.values()
+                for threshold in model._rfedags_server_diversity_thresholds.values()
             )
         )
         self.assertTrue(
             all(
                 threshold < 1.0
-                for threshold in model._rfedags_subspace_thresholds.values()
+                for threshold in model._rfedags_server_diversity_thresholds.values()
             )
         )
         self.assertTrue(
             all(
                 abs(threshold - 0.95) < 1e-12
-                for threshold in model._rfedags_subspace_thresholds.values()
+                for threshold in model._rfedags_server_diversity_thresholds.values()
             )
         )
 
@@ -262,7 +282,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         # If the client path tries to evaluate the diversity objective, fail
         # immediately. Scheme two computes that objective only on the server.
         with patch.object(
-            algorithm.subspace,
+            algorithm,
             "compute_subspace_diversity_loss",
             side_effect=AssertionError(
                 "client must not compute the diversity loss"
@@ -288,8 +308,8 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         self.assertEqual(result.stats.num_batches, 4)
         payload = result.algorithm_payload[algorithm.PAYLOAD_KEY]
         self.assertEqual(payload["local_steps"], 4)
-        self.assertEqual(payload["mean_diversity_loss"], 0.0)
-        self.assertEqual(payload["mean_overlap_by_layer"], {})
+        self.assertNotIn("mean_diversity_loss", payload)
+        self.assertNotIn("mean_overlap_by_layer", payload)
         self.assertTrue(payload["gradient_stream"])
 
         for name, parameter in model.named_parameters():
@@ -304,7 +324,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
 
     def test_server_correction_runs_after_rfedags_aggregation(self) -> None:
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
-        records = model._rfedags_subspace_layer_records
+        records = model._rfedags_server_diversity_layer_records
         self._set_overlapping_subspaces(model, angle=0.1)
 
         state = base.clone_state_dict(model.state_dict())
@@ -330,7 +350,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         for name in p_names:
             parameter = parameter_map[name].detach()
             ambient_direction = torch.randn_like(parameter)
-            tangent_direction = algorithm.subspace.stiefel_tangent_projection(
+            tangent_direction = algorithm.stiefel_tangent_projection(
                 parameter,
                 ambient_direction,
             )
@@ -418,9 +438,9 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         parameter_map = dict(model.named_parameters())
         p_parameters = [parameter_map[name] for name in ordered_p_names]
         with torch.enable_grad():
-            expected_loss, _ = algorithm.subspace.compute_subspace_diversity_loss(
+            expected_loss, _ = algorithm.compute_subspace_diversity_loss(
                 model,
-                thresholds=model._rfedags_subspace_thresholds,
+                thresholds=model._rfedags_server_diversity_thresholds,
             )
             euclidean_gradients = torch.autograd.grad(
                 expected_loss,
@@ -430,7 +450,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                 allow_unused=False,
             )
         expected_riemannian_gradients = [
-            algorithm.subspace.stiefel_tangent_projection(
+            algorithm.stiefel_tangent_projection(
                 parameter.detach(),
                 gradient.detach(),
             )
@@ -443,7 +463,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             )
         )
         expected_parameters = {
-            name: algorithm.subspace.qr_retraction(
+            name: algorithm.qr_retraction(
                 parameter.detach()
                 - aggregator.diversity_lr * gradient
             )
