@@ -28,6 +28,7 @@ class RFedAGSSubspaceTests(unittest.TestCase):
     def _build_cfg(
         local_steps: int | None = 4,
         method_config: dict | None = None,
+        frac: float = 1.0,
     ):
         configured_method = {"subspace_rank": 8}
         if method_config:
@@ -39,7 +40,7 @@ class RFedAGSSubspaceTests(unittest.TestCase):
             config_overrides={
                 "dataset": "cifar10",
                 "num_clients": 2,
-                "frac": 1.0,
+                "frac": frac,
                 "local_steps": local_steps,
                 "num_experts": 4,
                 "model_cfg": {
@@ -73,6 +74,13 @@ class RFedAGSSubspaceTests(unittest.TestCase):
             self._build_cfg(local_steps=None)
 
         self.assertEqual(int(self.cfg.local_steps), 4)
+
+    def test_full_participation_requires_exact_numeric_one(self) -> None:
+        with self.assertRaisesRegex(ValueError, "frac=1.0"):
+            self._build_cfg(frac=0.9999999999995)
+
+        with self.assertRaisesRegex(ValueError, "frac"):
+            self._build_cfg(frac=True)
 
     def test_subspace_threshold_is_capped_below_one(self) -> None:
         cfg = self._build_cfg(method_config={"tau_margin": 0.99})
