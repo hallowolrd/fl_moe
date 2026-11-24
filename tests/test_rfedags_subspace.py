@@ -95,6 +95,34 @@ class RFedAGSSubspaceTests(unittest.TestCase):
             )
         )
 
+    def test_factor_gauge_alignment_preserves_effective_weight(self) -> None:
+        local_p = torch.linalg.qr(torch.randn(16, 8), mode="reduced").Q
+        reference_p = torch.linalg.qr(torch.randn(16, 8), mode="reduced").Q
+        local_a = torch.randn(32, 8)
+        effective_weight_before = local_a @ local_p.transpose(0, 1)
+
+        aligned_a, aligned_p = algorithm.align_stiefel_factor_gauge(
+            local_a=local_a,
+            local_p=local_p,
+            reference_p=reference_p,
+        )
+
+        effective_weight_after = aligned_a @ aligned_p.transpose(0, 1)
+        self.assertTrue(
+            torch.allclose(
+                effective_weight_after,
+                effective_weight_before,
+                atol=1e-5,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                aligned_p.transpose(0, 1) @ aligned_p,
+                torch.eye(8),
+                atol=1e-5,
+            )
+        )
+
     def test_model_builder_replaces_each_expert_first_layer(self) -> None:
         model = algorithm.build_rfedags_subspace_model(self.cfg)
         stiefel_layers = [
