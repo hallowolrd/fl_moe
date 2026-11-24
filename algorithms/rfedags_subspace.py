@@ -1057,15 +1057,12 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
         )
         base.check_finite_state_dict(new_state_dict)
 
-        diagnostic_param_names = (
-            list(param_names)
-            if param_names is not None
-            else sorted(expert_state_names)
-        )
+        # model_delta diagnostics describe only the Euclidean expert path;
+        # P is aggregated from gradient_stream, not from its endpoint delta.
         diagnostics = self.build_diagnostics(
             client_updates=client_updates,
             weights=weights,
-            param_names=diagnostic_param_names,
+            param_names=sorted(euclidean_parameter_names),
         )
         diagnostics.update(
             {
