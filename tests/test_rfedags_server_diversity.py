@@ -25,7 +25,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         self.cfg = self._build_cfg(local_steps=4)
 
     @staticmethod
-    def _build_cfg(local_steps: int | None = 4):
+    def _build_cfg(local_steps: int | None = 4, frac: float = 1.0):
         return base.load_embedded_config(
             algorithm.EMBEDDED_METHOD_CONFIG,
             method_defaults=algorithm.METHOD_CONFIG_DEFAULTS,
@@ -33,7 +33,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             config_overrides={
                 "dataset": "cifar10",
                 "num_clients": 2,
-                "frac": 1.0,
+                "frac": frac,
                 "local_steps": local_steps,
                 "num_experts": 4,
                 "model_cfg": {
@@ -55,10 +55,8 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "local_steps"):
             self._build_cfg(local_steps=None)
 
-        invalid_cfg = self._build_cfg()
-        invalid_cfg.frac = 0.5
         with self.assertRaisesRegex(ValueError, "frac=1.0"):
-            algorithm.validate_method_config(invalid_cfg)
+            self._build_cfg(frac=0.5)
 
         self.assertEqual(int(self.cfg.local_steps), 4)
         self.assertEqual(
