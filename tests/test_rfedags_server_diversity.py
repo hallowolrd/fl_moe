@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import sys
 import unittest
@@ -282,8 +283,73 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         self.assertNotIn("lambda_div", result.diagnostics)
 
         model.load_state_dict(result.new_state_dict, strict=True)
+
+        # Independently construct the expected server update using the
+        # Stiefel tangent projection. This fails if the implementation
+        # accidentally applies the ambient Euclidean gradient directly.
+        ordered_p_names = [
+            item["p_name"]
+            for layer_records in records.values()
+            for item in layer_records
+        ]
+        parameter_map = dict(model.named_parameters())
+        p_parameters = [parameter_map[name] for name in ordered_p_names]
+        with torch.enable_grad():
+            expected_loss, _ = algorithm.subspace.compute_subspace_diversity_loss(
+                model,
+                thresholds=model._rfedags_subspace_thresholds,
+            )
+            euclidean_gradients = torch.autograd.grad(
+                expected_loss,
+                p_parameters,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )
+        expected_riemannian_gradients = [
+            algorithm.subspace.stiefel_tangent_projection(
+                parameter.detach(),
+                gradient.detach(),
+            )
+            for parameter, gradient in zip(p_parameters, euclidean_gradients)
+        ]
+        expected_gradient_norm = math.sqrt(
+            sum(
+                float(torch.sum(gradient.to(torch.float64).square()).item())
+                for gradient in expected_riemannian_gradients
+            )
+        )
+        expected_parameters = {
+            name: algorithm.subspace.qr_retraction(
+                parameter.detach()
+                - aggregator.diversity_lr * gradient
+            )
+            for name, parameter, gradient in zip(
+                ordered_p_names,
+                p_parameters,
+                expected_riemannian_gradients,
+            )
+        }
+
         aggregator.after_aggregate(model)
         diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+
+        actual_parameter_map = dict(model.named_parameters())
+        for name, expected_parameter in expected_parameters.items():
+            self.assertTrue(
+                torch.allclose(
+                    actual_parameter_map[name],
+                    expected_parameter,
+                    atol=1e-6,
+                    rtol=1e-5,
+                ),
+                msg=f"服务器端参数 {name} 未按黎曼梯度方向更新。",
+            )
+        self.assertAlmostEqual(
+            diagnostics["server_diversity_gradient_norm"],
+            expected_gradient_norm,
+            places=6,
+        )
 
         self.assertTrue(diagnostics["server_diversity_applied"])
         self.assertGreater(
