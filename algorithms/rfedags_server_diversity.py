@@ -381,10 +381,25 @@ class RFedAGSServerDiversityExpertAggregator(
         )
         before_points = [parameter.detach().clone() for parameter in p_parameters]
 
+        # Convert ambient Euclidean gradients into Riemannian gradients
+        # before measuring/clipping their product-manifold norm.
+        riemannian_gradients = [
+            subspace.stiefel_tangent_projection(
+                parameter.detach(),
+                gradient.detach(),
+            )
+            for parameter, gradient in zip(p_parameters, gradients)
+        ]
+        if any(
+            not subspace._tensor_is_finite(gradient)
+            for gradient in riemannian_gradients
+        ):
+            raise ValueError("服务器端黎曼差异性梯度包含 NaN 或 Inf。")
+
         gradient_norm = math.sqrt(
             sum(
-                float(torch.sum(gradient.detach().to(torch.float64).square()).item())
-                for gradient in gradients
+                float(torch.sum(gradient.to(torch.float64).square()).item())
+                for gradient in riemannian_gradients
             )
         )
         if not math.isfinite(gradient_norm):
@@ -405,7 +420,10 @@ class RFedAGSServerDiversityExpertAggregator(
 
         if applied:
             with torch.no_grad():
-                for parameter, gradient in zip(p_parameters, gradients):
+                for parameter, gradient in zip(
+                    p_parameters,
+                    riemannian_gradients,
+                ):
                     parameter.copy_(
                         subspace.qr_retraction(
                             parameter.detach()
