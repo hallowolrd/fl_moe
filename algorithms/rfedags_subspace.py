@@ -614,6 +614,7 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
         self._records: Dict[str, list[Dict[str, Any]]] = {}
         self._p_names: list[str] = []
         self._expert_parameter_names: list[str] = []
+        self._expert_parameters: list[nn.Parameter] = []
         self._euclidean_expert_names: list[str] = []
         self._euclidean_expert_parameters: list[nn.Parameter] = []
         self._expert_buffer_names: list[str] = []
@@ -671,6 +672,12 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
         if not self._euclidean_expert_names:
             raise ValueError("没有可由普通优化器更新的欧氏专家参数。")
 
+        # Keep the full expert-parameter list for subclasses that implement
+        # their own expert clipping (e.g. the server-diversity variant).
+        self._expert_parameters = [
+            self._parameter_map[name]
+            for name in self._expert_parameter_names
+        ]
         self._euclidean_expert_parameters = [
             self._parameter_map[name]
             for name in self._euclidean_expert_names
