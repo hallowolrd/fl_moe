@@ -38,6 +38,7 @@ LOCAL_MANIFOLD_LR = None  # None -> use base.py's optimizer.lr.
 SERVER_MANIFOLD_LR = 1.0  # RFedAGS server step.
 SERVER_DIVERSITY_LR = 1e-3  # Additional server-side Stiefel correction step.
 SERVER_DIVERSITY_GRAD_CLIP = None  # None -> no product-manifold gradient clipping.
+SUBSPACE_OVERLAP_THRESHOLD_CAP = 0.95
 
 METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
     "method_config": {
@@ -47,6 +48,7 @@ METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
         "server_manifold_lr": SERVER_MANIFOLD_LR,
         "server_diversity_lr": SERVER_DIVERSITY_LR,
         "server_diversity_grad_clip": SERVER_DIVERSITY_GRAD_CLIP,
+        "subspace_overlap_threshold_cap": SUBSPACE_OVERLAP_THRESHOLD_CAP,
     },
 }
 
@@ -166,10 +168,52 @@ def validate_method_config(cfg: Mapping[str, Any]) -> None:
             "method_config.server_diversity_grad_clip",
         )
 
+    threshold_cap = subspace._validate_finite_positive(
+        _method_cfg_get(
+            cfg,
+            "subspace_overlap_threshold_cap",
+            SUBSPACE_OVERLAP_THRESHOLD_CAP,
+        ),
+        "method_config.subspace_overlap_threshold_cap",
+    )
+    if threshold_cap >= 1.0:
+        raise ValueError(
+            "method_config.subspace_overlap_threshold_cap 必须小于 1。"
+        )
+
 
 def build_rfedags_server_diversity_model(cfg: Any) -> nn.Module:
-    """Build the shared low-rank Stiefel Switch-ViT parameterization."""
-    return subspace.build_rfedags_subspace_model(cfg)
+    """Build Stiefel parameters and calibrate a strictly sub-unit overlap threshold."""
+    model = subspace.build_rfedags_subspace_model(cfg)
+    initial_overlaps = getattr(
+        model,
+        "_rfedags_subspace_initial_overlaps",
+        None,
+    )
+    if not isinstance(initial_overlaps, Mapping) or not initial_overlaps:
+        raise ValueError("模型缺少初始化时计算的逐层专家子空间重叠度。")
+
+    tau_margin = float(_method_cfg_get(cfg, "tau_margin", TAU_MARGIN))
+    threshold_cap = float(
+        _method_cfg_get(
+            cfg,
+            "subspace_overlap_threshold_cap",
+            SUBSPACE_OVERLAP_THRESHOLD_CAP,
+        )
+    )
+    thresholds = {
+        str(layer_name): min(float(initial_mean) + tau_margin, threshold_cap)
+        for layer_name, initial_mean in initial_overlaps.items()
+    }
+    if any(
+        not math.isfinite(value) or not 0.0 <= value < 1.0
+        for value in thresholds.values()
+    ):
+        raise ValueError("服务器端子空间重叠阈值必须是 [0, 1) 内的有限数值。")
+
+    model._rfedags_subspace_thresholds = thresholds
+    model._rfedags_server_diversity_threshold_cap = threshold_cap
+    return model
 
 
 class RFedAGSServerDiversityClientStrategy(
@@ -306,6 +350,13 @@ class RFedAGSServerDiversityExpertAggregator(
             if configured_grad_clip is None
             else float(configured_grad_clip)
         )
+        self.subspace_overlap_threshold_cap = float(
+            _method_cfg_get(
+                cfg,
+                "subspace_overlap_threshold_cap",
+                SUBSPACE_OVERLAP_THRESHOLD_CAP,
+            )
+        )
         self._last_server_correction_diagnostics: Dict[str, Any] = {}
 
     def aggregate(
@@ -415,31 +466,57 @@ class RFedAGSServerDiversityExpertAggregator(
         clipped_gradient_norm = gradient_norm * clip_scale
 
         loss_before_value = float(loss_before.detach().item())
-        applied = loss_before_value > 0.0 and clipped_gradient_norm > 0.0
         parameter_step_norm = 0.0
+        applied = False
+        skip_reason: Optional[str] = None
 
-        if applied:
+        if loss_before_value <= 0.0:
+            skip_reason = "no_active_overlap_pairs"
+        elif clipped_gradient_norm <= 0.0:
+            skip_reason = "zero_riemannian_gradient"
+        else:
+            candidate_parameters = []
             with torch.no_grad():
                 for parameter, gradient in zip(
                     p_parameters,
                     riemannian_gradients,
                 ):
-                    parameter.copy_(
-                        subspace.qr_retraction(
-                            parameter.detach()
-                            - self.diversity_lr * clip_scale * gradient
+                    candidate = subspace.qr_retraction(
+                        parameter.detach()
+                        - self.diversity_lr * clip_scale * gradient
+                    )
+                    if not subspace._tensor_is_finite(candidate):
+                        raise ValueError(
+                            "服务器端差异性校正生成了 NaN 或 Inf 参数。"
+                        )
+                    candidate_parameters.append(candidate)
+
+                parameter_step_norm = math.sqrt(
+                    sum(
+                        float(
+                            torch.sum(
+                                (candidate - before).to(torch.float64).square()
+                            ).item()
+                        )
+                        for candidate, before in zip(
+                            candidate_parameters,
+                            before_points,
                         )
                     )
-            parameter_step_norm = math.sqrt(
-                sum(
-                    float(
-                        torch.sum(
-                            (parameter.detach() - before).to(torch.float64).square()
-                        ).item()
-                    )
-                    for parameter, before in zip(p_parameters, before_points)
                 )
-            )
+
+                if not math.isfinite(parameter_step_norm):
+                    raise ValueError("服务器端参数更新范数包含 NaN 或 Inf。")
+
+                applied = parameter_step_norm > 0.0
+                if applied:
+                    for parameter, candidate in zip(
+                        p_parameters,
+                        candidate_parameters,
+                    ):
+                        parameter.copy_(candidate)
+                else:
+                    skip_reason = "zero_effective_parameter_step"
 
         with torch.no_grad():
             loss_after, overlap_after = subspace.compute_subspace_diversity_loss(
@@ -454,6 +531,7 @@ class RFedAGSServerDiversityExpertAggregator(
         pairwise_overlap_after = _collect_pairwise_overlap_metrics(model)
         self._last_server_correction_diagnostics = {
             "server_diversity_applied": bool(applied),
+            "server_diversity_skip_reason": skip_reason,
             "server_diversity_loss_before": loss_before_value,
             "server_diversity_loss_after": loss_after_value,
             "server_diversity_loss_reduction": (
@@ -478,6 +556,7 @@ class RFedAGSServerDiversityExpertAggregator(
             "server_diversity_parameter_step_norm": parameter_step_norm,
             "server_diversity_lr": self.diversity_lr,
             "server_diversity_grad_clip": self.diversity_grad_clip,
+            "server_diversity_threshold_cap": self.subspace_overlap_threshold_cap,
         }
 
     def build_post_aggregate_diagnostics(
