@@ -34,6 +34,7 @@ PAYLOAD_VERSION = 1
 SUBSPACE_RANK = 128
 LAMBDA_DIV = 1e-3
 TAU_MARGIN = 0.05
+SUBSPACE_OVERLAP_THRESHOLD_CAP = 0.95
 LOCAL_MANIFOLD_LR = None  # None -> use base.py's optimizer.lr.
 SERVER_MANIFOLD_LR = 1.0
 
@@ -42,6 +43,7 @@ METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
         "subspace_rank": SUBSPACE_RANK,
         "lambda_div": LAMBDA_DIV,
         "tau_margin": TAU_MARGIN,
+        "subspace_overlap_threshold_cap": SUBSPACE_OVERLAP_THRESHOLD_CAP,
         "local_manifold_lr": LOCAL_MANIFOLD_LR,
         "server_manifold_lr": SERVER_MANIFOLD_LR,
     },
@@ -151,6 +153,19 @@ def validate_method_config(cfg: Mapping[str, Any]) -> None:
     if tau_margin >= 1.0:
         raise ValueError("method_config.tau_margin 必须小于 1。")
 
+    threshold_cap = _validate_finite_positive(
+        _method_cfg_get(
+            cfg,
+            "subspace_overlap_threshold_cap",
+            SUBSPACE_OVERLAP_THRESHOLD_CAP,
+        ),
+        "method_config.subspace_overlap_threshold_cap",
+    )
+    if threshold_cap >= 1.0:
+        raise ValueError(
+            "method_config.subspace_overlap_threshold_cap 必须小于 1。"
+        )
+
     local_lr = _method_cfg_get(
         cfg,
         "local_manifold_lr",
@@ -182,6 +197,58 @@ def _tensor_is_finite(value: torch.Tensor) -> bool:
     if value.is_floating_point() or value.is_complex():
         return bool(torch.isfinite(value).all().item())
     return True
+
+
+def _clip_product_manifold_gradients(
+    riemannian_gradients: Mapping[str, torch.Tensor],
+    euclidean_parameters: Sequence[nn.Parameter],
+    max_norm: Optional[float],
+) -> float:
+    """Clip the combined Euclidean/Stiefel gradient in the product metric.
+
+    Stiefel gradients must already be projected onto their tangent spaces.
+    The common clipping factor is applied to those Riemannian gradients and
+    to the ordinary gradients consumed by the Euclidean optimizer.
+    """
+    if max_norm is not None:
+        max_norm = _validate_finite_positive(max_norm, "grad_clip")
+
+    gradients = list(riemannian_gradients.values())
+    gradients.extend(
+        parameter.grad
+        for parameter in euclidean_parameters
+        if parameter.grad is not None
+    )
+    if not gradients:
+        return 0.0
+
+    device = gradients[0].device
+    squared_norm = torch.zeros((), device=device, dtype=torch.float64)
+    for gradient in gradients:
+        if gradient.is_sparse:
+            raise NotImplementedError(
+                "RFedAGS 子空间策略暂不支持稀疏专家梯度。"
+            )
+        if gradient.device != device:
+            raise ValueError("产品流形梯度裁剪要求所有专家梯度位于同一设备。")
+        if not _tensor_is_finite(gradient):
+            raise ValueError("产品流形专家梯度包含 NaN 或 Inf。")
+        squared_norm.add_(
+            gradient.detach().abs().to(dtype=torch.float64).square().sum()
+        )
+
+    total_norm = torch.sqrt(squared_norm)
+    total_norm_value = float(total_norm.item())
+    if max_norm is not None and total_norm_value > max_norm:
+        clip_coefficient = max_norm / (total_norm_value + 1e-6)
+        with torch.no_grad():
+            for gradient in riemannian_gradients.values():
+                gradient.mul_(clip_coefficient)
+            for parameter in euclidean_parameters:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(clip_coefficient)
+
+    return total_norm_value
 
 
 def stiefel_tangent_projection(
@@ -458,6 +525,18 @@ def build_rfedags_subspace_model(cfg: Any) -> nn.Module:
     initial_overlaps: Dict[str, float] = {}
     parameter_map = dict(model.named_parameters())
     tau_margin = float(_method_cfg_get(cfg, "tau_margin", TAU_MARGIN))
+    threshold_cap = _validate_finite_positive(
+        _method_cfg_get(
+            cfg,
+            "subspace_overlap_threshold_cap",
+            SUBSPACE_OVERLAP_THRESHOLD_CAP,
+        ),
+        "method_config.subspace_overlap_threshold_cap",
+    )
+    if threshold_cap >= 1.0:
+        raise ValueError(
+            "method_config.subspace_overlap_threshold_cap 必须小于 1。"
+        )
 
     for layer_name, layer_records in records.items():
         expert_ids = [int(item["expert_id"]) for item in layer_records]
@@ -480,13 +559,14 @@ def build_rfedags_subspace_model(cfg: Any) -> nn.Module:
             raise ValueError(f"MoE 层 {layer_name} 不存在专家配对。")
         initial_mean = sum(pair_overlaps) / len(pair_overlaps)
         initial_overlaps[layer_name] = initial_mean
-        thresholds[layer_name] = min(1.0, initial_mean + tau_margin)
+        thresholds[layer_name] = min(initial_mean + tau_margin, threshold_cap)
 
     model._rfedags_subspace_layer_records = records
     model._rfedags_subspace_thresholds = thresholds
     model._rfedags_subspace_initial_overlaps = initial_overlaps
     model._rfedags_subspace_reconstruction_errors = reconstruction_errors
     model._rfedags_subspace_rank = rank
+    model._rfedags_subspace_threshold_cap = threshold_cap
     return model
 
 
@@ -535,7 +615,7 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
         self._p_names: list[str] = []
         self._expert_parameter_names: list[str] = []
         self._euclidean_expert_names: list[str] = []
-        self._expert_parameters: list[nn.Parameter] = []
+        self._euclidean_expert_parameters: list[nn.Parameter] = []
         self._expert_buffer_names: list[str] = []
         self._global_points: Dict[str, torch.Tensor] = {}
         self._gradient_stream: Dict[str, torch.Tensor] = {}
@@ -591,9 +671,9 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
         if not self._euclidean_expert_names:
             raise ValueError("没有可由普通优化器更新的欧氏专家参数。")
 
-        self._expert_parameters = [
+        self._euclidean_expert_parameters = [
             self._parameter_map[name]
-            for name in self._expert_parameter_names
+            for name in self._euclidean_expert_names
         ]
         self._expert_buffer_names = sorted(
             set(context.optimization_groups.expert_state_names)
@@ -647,13 +727,14 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
             (self.lambda_div * diversity_loss).backward()
 
         grad_clip = context.train_context.non_expert_grad_clip
-        if grad_clip is not None and float(grad_clip) > 0.0:
-            torch.nn.utils.clip_grad_norm_(
-                self._expert_parameters,
-                max_norm=float(grad_clip),
-            )
+        max_grad_norm = (
+            float(grad_clip)
+            if grad_clip is not None and float(grad_clip) > 0.0
+            else None
+        )
 
         with torch.no_grad():
+            riemannian_gradients: Dict[str, torch.Tensor] = {}
             for name in self._p_names:
                 parameter = self._parameter_map[name]
                 gradient = parameter.grad
@@ -670,7 +751,24 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
                     parameter.detach(),
                     gradient.detach(),
                 )
-                scaled_direction = self.local_lr * riemannian_gradient
+                if not _tensor_is_finite(riemannian_gradient):
+                    raise ValueError(
+                        f"Stiefel 参数 {name} 的黎曼梯度包含 NaN 或 Inf。"
+                    )
+                riemannian_gradients[name] = riemannian_gradient
+
+            # Clip in the product metric: tangent-projected P gradients plus
+            # ordinary Euclidean gradients. Normal components of ambient P
+            # gradients must not influence the clipping coefficient.
+            _clip_product_manifold_gradients(
+                riemannian_gradients=riemannian_gradients,
+                euclidean_parameters=self._euclidean_expert_parameters,
+                max_norm=max_grad_norm,
+            )
+
+            for name in self._p_names:
+                parameter = self._parameter_map[name]
+                scaled_direction = self.local_lr * riemannian_gradients[name]
 
                 transported = stiefel_tangent_projection(
                     self._global_points[name],
