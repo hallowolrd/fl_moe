@@ -340,6 +340,29 @@ def _get_layer_records(model: nn.Module) -> Dict[str, list[Dict[str, Any]]]:
     }
 
 
+def align_stiefel_factor_gauge(
+    local_a: torch.Tensor,
+    local_p: torch.Tensor,
+    reference_p: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Procrustes-align (A, P) to reference_p without changing A P^T."""
+    if (
+        local_a.ndim != 2
+        or local_p.ndim != 2
+        or reference_p.shape != local_p.shape
+        or local_a.shape[1] != local_p.shape[1]
+    ):
+        raise ValueError(
+            "因子对齐要求 A、P、reference_P 维度兼容；"
+            f"A={tuple(local_a.shape)}, P={tuple(local_p.shape)}, "
+            f"reference_P={tuple(reference_p.shape)}"
+        )
+    cross = local_p.transpose(0, 1) @ reference_p
+    u, _, vh = torch.linalg.svd(cross, full_matrices=False)
+    rotation = u @ vh
+    return local_a @ rotation, local_p @ rotation
+
+
 def _pairwise_subspace_overlap(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -695,11 +718,13 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
                     local_a = self._parameter_map[a_name]
                     global_p = self._global_points[p_name]
 
-                    cross = local_p.transpose(0, 1) @ global_p
-                    u, _, vh = torch.linalg.svd(cross, full_matrices=False)
-                    rotation = u @ vh
-                    local_p.copy_(local_p @ rotation)
-                    local_a.copy_(local_a @ rotation)
+                    aligned_a, aligned_p = align_stiefel_factor_gauge(
+                        local_a=local_a,
+                        local_p=local_p,
+                        reference_p=global_p,
+                    )
+                    local_p.copy_(aligned_p)
+                    local_a.copy_(aligned_a)
 
         state_dict = context.model.state_dict()
         expert_buffers = {
