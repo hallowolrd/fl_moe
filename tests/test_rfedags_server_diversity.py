@@ -418,6 +418,111 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                     )
                 )
 
+
+    def test_server_aligns_client_factors_to_final_global_gauge(self) -> None:
+        model = algorithm.build_rfedags_server_diversity_model(self.cfg)
+        # Disable the optional diversity step to isolate final-gauge alignment.
+        model._rfedags_server_diversity_thresholds = {
+            name: 1.0
+            for name in model._rfedags_server_diversity_layer_records
+        }
+        state = base.clone_state_dict(model.state_dict())
+        param_groups, optimization_groups, aggregator = self._build_server_aggregator(
+            self.cfg,
+            model,
+        )
+        factor_records = [
+            item
+            for layer_records in model._rfedags_server_diversity_layer_records.values()
+            for item in layer_records
+        ]
+        p_names = {item["p_name"] for item in factor_records}
+        expert_buffer_names = (
+            set(optimization_groups.expert_state_names)
+            - set(dict(model.named_parameters()))
+        )
+
+        client_updates = []
+        for client_id in range(2):
+            model_delta = {
+                name: torch.zeros_like(value)
+                for name, value in state.items()
+                if value.is_floating_point() or value.is_complex()
+            }
+            for item in factor_records:
+                rank = state[item["p_name"]].shape[1]
+                rotation = (
+                    torch.eye(rank)
+                    if client_id == 0
+                    else torch.linalg.qr(
+                        torch.randn(rank, rank),
+                        mode="reduced",
+                    ).Q
+                )
+                local_p = state[item["p_name"]] @ rotation
+                local_a = state[item["a_name"]] @ rotation
+                model_delta[item["p_name"]] = local_p - state[item["p_name"]]
+                model_delta[item["a_name"]] = local_a - state[item["a_name"]]
+            client_updates.append(
+                base.ClientUpdate(
+                    client_id=client_id,
+                    round_id=1,
+                    num_samples=10,
+                    model_delta=model_delta,
+                    metrics={"num_batches": 4},
+                    algorithm_payload={
+                        algorithm.PAYLOAD_KEY: {
+                            "version": algorithm.PAYLOAD_VERSION,
+                            "local_steps": 4,
+                            "gradient_stream": {
+                                name: torch.zeros_like(state[name])
+                                for name in p_names
+                            },
+                            "expert_buffers": {
+                                name: state[name].clone()
+                                for name in expert_buffer_names
+                            },
+                        }
+                    },
+                )
+            )
+
+        result = aggregator.aggregate(
+            global_state=state,
+            client_updates=client_updates,
+            param_names=param_groups.expert,
+            base_state=state,
+            strict=True,
+        )
+        model.load_state_dict(result.new_state_dict, strict=True)
+        aggregator.after_aggregate(model)
+
+        parameter_map = dict(model.named_parameters())
+        for item in factor_records:
+            self.assertTrue(
+                torch.allclose(
+                    parameter_map[item["a_name"]],
+                    state[item["a_name"]],
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+            )
+            self.assertTrue(
+                torch.allclose(
+                    parameter_map[item["p_name"]],
+                    state[item["p_name"]],
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+            )
+
+        diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+        self.assertTrue(diagnostics["factor_gauge_alignment_applied"])
+        self.assertEqual(
+            diagnostics["num_factor_gauge_aligned_parameters"],
+            len(factor_records),
+        )
+
     def test_server_correction_runs_after_rfedags_aggregation(self) -> None:
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
         records = model._rfedags_server_diversity_layer_records
@@ -557,20 +662,25 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                 for gradient in expected_riemannian_gradients
             )
         )
-        expected_parameters = {
-            name: algorithm.qr_retraction(
-                parameter.detach()
-                - aggregator.diversity_lr * gradient
-            )
-            for name, parameter, gradient in zip(
-                ordered_p_names,
-                p_parameters,
-                expected_riemannian_gradients,
-            )
+        expected_base_parameters = {
+            name: parameter.detach().clone()
+            for name, parameter in zip(ordered_p_names, p_parameters)
         }
 
         aggregator.after_aggregate(model)
-        diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+        post_diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+        self.assertTrue(set(result.diagnostics).isdisjoint(post_diagnostics))
+        diagnostics = {**result.diagnostics, **post_diagnostics}
+        expected_parameters = {
+            name: algorithm.qr_retraction(
+                expected_base_parameters[name]
+                - diagnostics["server_diversity_effective_lr"] * gradient
+            )
+            for name, gradient in zip(
+                ordered_p_names,
+                expected_riemannian_gradients,
+            )
+        }
 
         actual_parameter_map = dict(model.named_parameters())
         for name, expected_parameter in expected_parameters.items():
@@ -637,6 +747,35 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                         atol=1e-5,
                     )
                 )
+
+
+    def test_server_diversity_line_search_never_increases_loss(self) -> None:
+        cfg = self._build_cfg(server_diversity_lr=1000.0)
+        model = algorithm.build_rfedags_server_diversity_model(cfg)
+        self._set_overlapping_subspaces(model, angle=0.35)
+        _, _, aggregator = self._build_server_aggregator(cfg, model)
+
+        aggregator.after_aggregate(model)
+        diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+
+        self.assertLessEqual(
+            diagnostics["server_diversity_loss_after"],
+            diagnostics["server_diversity_loss_before"] + 1e-12,
+        )
+        if diagnostics["server_diversity_applied"]:
+            self.assertGreater(
+                diagnostics["server_diversity_effective_lr"],
+                0.0,
+            )
+            self.assertLessEqual(
+                diagnostics["server_diversity_backtracking_steps"],
+                algorithm.MAX_SERVER_DIVERSITY_BACKTRACKING_STEPS,
+            )
+        else:
+            self.assertEqual(
+                diagnostics["server_diversity_effective_lr"],
+                0.0,
+            )
 
 
 if __name__ == "__main__":
