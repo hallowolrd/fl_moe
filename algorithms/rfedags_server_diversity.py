@@ -100,11 +100,9 @@ def validate_method_config(cfg: Mapping[str, Any]) -> None:
         raise ValueError("frac 必须为数值 1.0。")
     try:
         frac = float(raw_frac)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"frac 必须为数值 1.0，当前值：{raw_frac!r}") from exc
-    if not math.isfinite(frac) or not math.isclose(
-        frac, 1.0, rel_tol=0.0, abs_tol=1e-12
-    ):
+    if not math.isfinite(frac) or frac != 1.0:
         raise ValueError(
             f"{ALGORITHM_NAME} 首版要求全客户端参与，必须设置 frac=1.0；"
             f"当前值：{frac}"
@@ -218,6 +216,58 @@ def _tensor_is_finite(value: torch.Tensor) -> bool:
     if value.is_floating_point() or value.is_complex():
         return bool(torch.isfinite(value).all().item())
     return True
+
+
+def _clip_product_manifold_gradients(
+    riemannian_gradients: Mapping[str, torch.Tensor],
+    euclidean_parameters: Sequence[nn.Parameter],
+    max_norm: Optional[float],
+) -> float:
+    """Clip Stiefel tangent and Euclidean expert gradients in one product metric.
+
+    Stiefel gradients must already be projected onto their tangent spaces.
+    Their ambient normal components therefore cannot affect the common
+    clipping coefficient.
+    """
+    if max_norm is not None:
+        max_norm = _validate_finite_positive(max_norm, "grad_clip")
+
+    gradients = list(riemannian_gradients.values())
+    gradients.extend(
+        parameter.grad
+        for parameter in euclidean_parameters
+        if parameter.grad is not None
+    )
+    if not gradients:
+        return 0.0
+
+    device = gradients[0].device
+    squared_norm = torch.zeros((), device=device, dtype=torch.float64)
+    for gradient in gradients:
+        if gradient.is_sparse:
+            raise NotImplementedError(
+                "RFedAGS 服务器端多样性策略暂不支持稀疏专家梯度。"
+            )
+        if gradient.device != device:
+            raise ValueError("产品流形梯度裁剪要求所有专家梯度位于同一设备。")
+        if not _tensor_is_finite(gradient):
+            raise ValueError("产品流形专家梯度包含 NaN 或 Inf。")
+        squared_norm.add_(
+            gradient.detach().abs().to(dtype=torch.float64).square().sum()
+        )
+
+    total_norm = torch.sqrt(squared_norm)
+    total_norm_value = float(total_norm.item())
+    if max_norm is not None and total_norm_value > max_norm:
+        clip_coefficient = max_norm / (total_norm_value + 1e-6)
+        with torch.no_grad():
+            for gradient in riemannian_gradients.values():
+                gradient.mul_(clip_coefficient)
+            for parameter in euclidean_parameters:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(clip_coefficient)
+
+    return total_norm_value
 
 
 def stiefel_tangent_projection(
@@ -569,8 +619,8 @@ class RFedAGSServerDiversityClientStrategy(base.ExpertClientTrainingStrategy):
         self._records: Dict[str, list[Dict[str, Any]]] = {}
         self._p_names: list[str] = []
         self._expert_parameter_names: list[str] = []
-        self._expert_parameters: list[nn.Parameter] = []
         self._euclidean_expert_names: list[str] = []
+        self._euclidean_expert_parameters: list[nn.Parameter] = []
         self._expert_buffer_names: list[str] = []
         self._global_points: Dict[str, torch.Tensor] = {}
         self._gradient_stream: Dict[str, torch.Tensor] = {}
@@ -605,8 +655,8 @@ class RFedAGSServerDiversityClientStrategy(base.ExpertClientTrainingStrategy):
         ]
         if not self._euclidean_expert_names:
             raise ValueError("没有可由普通优化器更新的欧氏专家参数。")
-        self._expert_parameters = [
-            self._parameter_map[name] for name in self._expert_parameter_names
+        self._euclidean_expert_parameters = [
+            self._parameter_map[name] for name in self._euclidean_expert_names
         ]
         self._expert_buffer_names = sorted(
             set(context.optimization_groups.expert_state_names) - set(self._parameter_map)
@@ -644,12 +694,14 @@ class RFedAGSServerDiversityClientStrategy(base.ExpertClientTrainingStrategy):
         # base.py has already backpropagated task and Switch auxiliary losses.
         # Scheme two deliberately adds no client-side diversity loss.
         grad_clip = context.train_context.non_expert_grad_clip
-        if grad_clip is not None and float(grad_clip) > 0.0:
-            torch.nn.utils.clip_grad_norm_(
-                self._expert_parameters, max_norm=float(grad_clip)
-            )
+        max_grad_norm = (
+            float(grad_clip)
+            if grad_clip is not None and float(grad_clip) > 0.0
+            else None
+        )
 
         with torch.no_grad():
+            riemannian_gradients: Dict[str, torch.Tensor] = {}
             for name in self._p_names:
                 parameter = self._parameter_map[name]
                 gradient = parameter.grad
@@ -664,7 +716,17 @@ class RFedAGSServerDiversityClientStrategy(base.ExpertClientTrainingStrategy):
                 )
                 if not _tensor_is_finite(riemannian_gradient):
                     raise ValueError(f"Stiefel 参数 {name} 的黎曼梯度包含 NaN 或 Inf。")
-                scaled_direction = self.local_lr * riemannian_gradient
+                riemannian_gradients[name] = riemannian_gradient
+
+            _clip_product_manifold_gradients(
+                riemannian_gradients=riemannian_gradients,
+                euclidean_parameters=self._euclidean_expert_parameters,
+                max_norm=max_grad_norm,
+            )
+
+            for name in self._p_names:
+                parameter = self._parameter_map[name]
+                scaled_direction = self.local_lr * riemannian_gradients[name]
                 transported = stiefel_tangent_projection(
                     self._global_points[name], scaled_direction
                 )
