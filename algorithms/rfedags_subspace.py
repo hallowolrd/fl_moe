@@ -436,6 +436,145 @@ def align_stiefel_factor_gauge(
     return local_a @ rotation, local_p @ rotation
 
 
+def _apply_factor_gauge_average(
+    model: nn.Module,
+    records: Mapping[str, Sequence[Mapping[str, Any]]],
+    pending_updates: Mapping[
+        str,
+        Sequence[tuple[float, torch.Tensor, torch.Tensor]],
+    ],
+) -> int:
+    """Average client A factors after aligning them to the final global P gauge."""
+    if not pending_updates:
+        return 0
+
+    parameter_map = dict(model.named_parameters())
+    expected_a_names = {
+        str(item["a_name"])
+        for layer_records in records.values()
+        for item in layer_records
+    }
+    if set(pending_updates) != expected_a_names:
+        raise ValueError(
+            "待对齐的 A 因子集合与 Stiefel P 因子记录不一致；"
+            f"expected={sorted(expected_a_names)}, "
+            f"actual={sorted(pending_updates)}"
+        )
+
+    aligned_count = 0
+    with torch.no_grad():
+        for layer_records in records.values():
+            for item in layer_records:
+                p_name = str(item["p_name"])
+                a_name = str(item["a_name"])
+                if p_name not in parameter_map or a_name not in parameter_map:
+                    raise KeyError(
+                        f"全局模型缺少低秩因子参数：P={p_name}, A={a_name}"
+                    )
+                reference_p = parameter_map[p_name].detach()
+                reference_a = parameter_map[a_name]
+                accumulator = torch.zeros(
+                    reference_a.shape,
+                    device=reference_a.device,
+                    dtype=_accumulation_dtype(reference_a),
+                )
+                total_weight = 0.0
+                for weight, local_a, local_p in pending_updates[a_name]:
+                    if not math.isfinite(float(weight)) or float(weight) < 0.0:
+                        raise ValueError(f"{a_name} 的客户端聚合权重无效：{weight!r}")
+                    aligned_a, aligned_p = align_stiefel_factor_gauge(
+                        local_a=local_a.to(
+                            device=reference_a.device,
+                            dtype=reference_a.dtype,
+                        ),
+                        local_p=local_p.to(
+                            device=reference_p.device,
+                            dtype=reference_p.dtype,
+                        ),
+                        reference_p=reference_p,
+                    )
+                    if not _tensor_is_finite(aligned_a) or not _tensor_is_finite(aligned_p):
+                        raise ValueError(f"{a_name}/{p_name} Gauge 对齐结果包含 NaN 或 Inf。")
+                    accumulator.add_(
+                        aligned_a.to(dtype=accumulator.dtype),
+                        alpha=float(weight),
+                    )
+                    total_weight += float(weight)
+                if not math.isclose(total_weight, 1.0, rel_tol=1e-6, abs_tol=1e-8):
+                    raise ValueError(
+                        f"{a_name} 的客户端聚合权重之和必须为 1，当前为 {total_weight}"
+                    )
+                averaged_a = accumulator.to(dtype=reference_a.dtype)
+                if not _tensor_is_finite(averaged_a):
+                    raise ValueError(f"{a_name} 的 Gauge 对齐聚合结果包含 NaN 或 Inf。")
+                reference_a.copy_(averaged_a)
+                aligned_count += 1
+    return aligned_count
+
+
+def _collect_pending_factor_updates(
+    records: Mapping[str, Sequence[Mapping[str, Any]]],
+    client_updates: Sequence[base.ClientUpdate],
+    weights: Mapping[int, float],
+    global_state: Mapping[str, torch.Tensor],
+) -> Dict[str, list[tuple[float, torch.Tensor, torch.Tensor]]]:
+    """Reconstruct raw local (A, P) factors for final server-side alignment."""
+    pending: Dict[str, list[tuple[float, torch.Tensor, torch.Tensor]]] = {
+        str(item["a_name"]): []
+        for layer_records in records.values()
+        for item in layer_records
+    }
+    for update in client_updates:
+        client_id = int(update.client_id)
+        if client_id not in weights:
+            raise KeyError(f"Gauge 对齐权重缺少客户端 {client_id}。")
+        for layer_records in records.values():
+            for item in layer_records:
+                a_name = str(item["a_name"])
+                p_name = str(item["p_name"])
+                local_a = global_state[a_name] + update.model_delta[a_name].to(
+                    device=global_state[a_name].device,
+                    dtype=global_state[a_name].dtype,
+                )
+                local_p = global_state[p_name] + update.model_delta[p_name].to(
+                    device=global_state[p_name].device,
+                    dtype=global_state[p_name].dtype,
+                )
+                pending[a_name].append(
+                    (
+                        float(weights[client_id]),
+                        local_a.detach().clone(),
+                        local_p.detach().clone(),
+                    )
+                )
+    return pending
+
+
+def _collect_pairwise_overlap_metrics(
+    model: nn.Module,
+) -> Dict[str, Dict[str, float]]:
+    """Return each within-layer expert-pair overlap for final-model diagnostics."""
+    parameter_map = dict(model.named_parameters())
+    pairwise: Dict[str, Dict[str, float]] = {}
+    for layer_name, layer_records in _get_layer_records(model).items():
+        layer_values: Dict[str, float] = {}
+        for left_index in range(len(layer_records)):
+            for right_index in range(left_index + 1, len(layer_records)):
+                left_item = layer_records[left_index]
+                right_item = layer_records[right_index]
+                overlap = _pairwise_subspace_overlap(
+                    parameter_map[left_item["p_name"]].detach(),
+                    parameter_map[right_item["p_name"]].detach(),
+                )
+                pair_name = (
+                    f"expert_{int(left_item['expert_id'])}_"
+                    f"expert_{int(right_item['expert_id'])}"
+                )
+                layer_values[pair_name] = float(overlap.item())
+        pairwise[layer_name] = layer_values
+    return pairwise
+
+
 def _pairwise_subspace_overlap(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -818,25 +957,8 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
                 f"expected={self._expected_local_steps}, actual={self._local_steps}"
             )
 
-        # Align the local (A, P) gauge to the round-start global P before
-        # FedAvg-aggregating A. The transformation preserves A P^T.
-        with torch.no_grad():
-            for layer_records in self._records.values():
-                for item in layer_records:
-                    p_name = item["p_name"]
-                    a_name = item["a_name"]
-                    local_p = self._parameter_map[p_name]
-                    local_a = self._parameter_map[a_name]
-                    global_p = self._global_points[p_name]
-
-                    aligned_a, aligned_p = align_stiefel_factor_gauge(
-                        local_a=local_a,
-                        local_p=local_p,
-                        reference_p=global_p,
-                    )
-                    local_p.copy_(aligned_p)
-                    local_a.copy_(aligned_a)
-
+        # Keep raw local (A, P) factors in model_delta. The server can only
+        # align A correctly after the RFedAGS update produces final global P.
         state_dict = context.model.state_dict()
         expert_buffers = {
             name: state_dict[name].detach().clone()
@@ -883,6 +1005,10 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
         self.server_lr = float(
             _method_cfg_get(cfg, "server_manifold_lr", SERVER_MANIFOLD_LR)
         )
+        self._pending_factor_updates: Dict[
+            str, list[tuple[float, torch.Tensor, torch.Tensor]]
+        ] = {}
+        self._last_factor_gauge_diagnostics: Dict[str, Any] = {}
 
     def compute_weights(
         self,
@@ -958,6 +1084,14 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
             for item in layer_records
         }
         euclidean_parameter_names = parameter_state_names - p_names
+        factor_a_names = {
+            str(item["a_name"])
+            for layer_records in records.values()
+            for item in layer_records
+        }
+        if not factor_a_names.issubset(euclidean_parameter_names):
+            raise ValueError("低秩 A 因子必须全部属于欧氏 expert 参数组。")
+        fedavg_euclidean_parameter_names = euclidean_parameter_names - factor_a_names
         expert_buffer_names = expert_state_names - parameter_state_names
 
         if not p_names:
@@ -1056,6 +1190,21 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
                         f"客户端 {update.client_id} 的 expert buffer {name} 包含 NaN 或 Inf。"
                     )
 
+            for name in p_names:
+                value = update.model_delta.get(name)
+                if not torch.is_tensor(value):
+                    raise ValueError(
+                        f"客户端 {update.client_id} 的 model_delta 缺少 Stiefel 参数 {name}。"
+                    )
+                if tuple(value.shape) != tuple(global_state[name].shape):
+                    raise ValueError(
+                        f"客户端 {update.client_id} 的 {name} delta shape 不匹配。"
+                    )
+                if not _tensor_is_finite(value):
+                    raise ValueError(
+                        f"客户端 {update.client_id} 的 {name} delta 包含 NaN 或 Inf。"
+                    )
+
             for name in euclidean_parameter_names:
                 value = update.model_delta.get(name)
                 if not torch.is_tensor(value):
@@ -1107,9 +1256,9 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
                 f"当前各客户端步数：{local_steps_by_client}"
             )
 
-        # Euclidean expert parameters use the same client-uniform delta rule
-        # as FedAvg. P is deliberately excluded from this path.
-        for name in sorted(euclidean_parameter_names):
+        # Ordinary Euclidean expert parameters use client-uniform FedAvg.
+        # A factors are averaged only after the final global P is available.
+        for name in sorted(fedavg_euclidean_parameter_names):
             reference = global_state[name]
             accumulator = torch.zeros(
                 reference.shape,
@@ -1193,12 +1342,21 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
         )
         base.check_finite_state_dict(new_state_dict)
 
-        # model_delta diagnostics describe only the Euclidean expert path;
-        # P is aggregated from gradient_stream, not from its endpoint delta.
+        # Retain raw local factors until after_aggregate(), when the final
+        # global P (including algorithm-specific post-processing) is known.
+        self._pending_factor_updates = _collect_pending_factor_updates(
+            records=records,
+            client_updates=client_updates,
+            weights=weights,
+            global_state=global_state,
+        )
+
+        # Diagnostics cover only parameters averaged directly in Euclidean
+        # coordinates. A is aggregated through the aligned factor path.
         diagnostics = self.build_diagnostics(
             client_updates=client_updates,
             weights=weights,
-            param_names=sorted(euclidean_parameter_names),
+            param_names=sorted(fedavg_euclidean_parameter_names),
         )
         diagnostics.update(
             {
@@ -1211,6 +1369,8 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
                 "server_manifold_lr": self.server_lr,
                 "num_stiefel_parameters": len(p_names),
                 "num_euclidean_expert_parameters": len(euclidean_parameter_names),
+                "num_fedavg_euclidean_expert_parameters": len(fedavg_euclidean_parameter_names),
+                "num_gauge_aligned_factor_parameters": len(factor_a_names),
                 "mean_diversity_loss": sum(
                     float(weights[client_id]) * value
                     for client_id, value in diversity_loss_by_client.items()
@@ -1248,6 +1408,19 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
             weights=weights,
             diagnostics=diagnostics,
         )
+
+    def after_aggregate(self, model: nn.Module) -> None:
+        """Align and average client A factors to the final global P gauge."""
+        aligned_count = _apply_factor_gauge_average(
+            model=model,
+            records=_get_layer_records(model),
+            pending_updates=self._pending_factor_updates,
+        )
+        self._pending_factor_updates = {}
+        self._last_factor_gauge_diagnostics = {
+            "factor_gauge_alignment_applied": bool(aligned_count),
+            "num_factor_gauge_aligned_parameters": int(aligned_count),
+        }
 
     def build_post_aggregate_diagnostics(
         self,
@@ -1296,6 +1469,15 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
             "subspace_thresholds_by_layer": dict(
                 getattr(model, "_rfedags_subspace_thresholds", {})
             ),
+            "global_subspace_overlap_by_layer": {
+                layer_name: (
+                    sum(pair_values.values()) / len(pair_values)
+                    if pair_values else 0.0
+                )
+                for layer_name, pair_values in _collect_pairwise_overlap_metrics(model).items()
+            },
+            "global_subspace_pair_overlap_by_layer": _collect_pairwise_overlap_metrics(model),
+            **self._last_factor_gauge_diagnostics,
         }
 
 
