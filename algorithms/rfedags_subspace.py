@@ -95,10 +95,16 @@ def validate_method_config(cfg: Mapping[str, Any]) -> None:
     local_steps = _cfg_get(cfg, "local_steps", None)
     _validate_positive_int(local_steps, "local_steps")
 
-    frac = float(_cfg_get(cfg, "frac", 1.0))
-    if not math.isfinite(frac) or not math.isclose(
-        frac, 1.0, rel_tol=0.0, abs_tol=1e-12
-    ):
+    raw_frac = _cfg_get(cfg, "frac", 1.0)
+    if isinstance(raw_frac, bool):
+        raise ValueError("frac 必须为数值 1.0。")
+    try:
+        frac = float(raw_frac)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"frac 必须为数值 1.0，当前值：{raw_frac!r}"
+        ) from exc
+    if not math.isfinite(frac) or frac != 1.0:
         raise ValueError(
             f"{ALGORITHM_NAME} 首版要求全客户端参与，必须设置 frac=1.0；"
             f"当前值：{frac}"
