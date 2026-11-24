@@ -485,9 +485,41 @@ class RFedAGSSubspaceTests(unittest.TestCase):
             strict=True,
         )
 
-        expected = state[euclidean_name] + 0.2
+        # A is intentionally left untouched by aggregate(); it is averaged
+        # only after each client factor is aligned to the final global P.
         self.assertTrue(
-            torch.allclose(result.new_state_dict[euclidean_name], expected, atol=1e-6)
+            torch.allclose(
+                result.new_state_dict[euclidean_name],
+                state[euclidean_name],
+                atol=1e-6,
+            )
+        )
+        model.load_state_dict(result.new_state_dict, strict=True)
+        aggregator.after_aggregate(model)
+        factor_record = next(
+            item
+            for layer_records in model._rfedags_subspace_layer_records.values()
+            for item in layer_records
+            if item["a_name"] == euclidean_name
+        )
+        expected_p = result.new_state_dict[factor_record["p_name"]]
+        aligned_a0, _ = algorithm.align_stiefel_factor_gauge(
+            local_a=state[euclidean_name] + 0.1,
+            local_p=state[factor_record["p_name"]],
+            reference_p=expected_p,
+        )
+        aligned_a1, _ = algorithm.align_stiefel_factor_gauge(
+            local_a=state[euclidean_name] + 0.3,
+            local_p=state[factor_record["p_name"]],
+            reference_p=expected_p,
+        )
+        expected_aligned_a = 0.5 * (aligned_a0 + aligned_a1)
+        self.assertTrue(
+            torch.allclose(
+                dict(model.named_parameters())[euclidean_name],
+                expected_aligned_a,
+                atol=1e-5,
+            )
         )
         for name in p_names:
             expected_stream = 0.2 * tangent_streams[name]
@@ -509,6 +541,126 @@ class RFedAGSSubspaceTests(unittest.TestCase):
             )
         self.assertEqual(result.diagnostics["local_steps"], 4)
         self.assertEqual(result.weights, {0: 0.5, 1: 0.5})
+
+
+    def test_server_aligns_client_factors_to_final_global_gauge(self) -> None:
+        model = algorithm.build_rfedags_subspace_model(self.cfg)
+        state = base.clone_state_dict(model.state_dict())
+        param_groups = base.build_param_groups(
+            model=model,
+            expected_num_experts=4,
+            strict=True,
+        )
+        optimization_groups = base.build_federated_optimization_groups(
+            model=model,
+            param_groups=param_groups,
+            expected_num_experts=4,
+            strict=True,
+        )
+        method_context = base.MethodContext(
+            cfg=self.cfg,
+            device=torch.device("cpu"),
+            dataset_name="cifar10",
+            model_builder=algorithm.build_rfedags_subspace_model,
+            global_model=model,
+            param_groups=param_groups,
+            optimization_groups=optimization_groups,
+        )
+        aggregator = algorithm.RFedAGSSubspaceExpertAggregator(self.cfg)
+        aggregator.set_method_context(method_context)
+
+        factor_records = [
+            item
+            for layer_records in model._rfedags_subspace_layer_records.values()
+            for item in layer_records
+        ]
+        p_names = {item["p_name"] for item in factor_records}
+        client_updates = []
+        for client_id in range(2):
+            model_delta = {
+                name: torch.zeros_like(value)
+                for name, value in state.items()
+                if value.is_floating_point() or value.is_complex()
+            }
+            for item in factor_records:
+                rank = state[item["p_name"]].shape[1]
+                rotation = (
+                    torch.eye(rank)
+                    if client_id == 0
+                    else torch.linalg.qr(
+                        torch.randn(rank, rank),
+                        mode="reduced",
+                    ).Q
+                )
+                local_p = state[item["p_name"]] @ rotation
+                local_a = state[item["a_name"]] @ rotation
+                model_delta[item["p_name"]] = local_p - state[item["p_name"]]
+                model_delta[item["a_name"]] = local_a - state[item["a_name"]]
+            client_updates.append(
+                base.ClientUpdate(
+                    client_id=client_id,
+                    round_id=1,
+                    num_samples=10,
+                    model_delta=model_delta,
+                    metrics={"num_batches": 4},
+                    algorithm_payload={
+                        algorithm.PAYLOAD_KEY: {
+                            "version": algorithm.PAYLOAD_VERSION,
+                            "local_steps": 4,
+                            "gradient_stream": {
+                                name: torch.zeros_like(state[name])
+                                for name in p_names
+                            },
+                            "expert_buffers": {},
+                            "mean_diversity_loss": 0.0,
+                            "mean_overlap_by_layer": {
+                                name: 0.0
+                                for name in model._rfedags_subspace_layer_records
+                            },
+                        }
+                    },
+                )
+            )
+
+        result = aggregator.aggregate(
+            global_state=state,
+            client_updates=client_updates,
+            param_names=param_groups.expert,
+            base_state=state,
+            strict=True,
+        )
+        model.load_state_dict(result.new_state_dict, strict=True)
+        aggregator.after_aggregate(model)
+
+        parameter_map = dict(model.named_parameters())
+        for item in factor_records:
+            self.assertTrue(
+                torch.allclose(
+                    parameter_map[item["a_name"]],
+                    state[item["a_name"]],
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+            )
+            self.assertTrue(
+                torch.allclose(
+                    parameter_map[item["p_name"]],
+                    state[item["p_name"]],
+                    atol=1e-5,
+                    rtol=1e-5,
+                )
+            )
+
+        diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+        self.assertTrue(diagnostics["factor_gauge_alignment_applied"])
+        self.assertEqual(
+            diagnostics["num_factor_gauge_aligned_parameters"],
+            len(factor_records),
+        )
+        self.assertEqual(
+            set(diagnostics["global_subspace_pair_overlap_by_layer"]),
+            set(model._rfedags_subspace_layer_records),
+        )
 
 
 if __name__ == "__main__":
