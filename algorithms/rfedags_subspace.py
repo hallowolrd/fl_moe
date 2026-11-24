@@ -265,10 +265,16 @@ class LowRankStiefelLinear(nn.Module):
         ).to(device=weight.device, dtype=weight.dtype)
 
         u, singular_values, vh = torch.linalg.svd(weight, full_matrices=False)
+        truncated_a = u[:, :rank] * singular_values[:rank].unsqueeze(0)
+        approximation = truncated_a @ vh[:rank, :]
+        denominator = torch.linalg.norm(weight).clamp_min(
+            torch.finfo(weight.dtype).eps
+        )
+        replacement.initial_reconstruction_error = float(
+            (torch.linalg.norm(weight - approximation) / denominator).item()
+        )
         with torch.no_grad():
-            replacement.A.copy_(
-                u[:, :rank] * singular_values[:rank].unsqueeze(0)
-            )
+            replacement.A.copy_(truncated_a)
             replacement.P.copy_(vh[:rank, :].transpose(0, 1))
             if replacement.bias is not None:
                 replacement.bias.copy_(linear.bias.detach())
@@ -414,8 +420,12 @@ def build_rfedags_subspace_model(cfg: Any) -> nn.Module:
     if not expert_modules:
         raise ValueError("默认 SwitchViT 中没有发现 SwitchExpert 模块。")
 
+    reconstruction_errors: Dict[str, float] = {}
     for module_name, expert in expert_modules:
         expert.fc1 = LowRankStiefelLinear.from_linear(expert.fc1, rank)
+        reconstruction_errors[f"{module_name}.fc1"] = float(
+            expert.fc1.initial_reconstruction_error
+        )
 
     records = _collect_layer_records(model)
     if not records:
@@ -452,6 +462,7 @@ def build_rfedags_subspace_model(cfg: Any) -> nn.Module:
     model._rfedags_subspace_layer_records = records
     model._rfedags_subspace_thresholds = thresholds
     model._rfedags_subspace_initial_overlaps = initial_overlaps
+    model._rfedags_subspace_reconstruction_errors = reconstruction_errors
     model._rfedags_subspace_rank = rank
     return model
 
@@ -499,7 +510,6 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
         self._parameter_map: Dict[str, nn.Parameter] = {}
         self._records: Dict[str, list[Dict[str, Any]]] = {}
         self._p_names: list[str] = []
-        self._a_names: list[str] = []
         self._expert_parameter_names: list[str] = []
         self._euclidean_expert_names: list[str] = []
         self._expert_parameters: list[nn.Parameter] = []
@@ -537,11 +547,6 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
 
         self._p_names = [
             item["p_name"]
-            for layer_records in self._records.values()
-            for item in layer_records
-        ]
-        self._a_names = [
-            item["a_name"]
             for layer_records in self._records.values()
             for item in layer_records
         ]
@@ -808,21 +813,24 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
         )
         expert_state_names = set(groups.expert_state_names)
         named_parameters = dict(model.named_parameters())
-        expert_parameter_names = set(groups.expert_parameter_names)
+        trainable_expert_parameter_names = set(groups.expert_parameter_names)
+        parameter_state_names = expert_state_names.intersection(named_parameters)
         records = _get_layer_records(model)
         p_names = {
             item["p_name"]
             for layer_records in records.values()
             for item in layer_records
         }
-        euclidean_parameter_names = expert_parameter_names - p_names
-        expert_buffer_names = expert_state_names - expert_parameter_names
+        euclidean_parameter_names = parameter_state_names - p_names
+        expert_buffer_names = expert_state_names - parameter_state_names
 
         if not p_names:
             raise ValueError("RFedAGS 子空间聚合器没有发现 Stiefel 参数。")
-        if not p_names.issubset(expert_parameter_names):
-            raise ValueError("Stiefel 参数必须全部属于 expert_parameter_names。")
-        if expert_parameter_names | expert_buffer_names != expert_state_names:
+        if not p_names.issubset(trainable_expert_parameter_names):
+            raise ValueError("Stiefel 参数必须全部属于可训练的 expert 参数组。")
+        if parameter_state_names.intersection(expert_buffer_names):
+            raise ValueError("expert 参数与 buffer 分组发生重叠。")
+        if parameter_state_names | expert_buffer_names != expert_state_names:
             raise ValueError("expert 参数与 buffer 分组不能完整覆盖 expert state。")
         if param_names is not None and set(param_names) != expert_state_names:
             raise ValueError("服务端传入的专家 state 名称与优化分组不一致。")
@@ -1122,10 +1130,31 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
                         ).item()
                     )
                 )
+        reconstruction_errors = getattr(
+            model,
+            "_rfedags_subspace_reconstruction_errors",
+            {},
+        )
         return {
             "max_stiefel_orthogonality_error": max(errors) if errors else 0.0,
             "mean_stiefel_orthogonality_error": (
                 sum(errors) / len(errors) if errors else 0.0
+            ),
+            "max_initial_reconstruction_error": (
+                max(reconstruction_errors.values())
+                if reconstruction_errors
+                else 0.0
+            ),
+            "mean_initial_reconstruction_error": (
+                sum(reconstruction_errors.values()) / len(reconstruction_errors)
+                if reconstruction_errors
+                else 0.0
+            ),
+            "initial_subspace_overlap_by_layer": dict(
+                getattr(model, "_rfedags_subspace_initial_overlaps", {})
+            ),
+            "subspace_thresholds_by_layer": dict(
+                getattr(model, "_rfedags_subspace_thresholds", {})
             ),
         }
 
