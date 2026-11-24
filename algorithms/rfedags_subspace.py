@@ -217,6 +217,7 @@ class LowRankStiefelLinear(nn.Module):
         out_features: int,
         rank: int,
         bias: bool = True,
+        _initialize: bool = True,
     ) -> None:
         super().__init__()
         if rank <= 0 or rank >= in_features or rank > out_features:
@@ -236,10 +237,11 @@ class LowRankStiefelLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        nn.init.xavier_uniform_(self.A)
-        nn.init.orthogonal_(self.P)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        if _initialize:
+            nn.init.xavier_uniform_(self.A)
+            nn.init.orthogonal_(self.P)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
 
     @classmethod
     def from_linear(
@@ -262,6 +264,7 @@ class LowRankStiefelLinear(nn.Module):
             out_features=out_features,
             rank=rank,
             bias=linear.bias is not None,
+            _initialize=False,
         ).to(device=weight.device, dtype=weight.dtype)
 
         u, singular_values, vh = torch.linalg.svd(weight, full_matrices=False)
