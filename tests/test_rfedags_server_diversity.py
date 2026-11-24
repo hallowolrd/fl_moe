@@ -683,6 +683,34 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         }
 
         actual_parameter_map = dict(model.named_parameters())
+        factor_record = next(
+            item
+            for layer_records in records.values()
+            for item in layer_records
+            if item["a_name"] == euclidean_name
+        )
+        final_global_p = actual_parameter_map[factor_record["p_name"]].detach()
+        aligned_a0, _ = algorithm.align_stiefel_factor_gauge(
+            local_a=state[euclidean_name] + 0.1,
+            local_p=state[factor_record["p_name"]],
+            reference_p=final_global_p,
+        )
+        aligned_a1, _ = algorithm.align_stiefel_factor_gauge(
+            local_a=state[euclidean_name] + 0.3,
+            local_p=state[factor_record["p_name"]],
+            reference_p=final_global_p,
+        )
+        expected_aligned_a = 0.5 * (aligned_a0 + aligned_a1)
+        self.assertTrue(
+            torch.allclose(
+                actual_parameter_map[euclidean_name],
+                expected_aligned_a,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertTrue(diagnostics["factor_gauge_alignment_applied"])
+
         for name, expected_parameter in expected_parameters.items():
             self.assertTrue(
                 torch.allclose(
