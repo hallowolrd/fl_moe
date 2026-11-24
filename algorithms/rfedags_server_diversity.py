@@ -246,22 +246,40 @@ class RFedAGSServerDiversityClientStrategy(
         self._local_steps += 1
 
 
-def _count_pairs_above_threshold(
+def _collect_pairwise_overlap_metrics(
     model: nn.Module,
-    thresholds: Mapping[str, float],
-) -> int:
+) -> Dict[str, Dict[str, float]]:
+    """Return every within-layer expert-pair overlap for server diagnostics."""
     parameter_map = dict(model.named_parameters())
-    count = 0
+    pairwise: Dict[str, Dict[str, float]] = {}
     for layer_name, layer_records in subspace._get_layer_records(model).items():
-        threshold = float(thresholds[layer_name])
+        layer_values: Dict[str, float] = {}
         for left_index in range(len(layer_records)):
             for right_index in range(left_index + 1, len(layer_records)):
-                left = parameter_map[layer_records[left_index]["p_name"]].detach()
-                right = parameter_map[layer_records[right_index]["p_name"]].detach()
+                left_item = layer_records[left_index]
+                right_item = layer_records[right_index]
+                left = parameter_map[left_item["p_name"]].detach()
+                right = parameter_map[right_item["p_name"]].detach()
                 overlap = subspace._pairwise_subspace_overlap(left, right)
-                if float(overlap.item()) > threshold:
-                    count += 1
-    return count
+                pair_name = (
+                    f"expert_{int(left_item['expert_id'])}_"
+                    f"expert_{int(right_item['expert_id'])}"
+                )
+                layer_values[pair_name] = float(overlap.item())
+        pairwise[layer_name] = layer_values
+    return pairwise
+
+
+def _count_pairs_above_threshold(
+    pairwise: Mapping[str, Mapping[str, float]],
+    thresholds: Mapping[str, float],
+) -> int:
+    return sum(
+        1
+        for layer_name, pairs in pairwise.items()
+        for overlap in pairs.values()
+        if float(overlap) > float(thresholds[layer_name])
+    )
 
 
 class RFedAGSServerDiversityExpertAggregator(
@@ -356,8 +374,9 @@ class RFedAGSServerDiversityExpertAggregator(
                 allow_unused=False,
             )
 
+        pairwise_overlap_before = _collect_pairwise_overlap_metrics(model)
         pairs_above_threshold_before = _count_pairs_above_threshold(
-            model,
+            pairwise_overlap_before,
             thresholds,
         )
         before_points = [parameter.detach().clone() for parameter in p_parameters]
@@ -414,6 +433,7 @@ class RFedAGSServerDiversityExpertAggregator(
         if not math.isfinite(loss_after_value) or not math.isfinite(parameter_step_norm):
             raise ValueError("服务器端多样性校正产生了 NaN 或 Inf。")
 
+        pairwise_overlap_after = _collect_pairwise_overlap_metrics(model)
         self._last_server_correction_diagnostics = {
             "server_diversity_applied": bool(applied),
             "server_diversity_loss_before": loss_before_value,
@@ -423,8 +443,17 @@ class RFedAGSServerDiversityExpertAggregator(
             ),
             "server_subspace_overlap_before_by_layer": dict(overlap_before),
             "server_subspace_overlap_after_by_layer": dict(overlap_after),
+            "server_subspace_pair_overlap_before": pairwise_overlap_before,
+            "server_subspace_pair_overlap_after": pairwise_overlap_after,
+            "server_diversity_thresholds_by_layer": {
+                str(name): float(value)
+                for name, value in thresholds.items()
+            },
             "server_diversity_pairs_above_threshold_before": (
                 pairs_above_threshold_before
+            ),
+            "server_diversity_pairs_above_threshold_after": (
+                _count_pairs_above_threshold(pairwise_overlap_after, thresholds)
             ),
             "server_diversity_gradient_norm": gradient_norm,
             "server_diversity_clipped_gradient_norm": clipped_gradient_norm,
@@ -432,9 +461,6 @@ class RFedAGSServerDiversityExpertAggregator(
             "server_diversity_lr": self.diversity_lr,
             "server_diversity_grad_clip": self.diversity_grad_clip,
         }
-        self._last_server_correction_diagnostics[
-            "server_diversity_pairs_above_threshold_after"
-        ] = _count_pairs_above_threshold(model, thresholds)
 
     def build_post_aggregate_diagnostics(
         self,
