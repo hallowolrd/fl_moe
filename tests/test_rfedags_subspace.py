@@ -79,7 +79,8 @@ class RFedAGSSubspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "frac=1.0"):
             self._build_cfg(frac=0.9999999999995)
 
-        with self.assertRaisesRegex(ValueError, "frac"):
+        # The shared config loader rejects bool before the algorithm validator.
+        with self.assertRaisesRegex(base.ConfigError, "frac"):
             self._build_cfg(frac=True)
 
     def test_subspace_threshold_is_capped_below_one(self) -> None:
