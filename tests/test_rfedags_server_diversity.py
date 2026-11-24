@@ -66,6 +66,9 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
     def test_scheme_two_is_independent_from_scheme_one(self) -> None:
         self.assertEqual(algorithm.PAYLOAD_KEY, algorithm.ALGORITHM_NAME)
         self.assertFalse(hasattr(algorithm, "subspace"))
+        source = Path(algorithm.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("rfedags_subspace", source)
+        self.assertNotIn("subspace.", source)
         self.assertIs(
             algorithm.RFedAGSServerDiversityClientStrategy.__bases__[0],
             base.ExpertClientTrainingStrategy,
@@ -384,8 +387,6 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                         name: state[name].clone()
                         for name in expert_buffer_names
                     },
-                    "mean_diversity_loss": 0.0,
-                    "mean_overlap_by_layer": {},
                 }
             }
             client_updates.append(
@@ -422,6 +423,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             0.0,
         )
 
+        self.assertEqual(result.diagnostics["aggregation_method"], algorithm.ALGORITHM_NAME)
         self.assertNotIn("mean_diversity_loss", result.diagnostics)
         self.assertNotIn("lambda_div", result.diagnostics)
 
