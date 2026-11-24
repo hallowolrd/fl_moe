@@ -94,7 +94,8 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             self._build_cfg(frac=0.5)
         with self.assertRaisesRegex(ValueError, "frac=1.0"):
             self._build_cfg(frac=0.9999999999995)
-        with self.assertRaisesRegex(ValueError, "frac"):
+        # The shared config loader rejects bool before the algorithm validator.
+        with self.assertRaisesRegex(base.ConfigError, "frac"):
             self._build_cfg(frac=True)
 
         self.assertEqual(int(self.cfg.local_steps), 4)
@@ -147,7 +148,12 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                     )
 
     def test_product_gradient_clipping_ignores_stiefel_normal_component(self) -> None:
-        point = torch.linalg.qr(torch.randn(16, 8), mode="reduced").Q
+        # Use float64 so the large normal component does not cause avoidable
+        # float32 cancellation when the projection subtracts it back out.
+        point = torch.linalg.qr(
+            torch.randn(16, 8, dtype=torch.float64),
+            mode="reduced",
+        ).Q
         tangent = algorithm.stiefel_tangent_projection(
             point,
             torch.randn_like(point),
@@ -159,7 +165,9 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             ambient_gradient,
         )
 
-        euclidean_parameter = torch.nn.Parameter(torch.zeros(4))
+        euclidean_parameter = torch.nn.Parameter(
+            torch.zeros(4, dtype=torch.float64)
+        )
         euclidean_parameter.grad = torch.full_like(euclidean_parameter, 0.2)
         original_euclidean_gradient = euclidean_parameter.grad.clone()
 
