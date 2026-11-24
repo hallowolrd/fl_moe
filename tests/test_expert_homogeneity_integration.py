@@ -199,7 +199,10 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
             model=self.model,
             data_loader=self.loader,
             device="cpu",
-            max_batches=1,
+            # Two batches provide 20 tokens (4 images x 5 tokens),
+            # so the 13-token cap is exercised rather than testing a
+            # request larger than the available input.
+            max_batches=2,
             max_tokens_per_layer=13,
             subspace_k=2,
             expert_batch_size=16,
@@ -213,7 +216,10 @@ class SwitchViTExpertDiagnosticsTests(unittest.TestCase):
         self.assertTrue(torch.equal(rng_before, torch.random.get_rng_state()))
 
         self.assertEqual(first["controls"]["shuffled_cka_repeats"], 2)
+        self.assertEqual(first["num_batches"], 2)
+        self.assertEqual(first["num_images"], 4)
         for layer_report in first["layers"].values():
+            self.assertEqual(layer_report["num_tokens_used"], 13)
             self.assertIn("token_output_cosine_mean", layer_report["summary"])
             self.assertIn("hidden_cka_vs_shuffled_gap", layer_report["summary"])
             for pair_report in layer_report["pairwise"].values():
