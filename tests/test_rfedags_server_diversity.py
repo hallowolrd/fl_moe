@@ -92,6 +92,10 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "frac=1.0"):
             self._build_cfg(frac=0.5)
+        with self.assertRaisesRegex(ValueError, "frac=1.0"):
+            self._build_cfg(frac=0.9999999999995)
+        with self.assertRaisesRegex(ValueError, "frac"):
+            self._build_cfg(frac=True)
 
         self.assertEqual(int(self.cfg.local_steps), 4)
         self.assertEqual(
@@ -141,6 +145,78 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                     parameter_map[item["p_name"]].copy_(
                         basis if expert_index < 3 else rotated
                     )
+
+    def test_product_gradient_clipping_ignores_stiefel_normal_component(self) -> None:
+        point = torch.linalg.qr(torch.randn(16, 8), mode="reduced").Q
+        tangent = algorithm.stiefel_tangent_projection(
+            point,
+            torch.randn_like(point),
+        )
+        tangent = tangent / torch.linalg.norm(tangent) * 0.6
+        ambient_gradient = tangent + 50.0 * point
+        projected_gradient = algorithm.stiefel_tangent_projection(
+            point,
+            ambient_gradient,
+        )
+
+        euclidean_parameter = torch.nn.Parameter(torch.zeros(4))
+        euclidean_parameter.grad = torch.full_like(euclidean_parameter, 0.2)
+        original_euclidean_gradient = euclidean_parameter.grad.clone()
+
+        algorithm._clip_product_manifold_gradients(
+            riemannian_gradients={"P": projected_gradient},
+            euclidean_parameters=[euclidean_parameter],
+            max_norm=1.0,
+        )
+
+        self.assertTrue(torch.allclose(projected_gradient, tangent, atol=1e-5))
+        self.assertTrue(
+            torch.allclose(
+                euclidean_parameter.grad,
+                original_euclidean_gradient,
+                atol=1e-7,
+            )
+        )
+
+    def test_product_gradient_clipping_uses_one_common_scale(self) -> None:
+        point = torch.linalg.qr(torch.randn(16, 8), mode="reduced").Q
+        tangent = algorithm.stiefel_tangent_projection(
+            point,
+            torch.randn_like(point),
+        )
+        tangent = tangent / torch.linalg.norm(tangent) * 1.2
+
+        euclidean_parameter = torch.nn.Parameter(torch.zeros(4))
+        euclidean_parameter.grad = torch.full_like(euclidean_parameter, 0.45)
+        original_tangent = tangent.clone()
+        original_euclidean_gradient = euclidean_parameter.grad.clone()
+        original_norm = torch.sqrt(
+            torch.linalg.norm(original_tangent).square()
+            + torch.linalg.norm(original_euclidean_gradient).square()
+        )
+        expected_scale = 1.0 / (float(original_norm.item()) + 1e-6)
+
+        algorithm._clip_product_manifold_gradients(
+            riemannian_gradients={"P": tangent},
+            euclidean_parameters=[euclidean_parameter],
+            max_norm=1.0,
+        )
+
+        clipped_norm = torch.sqrt(
+            torch.linalg.norm(tangent).square()
+            + torch.linalg.norm(euclidean_parameter.grad).square()
+        )
+        self.assertAlmostEqual(float(clipped_norm.item()), 1.0, places=5)
+        self.assertTrue(
+            torch.allclose(tangent, original_tangent * expected_scale, atol=1e-6)
+        )
+        self.assertTrue(
+            torch.allclose(
+                euclidean_parameter.grad,
+                original_euclidean_gradient * expected_scale,
+                atol=1e-6,
+            )
+        )
 
     def test_model_builder_uses_own_stiefel_parameterization(self) -> None:
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
@@ -255,6 +331,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                 self.assertTrue(torch.equal(parameter, before[name]))
 
     def test_client_training_does_not_compute_diversity_loss(self) -> None:
+        self.cfg.optimizer.grad_clip = 1.0
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
         global_state = base.clone_state_dict(model.state_dict())
         groups = base.build_federated_optimization_groups(
@@ -290,7 +367,11 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             side_effect=AssertionError(
                 "client must not compute the diversity loss"
             ),
-        ):
+        ), patch.object(
+            algorithm,
+            "_clip_product_manifold_gradients",
+            wraps=algorithm._clip_product_manifold_gradients,
+        ) as product_clip:
             result = base.train_local_model_with_expert_strategy(
                 model=model,
                 train_loader=loader,
@@ -309,6 +390,10 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             )
 
         self.assertEqual(result.stats.num_batches, 4)
+        self.assertEqual(product_clip.call_count, 4)
+        self.assertTrue(
+            all(call.kwargs["max_norm"] == 1.0 for call in product_clip.call_args_list)
+        )
         payload = result.algorithm_payload[algorithm.PAYLOAD_KEY]
         self.assertEqual(payload["local_steps"], 4)
         self.assertNotIn("mean_diversity_loss", payload)
