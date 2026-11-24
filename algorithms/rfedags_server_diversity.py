@@ -1290,7 +1290,8 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
                 "aggregation_method": ALGORITHM_NAME,
                 "aggregation_rule": "client_uniform",
                 "client_participation": "all_clients",
-                "update_space": "stiefel_riemannian_gradient_stream_and_euclidean_delta",
+                "update_space": "stiefel_riemannian_gradient_stream_and_gauge_aligned_euclidean_updates",
+                "factor_a_aggregation": "client_uniform_after_procrustes_alignment_to_final_global_p",
                 "local_steps": configured_local_steps,
                 "subspace_rank": int(_method_cfg_get(self.cfg, "subspace_rank", SUBSPACE_RANK)),
                 "server_manifold_lr": self.server_lr,
@@ -1461,6 +1462,7 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
                     accepted = True
                     if not applied:
                         skip_reason = "zero_effective_parameter_step"
+                        effective_diversity_lr = 0.0
                     break
 
                 # Reject a non-decreasing step and restore the exact RFedAGS
