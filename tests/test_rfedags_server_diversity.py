@@ -294,6 +294,22 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             diagnostics["server_diversity_pairs_above_threshold_before"],
             0,
         )
+        self.assertEqual(
+            len(diagnostics["server_subspace_pair_overlap_before"]),
+            2,
+        )
+        self.assertTrue(
+            all(
+                len(pair_values) == 6
+                for pair_values in diagnostics[
+                    "server_subspace_pair_overlap_before"
+                ].values()
+            )
+        )
+        self.assertEqual(
+            set(diagnostics["server_diversity_thresholds_by_layer"]),
+            set(records),
+        )
         self.assertGreater(
             diagnostics["server_diversity_parameter_step_norm"],
             0.0,
