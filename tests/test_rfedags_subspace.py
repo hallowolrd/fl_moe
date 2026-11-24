@@ -131,7 +131,7 @@ class RFedAGSSubspaceTests(unittest.TestCase):
             torch.randn_like(point),
         )
         tangent = tangent / torch.linalg.norm(tangent) * 0.6
-        ambient_gradient = tangent + 100.0 * point
+        ambient_gradient = tangent + 50.0 * point
         projected_gradient = algorithm.stiefel_tangent_projection(
             point,
             ambient_gradient,
