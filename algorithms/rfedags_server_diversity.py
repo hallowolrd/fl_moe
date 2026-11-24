@@ -356,6 +356,12 @@ class RFedAGSServerDiversityExpertAggregator(
                 allow_unused=False,
             )
 
+        pairs_above_threshold_before = _count_pairs_above_threshold(
+            model,
+            thresholds,
+        )
+        before_points = [parameter.detach().clone() for parameter in p_parameters]
+
         gradient_norm = math.sqrt(
             sum(
                 float(torch.sum(gradient.detach().to(torch.float64).square()).item())
@@ -379,7 +385,6 @@ class RFedAGSServerDiversityExpertAggregator(
         parameter_step_norm = 0.0
 
         if applied:
-            before_points = [parameter.detach().clone() for parameter in p_parameters]
             with torch.no_grad():
                 for parameter, gradient in zip(p_parameters, gradients):
                     parameter.copy_(
@@ -419,9 +424,7 @@ class RFedAGSServerDiversityExpertAggregator(
             "server_subspace_overlap_before_by_layer": dict(overlap_before),
             "server_subspace_overlap_after_by_layer": dict(overlap_after),
             "server_diversity_pairs_above_threshold_before": (
-                _count_pairs_above_threshold(model, thresholds)
-                if not applied
-                else None
+                pairs_above_threshold_before
             ),
             "server_diversity_gradient_norm": gradient_norm,
             "server_diversity_clipped_gradient_norm": clipped_gradient_norm,
@@ -429,27 +432,6 @@ class RFedAGSServerDiversityExpertAggregator(
             "server_diversity_lr": self.diversity_lr,
             "server_diversity_grad_clip": self.diversity_grad_clip,
         }
-        # Count the pre-correction pairs from the recorded pre-correction
-        # overlaps, not from the already-updated model.
-        if applied:
-            pre_count = 0
-            for layer_name, layer_records in records.items():
-                threshold = float(thresholds[layer_name])
-                parameter_map_before = {
-                    name: point
-                    for name, point in zip(p_names, before_points)
-                }
-                for left_index in range(len(layer_records)):
-                    for right_index in range(left_index + 1, len(layer_records)):
-                        left = parameter_map_before[layer_records[left_index]["p_name"]]
-                        right = parameter_map_before[layer_records[right_index]["p_name"]]
-                        overlap = subspace._pairwise_subspace_overlap(left, right)
-                        if float(overlap.item()) > threshold:
-                            pre_count += 1
-            self._last_server_correction_diagnostics[
-                "server_diversity_pairs_above_threshold_before"
-            ] = pre_count
-
         self._last_server_correction_diagnostics[
             "server_diversity_pairs_above_threshold_after"
         ] = _count_pairs_above_threshold(model, thresholds)
