@@ -142,7 +142,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                         basis if expert_index < 3 else rotated
                     )
 
-    def test_model_builder_uses_shared_stiefel_parameterization(self) -> None:
+    def test_model_builder_uses_own_stiefel_parameterization(self) -> None:
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
         stiefel_layers = [
             module
