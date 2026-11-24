@@ -750,7 +750,7 @@ def diagnose_model_experts(
                 for batch_index, batch in enumerate(data_loader):
                     if max_batches is not None and batch_index >= max_batches:
                         break
-    
+
                     images = _extract_images_from_batch(batch).to(
                         device=target_device,
                         dtype=input_dtype,
@@ -758,14 +758,14 @@ def diagnose_model_experts(
                     )
                     active_capture.clear()
                     model(images)
-    
+
                     missing_layers = set(moe_layers) - set(active_capture)
                     if missing_layers:
                         raise RuntimeError(
                             "模型前向没有触发全部 MoE 层输入采集："
                             f"{sorted(missing_layers)}。"
                         )
-    
+
                     for layer_name in moe_layers:
                         captured_batches[layer_name].append(
                             active_capture[layer_name]
