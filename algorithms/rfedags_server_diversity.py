@@ -36,6 +36,8 @@ SERVER_MANIFOLD_LR = 1.0
 SERVER_DIVERSITY_LR = 1e-3
 SERVER_DIVERSITY_GRAD_CLIP = None
 SUBSPACE_OVERLAP_THRESHOLD_CAP = 0.95
+MAX_SERVER_DIVERSITY_BACKTRACKING_STEPS = 10
+SERVER_DIVERSITY_BACKTRACKING_FACTOR = 0.5
 
 METHOD_CONFIG_DEFAULTS: Dict[str, Any] = {
     "method_config": {
@@ -449,6 +451,120 @@ def align_stiefel_factor_gauge(
     return local_a @ rotation, local_p @ rotation
 
 
+def _apply_factor_gauge_average(
+    model: nn.Module,
+    records: Mapping[str, Sequence[Mapping[str, Any]]],
+    pending_updates: Mapping[
+        str,
+        Sequence[tuple[float, torch.Tensor, torch.Tensor]],
+    ],
+) -> int:
+    """Average client A factors after aligning them to the final global P gauge."""
+    if not pending_updates:
+        return 0
+
+    parameter_map = dict(model.named_parameters())
+    expected_a_names = {
+        str(item["a_name"])
+        for layer_records in records.values()
+        for item in layer_records
+    }
+    if set(pending_updates) != expected_a_names:
+        raise ValueError(
+            "待对齐的 A 因子集合与 Stiefel P 因子记录不一致；"
+            f"expected={sorted(expected_a_names)}, "
+            f"actual={sorted(pending_updates)}"
+        )
+
+    aligned_count = 0
+    with torch.no_grad():
+        for layer_records in records.values():
+            for item in layer_records:
+                p_name = str(item["p_name"])
+                a_name = str(item["a_name"])
+                if p_name not in parameter_map or a_name not in parameter_map:
+                    raise KeyError(
+                        f"全局模型缺少低秩因子参数：P={p_name}, A={a_name}"
+                    )
+                reference_p = parameter_map[p_name].detach()
+                reference_a = parameter_map[a_name]
+                accumulator = torch.zeros(
+                    reference_a.shape,
+                    device=reference_a.device,
+                    dtype=_accumulation_dtype(reference_a),
+                )
+                total_weight = 0.0
+                for weight, local_a, local_p in pending_updates[a_name]:
+                    if not math.isfinite(float(weight)) or float(weight) < 0.0:
+                        raise ValueError(f"{a_name} 的客户端聚合权重无效：{weight!r}")
+                    aligned_a, aligned_p = align_stiefel_factor_gauge(
+                        local_a=local_a.to(
+                            device=reference_a.device,
+                            dtype=reference_a.dtype,
+                        ),
+                        local_p=local_p.to(
+                            device=reference_p.device,
+                            dtype=reference_p.dtype,
+                        ),
+                        reference_p=reference_p,
+                    )
+                    if not _tensor_is_finite(aligned_a) or not _tensor_is_finite(aligned_p):
+                        raise ValueError(f"{a_name}/{p_name} Gauge 对齐结果包含 NaN 或 Inf。")
+                    accumulator.add_(
+                        aligned_a.to(dtype=accumulator.dtype),
+                        alpha=float(weight),
+                    )
+                    total_weight += float(weight)
+                if not math.isclose(total_weight, 1.0, rel_tol=1e-6, abs_tol=1e-8):
+                    raise ValueError(
+                        f"{a_name} 的客户端聚合权重之和必须为 1，当前为 {total_weight}"
+                    )
+                averaged_a = accumulator.to(dtype=reference_a.dtype)
+                if not _tensor_is_finite(averaged_a):
+                    raise ValueError(f"{a_name} 的 Gauge 对齐聚合结果包含 NaN 或 Inf。")
+                reference_a.copy_(averaged_a)
+                aligned_count += 1
+    return aligned_count
+
+
+def _collect_pending_factor_updates(
+    records: Mapping[str, Sequence[Mapping[str, Any]]],
+    client_updates: Sequence[base.ClientUpdate],
+    weights: Mapping[int, float],
+    global_state: Mapping[str, torch.Tensor],
+) -> Dict[str, list[tuple[float, torch.Tensor, torch.Tensor]]]:
+    """Reconstruct raw local (A, P) factors for final server-side alignment."""
+    pending: Dict[str, list[tuple[float, torch.Tensor, torch.Tensor]]] = {
+        str(item["a_name"]): []
+        for layer_records in records.values()
+        for item in layer_records
+    }
+    for update in client_updates:
+        client_id = int(update.client_id)
+        if client_id not in weights:
+            raise KeyError(f"Gauge 对齐权重缺少客户端 {client_id}。")
+        for layer_records in records.values():
+            for item in layer_records:
+                a_name = str(item["a_name"])
+                p_name = str(item["p_name"])
+                local_a = global_state[a_name] + update.model_delta[a_name].to(
+                    device=global_state[a_name].device,
+                    dtype=global_state[a_name].dtype,
+                )
+                local_p = global_state[p_name] + update.model_delta[p_name].to(
+                    device=global_state[p_name].device,
+                    dtype=global_state[p_name].dtype,
+                )
+                pending[a_name].append(
+                    (
+                        float(weights[client_id]),
+                        local_a.detach().clone(),
+                        local_p.detach().clone(),
+                    )
+                )
+    return pending
+
+
 def _pairwise_subspace_overlap(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -751,18 +867,8 @@ class RFedAGSServerDiversityClientStrategy(base.ExpertClientTrainingStrategy):
                 "客户端实际更新步数与配置不一致："
                 f"expected={self._expected_local_steps}, actual={self._local_steps}"
             )
-        with torch.no_grad():
-            for layer_records in self._records.values():
-                for item in layer_records:
-                    p_name, a_name = item["p_name"], item["a_name"]
-                    aligned_a, aligned_p = align_stiefel_factor_gauge(
-                        local_a=self._parameter_map[a_name],
-                        local_p=self._parameter_map[p_name],
-                        reference_p=self._global_points[p_name],
-                    )
-                    self._parameter_map[p_name].copy_(aligned_p)
-                    self._parameter_map[a_name].copy_(aligned_a)
-
+        # Keep raw local (A, P) factors in model_delta. The server aligns A
+        # only after RFedAGS and diversity correction produce the final P.
         state_dict = context.model.state_dict()
         expert_buffers = {
             name: state_dict[name].detach().clone()
@@ -852,6 +958,10 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
             )
         )
         self._last_server_correction_diagnostics: Dict[str, Any] = {}
+        self._pending_factor_updates: Dict[
+            str, list[tuple[float, torch.Tensor, torch.Tensor]]
+        ] = {}
+        self._last_factor_gauge_diagnostics: Dict[str, Any] = {}
 
     def compute_weights(
         self,
@@ -927,6 +1037,14 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
             for item in layer_records
         }
         euclidean_parameter_names = parameter_state_names - p_names
+        factor_a_names = {
+            str(item["a_name"])
+            for layer_records in records.values()
+            for item in layer_records
+        }
+        if not factor_a_names.issubset(euclidean_parameter_names):
+            raise ValueError("低秩 A 因子必须全部属于欧氏 expert 参数组。")
+        fedavg_euclidean_parameter_names = euclidean_parameter_names - factor_a_names
         expert_buffer_names = expert_state_names - parameter_state_names
 
         if not p_names:
@@ -1023,6 +1141,21 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
                         f"客户端 {update.client_id} 的 expert buffer {name} 包含 NaN 或 Inf。"
                     )
 
+            for name in p_names:
+                value = update.model_delta.get(name)
+                if not torch.is_tensor(value):
+                    raise ValueError(
+                        f"客户端 {update.client_id} 的 model_delta 缺少 Stiefel 参数 {name}。"
+                    )
+                if tuple(value.shape) != tuple(global_state[name].shape):
+                    raise ValueError(
+                        f"客户端 {update.client_id} 的 {name} delta shape 不匹配。"
+                    )
+                if not _tensor_is_finite(value):
+                    raise ValueError(
+                        f"客户端 {update.client_id} 的 {name} delta 包含 NaN 或 Inf。"
+                    )
+
             for name in euclidean_parameter_names:
                 value = update.model_delta.get(name)
                 if not torch.is_tensor(value):
@@ -1046,9 +1179,9 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
                 f"当前各客户端步数：{local_steps_by_client}"
             )
 
-        # Euclidean expert parameters use the same client-uniform delta rule
-        # as FedAvg. P is deliberately excluded from this path.
-        for name in sorted(euclidean_parameter_names):
+        # Ordinary Euclidean expert parameters use client-uniform FedAvg.
+        # A factors are aligned and averaged after the final server P update.
+        for name in sorted(fedavg_euclidean_parameter_names):
             reference = global_state[name]
             accumulator = torch.zeros(
                 reference.shape,
@@ -1132,12 +1265,21 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
         )
         base.check_finite_state_dict(new_state_dict)
 
-        # model_delta diagnostics describe only the Euclidean expert path;
-        # P is aggregated from gradient_stream, not from its endpoint delta.
+        # Retain raw local factors until the server-side diversity correction
+        # has produced the final global P for this round.
+        self._pending_factor_updates = _collect_pending_factor_updates(
+            records=records,
+            client_updates=client_updates,
+            weights=weights,
+            global_state=global_state,
+        )
+
+        # Diagnostics cover only parameters averaged directly in Euclidean
+        # coordinates. A is aggregated through the aligned factor path.
         diagnostics = self.build_diagnostics(
             client_updates=client_updates,
             weights=weights,
-            param_names=sorted(euclidean_parameter_names),
+            param_names=sorted(fedavg_euclidean_parameter_names),
         )
         diagnostics.update(
             {
@@ -1153,6 +1295,8 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
                 "server_diversity_threshold_cap": self.subspace_overlap_threshold_cap,
                 "num_stiefel_parameters": len(p_names),
                 "num_euclidean_expert_parameters": len(euclidean_parameter_names),
+                "num_fedavg_euclidean_expert_parameters": len(fedavg_euclidean_parameter_names),
+                "num_gauge_aligned_factor_parameters": len(factor_a_names),
                 "mean_aggregated_stream_norm": (
                     sum(aggregated_stream_norms) / len(aggregated_stream_norms)
                     if aggregated_stream_norms
@@ -1247,54 +1391,89 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
         parameter_step_norm = 0.0
         applied = False
         skip_reason: Optional[str] = None
+        effective_diversity_lr = 0.0
+        backtracking_steps = 0
 
         if loss_before_value <= 0.0:
             skip_reason = "no_active_overlap_pairs"
         elif clipped_gradient_norm <= 0.0:
             skip_reason = "zero_riemannian_gradient"
         else:
-            candidate_parameters = []
-            with torch.no_grad():
-                for parameter, gradient in zip(
-                    p_parameters,
-                    riemannian_gradients,
+            trial_lr = self.diversity_lr * clip_scale
+            accepted = False
+            for backtracking_steps in range(
+                MAX_SERVER_DIVERSITY_BACKTRACKING_STEPS + 1
+            ):
+                candidate_parameters = [
+                    qr_retraction(before - trial_lr * gradient)
+                    for before, gradient in zip(
+                        before_points,
+                        riemannian_gradients,
+                    )
+                ]
+                if any(
+                    not _tensor_is_finite(candidate)
+                    for candidate in candidate_parameters
                 ):
-                    candidate = qr_retraction(
-                        parameter.detach()
-                        - self.diversity_lr * clip_scale * gradient
+                    raise ValueError(
+                        "服务器端差异性校正生成了 NaN 或 Inf 参数。"
                     )
-                    if not _tensor_is_finite(candidate):
-                        raise ValueError(
-                            "服务器端差异性校正生成了 NaN 或 Inf 参数。"
-                        )
-                    candidate_parameters.append(candidate)
 
-                parameter_step_norm = math.sqrt(
-                    sum(
-                        float(
-                            torch.sum(
-                                (candidate - before).to(torch.float64).square()
-                            ).item()
-                        )
-                        for candidate, before in zip(
-                            candidate_parameters,
-                            before_points,
-                        )
-                    )
-                )
-
-                if not math.isfinite(parameter_step_norm):
-                    raise ValueError("服务器端参数更新范数包含 NaN 或 Inf。")
-
-                applied = parameter_step_norm > 0.0
-                if applied:
+                with torch.no_grad():
                     for parameter, candidate in zip(
                         p_parameters,
                         candidate_parameters,
                     ):
                         parameter.copy_(candidate)
-                else:
-                    skip_reason = "zero_effective_parameter_step"
+                    candidate_loss, _ = compute_subspace_diversity_loss(
+                        model,
+                        thresholds=thresholds,
+                    )
+                    candidate_loss_value = float(candidate_loss.item())
+
+                if (
+                    math.isfinite(candidate_loss_value)
+                    and candidate_loss_value <= loss_before_value
+                ):
+                    parameter_step_norm = math.sqrt(
+                        sum(
+                            float(
+                                torch.sum(
+                                    (candidate - before).to(torch.float64).square()
+                                ).item()
+                            )
+                            for candidate, before in zip(
+                                candidate_parameters,
+                                before_points,
+                            )
+                        )
+                    )
+                    if not math.isfinite(parameter_step_norm):
+                        raise ValueError(
+                            "服务器端参数更新范数包含 NaN 或 Inf。"
+                        )
+                    applied = parameter_step_norm > 0.0
+                    effective_diversity_lr = trial_lr
+                    accepted = True
+                    if not applied:
+                        skip_reason = "zero_effective_parameter_step"
+                    break
+
+                # Reject a non-decreasing step and restore the exact RFedAGS
+                # intermediate point before trying a smaller step.
+                with torch.no_grad():
+                    for parameter, before in zip(p_parameters, before_points):
+                        parameter.copy_(before)
+                trial_lr *= SERVER_DIVERSITY_BACKTRACKING_FACTOR
+
+            if not accepted:
+                with torch.no_grad():
+                    for parameter, before in zip(p_parameters, before_points):
+                        parameter.copy_(before)
+                skip_reason = "non_decreasing_diversity_loss"
+                parameter_step_norm = 0.0
+                applied = False
+                effective_diversity_lr = 0.0
 
         with torch.no_grad():
             loss_after, overlap_after = compute_subspace_diversity_loss(
@@ -1307,6 +1486,16 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
             raise ValueError("服务器端多样性校正产生了 NaN 或 Inf。")
 
         pairwise_overlap_after = _collect_pairwise_overlap_metrics(model)
+        aligned_count = _apply_factor_gauge_average(
+            model=model,
+            records=records,
+            pending_updates=self._pending_factor_updates,
+        )
+        self._pending_factor_updates = {}
+        self._last_factor_gauge_diagnostics = {
+            "factor_gauge_alignment_applied": bool(aligned_count),
+            "num_factor_gauge_aligned_parameters": int(aligned_count),
+        }
         self._last_server_correction_diagnostics = {
             "server_diversity_applied": bool(applied),
             "server_diversity_skip_reason": skip_reason,
@@ -1332,9 +1521,8 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
             "server_diversity_gradient_norm": gradient_norm,
             "server_diversity_clipped_gradient_norm": clipped_gradient_norm,
             "server_diversity_parameter_step_norm": parameter_step_norm,
-            "server_diversity_lr": self.diversity_lr,
-            "server_diversity_grad_clip": self.diversity_grad_clip,
-            "server_diversity_threshold_cap": self.subspace_overlap_threshold_cap,
+            "server_diversity_effective_lr": effective_diversity_lr,
+            "server_diversity_backtracking_steps": int(backtracking_steps),
         }
 
     def build_post_aggregate_diagnostics(
@@ -1373,6 +1561,7 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
             ),
         }
         diagnostics.update(self._last_server_correction_diagnostics)
+        diagnostics.update(self._last_factor_gauge_diagnostics)
         return diagnostics
 
 
