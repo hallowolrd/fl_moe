@@ -363,8 +363,7 @@ def compute_subspace_diversity_loss(
 
     parameter_map = dict(model.named_parameters())
     penalties: list[torch.Tensor] = []
-    overlap_sums: Dict[str, float] = {}
-    overlap_counts: Dict[str, int] = {}
+    overlaps_by_layer: Dict[str, list[torch.Tensor]] = {}
 
     for layer_name, layer_records in records.items():
         if layer_name not in thresholds:
@@ -383,19 +382,15 @@ def compute_subspace_diversity_loss(
                 right = parameter_map[right_name]
                 overlap = _pairwise_subspace_overlap(left, right)
                 penalties.append(torch.relu(overlap - threshold).square())
-                overlap_sums[layer_name] = (
-                    overlap_sums.get(layer_name, 0.0)
-                    + float(overlap.detach().item())
-                )
-                overlap_counts[layer_name] = overlap_counts.get(layer_name, 0) + 1
+                overlaps_by_layer.setdefault(layer_name, []).append(overlap.detach())
 
     if not penalties:
         raise ValueError("子空间差异性损失没有可计算的专家配对。")
 
     loss = torch.stack(penalties).mean()
     mean_overlap_by_layer = {
-        layer_name: overlap_sums[layer_name] / overlap_counts[layer_name]
-        for layer_name in overlap_sums
+        layer_name: float(torch.stack(values).mean().item())
+        for layer_name, values in overlaps_by_layer.items()
     }
     return loss, mean_overlap_by_layer
 
@@ -1081,6 +1076,13 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
                 "mean_diversity_loss": sum(
                     float(weights[client_id]) * value
                     for client_id, value in diversity_loss_by_client.items()
+                ),
+                "mean_weighted_diversity_loss": (
+                    float(_method_cfg_get(self.cfg, "lambda_div", LAMBDA_DIV))
+                    * sum(
+                        float(weights[client_id]) * value
+                        for client_id, value in diversity_loss_by_client.items()
+                    )
                 ),
                 "mean_overlap_by_layer": {
                     layer_name: sum(
