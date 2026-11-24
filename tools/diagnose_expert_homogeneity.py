@@ -638,7 +638,8 @@ def diagnose_model_experts(
     3. 计算所有专家对的权重、子空间、CKA 和输出差异指标。
 
     模型在诊断期间切换到 eval 模式并禁用梯度；结束后恢复原有设备和
-    每个子模块各自的 training 状态。不会更新模型参数。
+    每个子模块各自的 training 状态。通过 fork_rng 隔离 DataLoader 迭代
+    和模型推理的随机数消耗，不改变调用方的 CPU/CUDA 全局 RNG 状态。
     """
     _validate_optional_positive_int(max_batches, "max_batches")
     _validate_optional_positive_int(
@@ -732,32 +733,44 @@ def diagnose_model_experts(
                 )
             )
 
-        with torch.inference_mode():
-            for batch_index, batch in enumerate(data_loader):
-                if max_batches is not None and batch_index >= max_batches:
-                    break
-
-                images = _extract_images_from_batch(batch).to(
-                    device=target_device,
-                    dtype=input_dtype,
-                    non_blocking=target_device.type == "cuda",
-                )
-                active_capture.clear()
-                model(images)
-
-                missing_layers = set(moe_layers) - set(active_capture)
-                if missing_layers:
-                    raise RuntimeError(
-                        "模型前向没有触发全部 MoE 层输入采集："
-                        f"{sorted(missing_layers)}。"
+        # DataLoader iterator creation may draw a base seed from the global
+        # CPU RNG even when shuffle=False and num_workers=0. Preserve the
+        # caller's CPU/CUDA RNG states around model inference and data loading.
+        rng_devices = (
+            [
+                target_device.index
+                if target_device.index is not None
+                else torch.cuda.current_device()
+            ]
+            if target_device.type == "cuda"
+            else []
+        )
+        with torch.random.fork_rng(devices=rng_devices):
+                for batch_index, batch in enumerate(data_loader):
+                    if max_batches is not None and batch_index >= max_batches:
+                        break
+    
+                    images = _extract_images_from_batch(batch).to(
+                        device=target_device,
+                        dtype=input_dtype,
+                        non_blocking=target_device.type == "cuda",
                     )
-
-                for layer_name in moe_layers:
-                    captured_batches[layer_name].append(
-                        active_capture[layer_name]
-                    )
-                num_batches += 1
-                num_images += int(images.shape[0])
+                    active_capture.clear()
+                    model(images)
+    
+                    missing_layers = set(moe_layers) - set(active_capture)
+                    if missing_layers:
+                        raise RuntimeError(
+                            "模型前向没有触发全部 MoE 层输入采集："
+                            f"{sorted(missing_layers)}。"
+                        )
+    
+                    for layer_name in moe_layers:
+                        captured_batches[layer_name].append(
+                            active_capture[layer_name]
+                        )
+                    num_batches += 1
+                    num_images += int(images.shape[0])
 
         if num_batches == 0:
             raise ValueError("诊断 DataLoader 没有提供任何 batch。")
