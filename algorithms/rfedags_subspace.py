@@ -2,8 +2,8 @@
 
 The first linear layer of every Switch expert is parameterized as W1 = A P^T.
 The P factors are optimized on Stiefel manifolds and aggregated with RFedAGS
-gradient streams. All remaining expert parameters use the base optimizer and
-client-uniform FedAvg. Non-expert parameters remain on base.py's fixed uniform
+gradient streams. Client A factors are aligned to the final global P gauge
+before uniform averaging; remaining expert parameters use client-uniform FedAvg. Non-expert parameters remain on base.py's fixed uniform
 aggregation path.
 """
 
@@ -724,8 +724,8 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
 
     @property
     def includes_expert_parameters_in_model_delta(self) -> bool:
-        # Euclidean expert parameters (A, fc2, bias) are FedAvg-aggregated
-        # from model_delta. P is ignored in model_delta and uses its stream.
+        # P uses the RFedAGS gradient stream. A is reconstructed from the
+        # raw local model delta, then gauge-aligned and averaged on the server.
         return True
 
     @property
@@ -986,7 +986,7 @@ class RFedAGSSubspaceClientStrategy(base.ExpertClientTrainingStrategy):
 
 
 class RFedAGSSubspaceExpertAggregator(base.Aggregator):
-    """RFedAGS for P plus client-uniform FedAvg for remaining expert state."""
+    """RFedAGS for P, gauge-aligned averaging for A, and FedAvg for other expert state."""
 
     @property
     def method_name(self) -> str:
@@ -1057,6 +1057,8 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
         strict: bool = True,
     ) -> base.AggregationResult:
         self._validate_client_updates(client_updates)
+        self._pending_factor_updates = {}
+        self._last_factor_gauge_diagnostics = {}
         model, groups = self._get_context_resources()
 
         configured_num_clients = int(_cfg_get(self.cfg, "num_clients", 0))
@@ -1448,6 +1450,7 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
             "_rfedags_subspace_reconstruction_errors",
             {},
         )
+        pairwise_overlaps = _collect_pairwise_overlap_metrics(model)
         return {
             "max_stiefel_orthogonality_error": max(errors) if errors else 0.0,
             "mean_stiefel_orthogonality_error": (
@@ -1474,9 +1477,9 @@ class RFedAGSSubspaceExpertAggregator(base.Aggregator):
                     sum(pair_values.values()) / len(pair_values)
                     if pair_values else 0.0
                 )
-                for layer_name, pair_values in _collect_pairwise_overlap_metrics(model).items()
+                for layer_name, pair_values in pairwise_overlaps.items()
             },
-            "global_subspace_pair_overlap_by_layer": _collect_pairwise_overlap_metrics(model),
+            "global_subspace_pair_overlap_by_layer": pairwise_overlaps,
             **self._last_factor_gauge_diagnostics,
         }
 
