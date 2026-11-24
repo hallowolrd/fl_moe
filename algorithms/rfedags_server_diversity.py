@@ -1079,6 +1079,7 @@ class RFedAGSServerDiversityExpertAggregator(base.Aggregator):
         )
         diagnostics.update(
             {
+                "aggregation_method": ALGORITHM_NAME,
                 "aggregation_rule": "client_uniform",
                 "client_participation": "all_clients",
                 "update_space": "stiefel_riemannian_gradient_stream_and_euclidean_delta",
