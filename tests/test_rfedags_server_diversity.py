@@ -325,6 +325,20 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             set(optimization_groups.expert_state_names)
             - set(dict(model.named_parameters()))
         )
+        parameter_map = dict(model.named_parameters())
+        stream_by_name = {}
+        for name in p_names:
+            parameter = parameter_map[name].detach()
+            ambient_direction = torch.randn_like(parameter)
+            tangent_direction = algorithm.subspace.stiefel_tangent_projection(
+                parameter,
+                ambient_direction,
+            )
+            self.assertGreater(
+                float(torch.linalg.norm(tangent_direction).item()),
+                0.0,
+            )
+            stream_by_name[name] = 1e-3 * tangent_direction
 
         client_updates = []
         for client_id, delta_value in ((0, 0.1), (1, 0.3)):
@@ -342,7 +356,8 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                     "version": algorithm.PAYLOAD_VERSION,
                     "local_steps": 4,
                     "gradient_stream": {
-                        name: torch.zeros_like(state[name])
+                        name: stream_by_name[name]
+                        * (0.5 if client_id == 0 else 1.5)
                         for name in p_names
                     },
                     "expert_buffers": {
@@ -374,13 +389,18 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             strict=True,
         )
         for name in p_names:
-            self.assertTrue(
+            self.assertFalse(
                 torch.allclose(
                     result.new_state_dict[name],
                     state[name],
-                    atol=1e-5,
-                )
+                    atol=1e-7,
+                ),
+                msg=f"RFedAGS 第一阶段没有应用非零梯度流：{name}",
             )
+        self.assertGreater(
+            result.diagnostics["mean_aggregated_stream_norm"],
+            0.0,
+        )
 
         self.assertNotIn("mean_diversity_loss", result.diagnostics)
         self.assertNotIn("lambda_div", result.diagnostics)
