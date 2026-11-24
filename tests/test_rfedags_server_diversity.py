@@ -26,7 +26,21 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         self.cfg = self._build_cfg(local_steps=4)
 
     @staticmethod
-    def _build_cfg(local_steps: int | None = 4, frac: float = 1.0):
+    def _build_cfg(
+        local_steps: int | None = 4,
+        frac: float = 1.0,
+        server_diversity_lr: float | None = 0.5,
+        tau_margin: float = 0.05,
+        threshold_cap: float = 0.95,
+    ):
+        method_config = {
+            "subspace_rank": 8,
+            "tau_margin": tau_margin,
+            "subspace_overlap_threshold_cap": threshold_cap,
+        }
+        if server_diversity_lr is not None:
+            method_config["server_diversity_lr"] = server_diversity_lr
+
         return base.load_embedded_config(
             algorithm.EMBEDDED_METHOD_CONFIG,
             method_defaults=algorithm.METHOD_CONFIG_DEFAULTS,
@@ -45,10 +59,7 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
                     "expert_hidden_dim": 32,
                     "moe_block_indices": [1, 2],
                 },
-                "method_config": {
-                    "subspace_rank": 8,
-                    "server_diversity_lr": 0.5,
-                },
+                "method_config": method_config,
             },
         )
 
@@ -64,6 +75,49 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             float(self.cfg.method_config.server_diversity_lr),
             0.5,
         )
+
+    def _build_server_aggregator(self, cfg, model):
+        param_groups = base.build_param_groups(
+            model=model,
+            expected_num_experts=4,
+            strict=True,
+        )
+        optimization_groups = base.build_federated_optimization_groups(
+            model=model,
+            param_groups=param_groups,
+            expected_num_experts=4,
+            strict=True,
+        )
+        method_context = base.MethodContext(
+            cfg=cfg,
+            device=torch.device("cpu"),
+            dataset_name="cifar10",
+            model_builder=algorithm.build_rfedags_server_diversity_model,
+            global_model=model,
+            param_groups=param_groups,
+            optimization_groups=optimization_groups,
+        )
+        aggregator = algorithm.RFedAGSServerDiversityExpertAggregator(cfg)
+        aggregator.set_method_context(method_context)
+        aggregator.initialize_model(model)
+        return param_groups, optimization_groups, aggregator
+
+    @staticmethod
+    def _set_overlapping_subspaces(model, angle: float) -> None:
+        records = model._rfedags_subspace_layer_records
+        parameter_map = dict(model.named_parameters())
+        basis = torch.eye(16)[:, :8]
+        rotated = basis.clone()
+        rotated[:, 0] = (
+            torch.cos(torch.tensor(angle)) * basis[:, 0]
+            + torch.sin(torch.tensor(angle)) * torch.eye(16)[:, 8]
+        )
+        with torch.no_grad():
+            for layer_records in records.values():
+                for expert_index, item in enumerate(layer_records):
+                    parameter_map[item["p_name"]].copy_(
+                        basis if expert_index < 3 else rotated
+                    )
 
     def test_model_builder_uses_shared_stiefel_parameterization(self) -> None:
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
@@ -91,6 +145,91 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
             model(torch.randn(2, 3, 32, 32))
         )
         self.assertEqual(tuple(output.logits.shape), (2, 10))
+
+    def test_server_thresholds_are_capped_strictly_below_one(self) -> None:
+        cfg = self._build_cfg(tau_margin=0.99, threshold_cap=0.95)
+        model = algorithm.build_rfedags_server_diversity_model(cfg)
+
+        self.assertTrue(model._rfedags_subspace_thresholds)
+        self.assertTrue(
+            all(
+                0.0 <= threshold <= 0.95
+                for threshold in model._rfedags_subspace_thresholds.values()
+            )
+        )
+        self.assertTrue(
+            all(
+                threshold < 1.0
+                for threshold in model._rfedags_subspace_thresholds.values()
+            )
+        )
+        self.assertTrue(
+            all(
+                abs(threshold - 0.95) < 1e-12
+                for threshold in model._rfedags_subspace_thresholds.values()
+            )
+        )
+
+    def test_threshold_cap_must_be_strictly_between_zero_and_one(self) -> None:
+        with self.assertRaisesRegex(ValueError, "threshold_cap"):
+            self._build_cfg(threshold_cap=1.0)
+        with self.assertRaisesRegex(ValueError, "threshold_cap"):
+            self._build_cfg(threshold_cap=0.0)
+
+    def test_default_server_diversity_lr_is_used(self) -> None:
+        cfg = self._build_cfg(server_diversity_lr=None)
+        self.assertAlmostEqual(
+            float(cfg.method_config.server_diversity_lr),
+            algorithm.SERVER_DIVERSITY_LR,
+        )
+
+        model = algorithm.build_rfedags_server_diversity_model(cfg)
+        self._set_overlapping_subspaces(model, angle=0.4)
+        _, _, aggregator = self._build_server_aggregator(cfg, model)
+        self.assertAlmostEqual(
+            aggregator.diversity_lr,
+            algorithm.SERVER_DIVERSITY_LR,
+        )
+
+        aggregator.after_aggregate(model)
+        diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+        self.assertTrue(diagnostics["server_diversity_applied"])
+        self.assertIsNone(diagnostics["server_diversity_skip_reason"])
+        self.assertGreater(
+            diagnostics["server_diversity_parameter_step_norm"],
+            0.0,
+        )
+
+    def test_exactly_identical_subspaces_report_zero_tangent_gradient(self) -> None:
+        model = algorithm.build_rfedags_server_diversity_model(self.cfg)
+        self._set_overlapping_subspaces(model, angle=0.0)
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+            if name.endswith(".P")
+        }
+        _, _, aggregator = self._build_server_aggregator(self.cfg, model)
+
+        aggregator.after_aggregate(model)
+        diagnostics = aggregator.build_post_aggregate_diagnostics(model)
+
+        self.assertGreater(diagnostics["server_diversity_loss_before"], 0.0)
+        self.assertLess(
+            diagnostics["server_diversity_gradient_norm"],
+            1e-6,
+        )
+        self.assertFalse(diagnostics["server_diversity_applied"])
+        self.assertEqual(
+            diagnostics["server_diversity_skip_reason"],
+            "zero_riemannian_gradient",
+        )
+        self.assertEqual(
+            diagnostics["server_diversity_parameter_step_norm"],
+            0.0,
+        )
+        for name, parameter in model.named_parameters():
+            if name in before:
+                self.assertTrue(torch.equal(parameter, before[name]))
 
     def test_client_training_does_not_compute_diversity_loss(self) -> None:
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
@@ -166,48 +305,12 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
     def test_server_correction_runs_after_rfedags_aggregation(self) -> None:
         model = algorithm.build_rfedags_server_diversity_model(self.cfg)
         records = model._rfedags_subspace_layer_records
-        parameter_map = dict(model.named_parameters())
-        basis = torch.eye(16)[:, :8]
-        rotated = basis.clone()
-        angle = 0.1
-        rotated[:, 0] = (
-            torch.cos(torch.tensor(angle)) * basis[:, 0]
-            + torch.sin(torch.tensor(angle)) * torch.eye(16)[:, 8]
-        )
-
-        # Make each layer's experts highly overlapping while keeping every P
-        # on the Stiefel manifold. The thresholds remain those calibrated at
-        # model initialization.
-        with torch.no_grad():
-            for layer_records in records.values():
-                for expert_index, item in enumerate(layer_records):
-                    parameter = parameter_map[item["p_name"]]
-                    parameter.copy_(basis if expert_index < 3 else rotated)
+        self._set_overlapping_subspaces(model, angle=0.1)
 
         state = base.clone_state_dict(model.state_dict())
-        param_groups = base.build_param_groups(
-            model=model,
-            expected_num_experts=4,
-            strict=True,
+        param_groups, optimization_groups, aggregator = (
+            self._build_server_aggregator(self.cfg, model)
         )
-        optimization_groups = base.build_federated_optimization_groups(
-            model=model,
-            param_groups=param_groups,
-            expected_num_experts=4,
-            strict=True,
-        )
-        method_context = base.MethodContext(
-            cfg=self.cfg,
-            device=torch.device("cpu"),
-            dataset_name="cifar10",
-            model_builder=algorithm.build_rfedags_server_diversity_model,
-            global_model=model,
-            param_groups=param_groups,
-            optimization_groups=optimization_groups,
-        )
-        aggregator = algorithm.RFedAGSServerDiversityExpertAggregator(self.cfg)
-        aggregator.set_method_context(method_context)
-        aggregator.initialize_model(model)
 
         p_names = {
             item["p_name"]
@@ -352,6 +455,11 @@ class RFedAGSServerDiversityTests(unittest.TestCase):
         )
 
         self.assertTrue(diagnostics["server_diversity_applied"])
+        self.assertIsNone(diagnostics["server_diversity_skip_reason"])
+        self.assertLess(
+            diagnostics["server_diversity_threshold_cap"],
+            1.0,
+        )
         self.assertGreater(
             diagnostics["server_diversity_loss_before"],
             diagnostics["server_diversity_loss_after"],
