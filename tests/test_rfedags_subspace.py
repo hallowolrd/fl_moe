@@ -54,6 +54,20 @@ class RFedAGSSubspaceTests(unittest.TestCase):
             },
         )
 
+    def test_scheme_one_is_independent_from_scheme_two(self) -> None:
+        self.assertEqual(algorithm.PAYLOAD_KEY, algorithm.ALGORITHM_NAME)
+        self.assertIs(
+            algorithm.RFedAGSSubspaceClientStrategy.__bases__[0],
+            base.ExpertClientTrainingStrategy,
+        )
+        self.assertIs(
+            algorithm.RFedAGSSubspaceExpertAggregator.__bases__[0],
+            base.Aggregator,
+        )
+        source = Path(algorithm.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("rfedags_server_diversity", source)
+        self.assertNotIn("server_diversity.", source)
+
     def test_fixed_local_steps_are_required(self) -> None:
         with self.assertRaisesRegex(ValueError, "local_steps"):
             self._build_cfg(local_steps=None)
