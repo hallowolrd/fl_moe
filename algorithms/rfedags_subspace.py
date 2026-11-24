@@ -385,7 +385,9 @@ def compute_subspace_diversity_loss(
                 right = parameter_map[right_name]
                 overlap = _pairwise_subspace_overlap(left, right)
                 penalties.append(torch.relu(overlap - threshold).square())
-                overlaps_by_layer.setdefault(layer_name, []).append(overlap.detach())
+                overlaps_by_layer.setdefault(layer_name, []).append(
+                    overlap.detach().clamp(min=0.0, max=1.0)
+                )
 
     if not penalties:
         raise ValueError("子空间差异性损失没有可计算的专家配对。")
