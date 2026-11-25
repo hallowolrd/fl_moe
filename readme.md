@@ -5,13 +5,15 @@
 ## 环境与启动
 
 ```bash
+tmux new -s m
+tmux attach -t m
+cd /home/cjq/Project/fl_moe
 conda activate fl_moe
 ```
 
 普通客户端等权 FedAvg 基线：
 
 ```bash
-
 CUDA_VISIBLE_DEVICES=1 python algorithms/uniform.py \
     --dataset cifar10 \
     --num-clients 5 \
