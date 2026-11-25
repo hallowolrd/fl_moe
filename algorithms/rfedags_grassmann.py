@@ -99,8 +99,16 @@ def _finite_real(value: Any, name: str) -> float:
     return result
 
 
-def validate_method_config(method_config: Mapping[str, Any]) -> None:
-    """Validate RFedAGS-Grassmann-specific hyperparameters."""
+def validate_method_config(config: Mapping[str, Any]) -> None:
+    """Validate RFedAGS-Grassmann settings from the complete resolved config.
+
+    base.load_config() and base.load_embedded_config() pass the complete
+    configuration mapping to method_validator. Direct callers may also pass
+    the method_config mapping itself, which is supported for unit testing.
+    """
+    if not isinstance(config, Mapping):
+        raise ValueError("配置必须是 Mapping。")
+    method_config = config.get("method_config", config)
     if not isinstance(method_config, Mapping):
         raise ValueError("method_config 必须是 Mapping。")
 
@@ -136,7 +144,6 @@ def validate_method_config(method_config: Mapping[str, Any]) -> None:
     )
     if server_lr <= 0.0:
         raise ValueError("method_config.server_lr 必须大于 0。")
-
 
 def _validate_runtime_config(cfg: Any) -> Dict[str, Any]:
     """Validate the RFedAGS assumptions and return resolved scalar settings."""
