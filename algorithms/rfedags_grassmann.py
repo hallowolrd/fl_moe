@@ -29,11 +29,13 @@ PAYLOAD_VERSION = 1
 ORTHOGONALITY_TOLERANCE = 5e-4
 
 METHOD_CONFIG_DEFAULTS = {
-    # GrMoE reference defaults for its geometric regularizer.
-    "lambda_div": 0.01,
-    "rho0": 0.3,
-    # RFedAGS global step size (varpi).
-    "server_lr": 1.0,
+    "method_config": {
+        # GrMoE reference defaults for its geometric regularizer.
+        "lambda_div": 0.01,
+        "rho0": 0.3,
+        # RFedAGS global step size (varpi).
+        "server_lr": 1.0,
+    },
 }
 
 EMBEDDED_METHOD_CONFIG = {
@@ -116,7 +118,7 @@ def validate_method_config(config: Mapping[str, Any]) -> None:
         _read_mapping_value(
             method_config,
             "lambda_div",
-            METHOD_CONFIG_DEFAULTS["lambda_div"],
+            METHOD_CONFIG_DEFAULTS["method_config"]["lambda_div"],
         ),
         "method_config.lambda_div",
     )
@@ -127,7 +129,7 @@ def validate_method_config(config: Mapping[str, Any]) -> None:
         _read_mapping_value(
             method_config,
             "rho0",
-            METHOD_CONFIG_DEFAULTS["rho0"],
+            METHOD_CONFIG_DEFAULTS["method_config"]["rho0"],
         ),
         "method_config.rho0",
     )
@@ -138,7 +140,7 @@ def validate_method_config(config: Mapping[str, Any]) -> None:
         _read_mapping_value(
             method_config,
             "server_lr",
-            METHOD_CONFIG_DEFAULTS["server_lr"],
+            METHOD_CONFIG_DEFAULTS["method_config"]["server_lr"],
         ),
         "method_config.server_lr",
     )
@@ -227,7 +229,7 @@ def _validate_runtime_config(cfg: Any) -> Dict[str, Any]:
         _read_mapping_value(
             method_config,
             "lambda_div",
-            METHOD_CONFIG_DEFAULTS["lambda_div"],
+            METHOD_CONFIG_DEFAULTS["method_config"]["lambda_div"],
         ),
         "method_config.lambda_div",
     )
@@ -235,7 +237,7 @@ def _validate_runtime_config(cfg: Any) -> Dict[str, Any]:
         _read_mapping_value(
             method_config,
             "rho0",
-            METHOD_CONFIG_DEFAULTS["rho0"],
+            METHOD_CONFIG_DEFAULTS["method_config"]["rho0"],
         ),
         "method_config.rho0",
     )
@@ -243,7 +245,7 @@ def _validate_runtime_config(cfg: Any) -> Dict[str, Any]:
         _read_mapping_value(
             method_config,
             "server_lr",
-            METHOD_CONFIG_DEFAULTS["server_lr"],
+            METHOD_CONFIG_DEFAULTS["method_config"]["server_lr"],
         ),
         "method_config.server_lr",
     )
