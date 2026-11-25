@@ -183,6 +183,8 @@ class RFedAGSGrassmannTests(unittest.TestCase):
             algorithm.validate_method_config({"lambda_div": -0.1})
         with self.assertRaisesRegex(ValueError, "server_lr"):
             algorithm.validate_method_config({"server_lr": 0.0})
+        with self.assertRaisesRegex(ValueError, "rho0"):
+            build_cfg(method_config={"rho0": 1.0})
 
         with self.assertRaisesRegex(ValueError, "local_steps"):
             algorithm._validate_runtime_config(build_cfg(local_steps=None))
