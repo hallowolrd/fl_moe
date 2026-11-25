@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import os
 import sys
 import unittest
 from pathlib import Path
-
-os.environ.setdefault("PYTHONHASHSEED", "0")
 
 ROOT = Path(__file__).resolve().parents[1]
 ALGORITHMS_DIR = ROOT / "algorithms"
