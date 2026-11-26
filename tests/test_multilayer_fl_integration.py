@@ -27,7 +27,6 @@ from torch.utils.data import (
     TensorDataset,
 )  # noqa: E402
 import uniform  # noqa: E402
-import rfedags  # noqa: E402
 
 
 MOE_LAYER_NAMES = ("blocks.0.moe", "blocks.1.moe")
@@ -272,7 +271,6 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
         self,
         algorithm_module: Any,
         *,
-        expects_payload: bool,
         cfg_override: dict[str, Any] | None = None,
         global_model_override: nn.Module | None = None,
         expected_moe_layer_names: tuple[str, ...] = MOE_LAYER_NAMES,
@@ -359,22 +357,12 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
         expected_all_names = set(server.param_groups.all)
 
         for update in updates:
-            if expects_payload:
-                self.assertEqual(set(update.model_delta), expected_non_expert_names)
-                payload = update.algorithm_payload["rfedags"]
-                self.assertEqual(payload["version"], rfedags.PAYLOAD_VERSION)
-                self.assertEqual(set(payload["expert_stream"]), expected_expert_parameter_names)
-                self.assertEqual(set(payload["expert_buffers"]), expected_expert_buffer_names)
-            else:
-                self.assertEqual(set(update.model_delta), expected_all_names)
-                self.assertEqual(update.algorithm_payload, {})
+            self.assertEqual(set(update.model_delta), expected_all_names)
+            self.assertEqual(update.algorithm_payload, {})
 
         aggregation_info = server.aggregate_client_updates(updates)
         diagnostics = aggregation_info["expert"]["diagnostics"]
         self.assertNotIn("manifold_diagnostics", diagnostics)
-        if expects_payload:
-            self.assertEqual(diagnostics["update_space"], "euclidean")
-            self.assertEqual(diagnostics["local_steps"], 1)
 
         round_result = server.build_round_result(
             round_id=1,
@@ -641,45 +629,16 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
 
 
     def test_uniform_client_server_support_two_moe_layers(self) -> None:
-        self._run_one_round(
-            uniform,
-            expects_payload=False,
-        )
-
-    def test_rfedags_client_server_support_two_moe_layers(self) -> None:
-        self._run_one_round(
-            rfedags,
-            expects_payload=True,
-        )
+        self._run_one_round(uniform)
 
     def test_uniform_client_server_support_switch_module_dict(self) -> None:
         self._run_one_round(
             uniform,
-            expects_payload=False,
             cfg_override=make_switch_cfg(),
             global_model_override=TinySwitchTwoLayerMoEClassifier(),
             expected_moe_layer_names=SWITCH_MOE_LAYER_NAMES,
             expects_runtime_stats=True,
         )
-
-    def test_rfedags_client_server_support_switch_module_dict(self) -> None:
-        self._run_one_round(
-            rfedags,
-            expects_payload=True,
-            cfg_override=make_switch_cfg(),
-            global_model_override=TinySwitchTwoLayerMoEClassifier(),
-            expected_moe_layer_names=SWITCH_MOE_LAYER_NAMES,
-            expects_runtime_stats=True,
-        )
-
-    def test_euclidean_rfedags_matches_uniform_fedavg(self) -> None:
-        uniform_state = self._run_one_round(uniform, expects_payload=False)
-        rfedags_state = self._run_one_round(rfedags, expects_payload=True)
-        self.assertEqual(set(uniform_state), set(rfedags_state))
-        for name in uniform_state:
-            torch.testing.assert_close(
-                rfedags_state[name], uniform_state[name], rtol=1e-5, atol=1e-7
-            )
 
     def test_build_server_uses_injected_model_builder(self) -> None:
         cfg = make_cfg()
