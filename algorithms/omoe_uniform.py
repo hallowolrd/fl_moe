@@ -15,7 +15,7 @@ from __future__ import annotations
 # Import base before torch so deterministic CUDA environment setup happens first.
 import base
 
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -163,7 +163,7 @@ class OMoESwitchMoE(base.SwitchMoE):
     def forward(
         self,
         inputs: torch.Tensor,
-    ):
+    ) -> Tuple[torch.Tensor, Dict[str, Any], Optional[torch.Tensor]]:
         if inputs.ndim != 3:
             raise ValueError(
                 "SwitchMoE 输入必须是 [batch, tokens, hidden_dim]，"
