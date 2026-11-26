@@ -1,10 +1,10 @@
 """OMoE-inspired Top-1 expert-output orthogonalization with uniform aggregation.
 
 Each MoE token is evaluated by every expert. Their output vectors are
-orthogonalized per token with modified Gram-Schmidt, placing the actually
-selected expert last in the orthogonalization order. The original Top-1
-router, capacity handling, auxiliary loss, and uniform federated aggregation
-remain unchanged.
+orthogonalized per token with a regularized, two-pass modified Gram-Schmidt
+procedure, placing the actually selected expert last in the orthogonalization
+order. The original Top-1 router, capacity handling, auxiliary loss, and
+uniform federated aggregation remain unchanged.
 
 This module injects the forward behavior through base.ModelBuilder and the
 expert aggregation policy through base.Aggregator. It does not modify base.py.
@@ -21,6 +21,15 @@ import torch
 
 
 ALGORITHM_NAME = "omoe_uniform"
+
+# Relative Tikhonov regularization used by the orthogonalization. The scale
+# floor avoids an excessively large derivative when an expert output itself
+# has a very small norm. With this value, the normalization denominator is
+# never smaller than 5e-3 in FP32.
+GS_RELATIVE_EPS = 5e-3
+GS_PROJECTION_EPS_FP32 = 1e-12
+GS_PROJECTION_EPS_FP64 = 1e-24
+
 Aggregator = base.Aggregator
 ClientUpdate = base.ClientUpdate
 build_uniform_weights = base.build_uniform_weights
@@ -37,33 +46,51 @@ EMBEDDED_METHOD_CONFIG = {
 def _gram_schmidt_expert_outputs(
     expert_outputs: torch.Tensor,
     selected_experts: torch.Tensor,
-) -> torch.Tensor:
-    """Orthogonalize per-token expert outputs, with the selected expert last.
+    *,
+    return_diagnostics: bool = False,
+) -> (
+    torch.Tensor
+    | Tuple[torch.Tensor, Dict[str, Any]]
+):
+    """Orthogonalize per-token expert outputs with regularized MGS.
 
     Args:
         expert_outputs:
             Tensor with shape [num_tokens, num_experts, hidden_dim].
         selected_experts:
-            Actual dispatched expert ID for each token, shape [num_tokens].
+            Actually dispatched expert ID for each token, shape [num_tokens].
+        return_diagnostics:
+            If True, also return additive residual and regularization statistics.
 
     Returns:
-        Orthogonalized expert outputs with the same shape and dtype.
+        By default, the orthogonalized tensor with the same shape, device, and
+        dtype as expert_outputs. When return_diagnostics=True, returns a pair
+        containing that tensor and additive scalar diagnostics.
 
     The per-token order is deterministic: unselected experts retain their
     ascending expert-ID order, and the selected expert is processed last.
-    Modified Gram-Schmidt is evaluated in FP32 (or FP64 for FP64 inputs).
-    Each non-degenerate residual is normalized, so the resulting columns
-    satisfy the Stiefel orthonormality constraint up to floating-point error.
+    Modified Gram-Schmidt uses two re-orthogonalization passes in FP32 (or
+    FP64 for FP64 inputs).
 
-    If an expert output is linearly dependent on the preceding outputs, its
-    residual is set to zero instead of dividing by a near-zero norm. This is
-    numerically safe, but means a rank-deficient token does not produce a
-    complete orthonormal frame.
+    Projection uses a Tikhonov-regularized denominator. Normalization uses
+    sqrt(residual_norm**2 + regularizer**2), rather than a hard clamp or a
+    zero-producing torch.where branch. This keeps gradients finite near
+    rank-deficient inputs. Well-conditioned outputs are approximately
+    orthonormal; nearly dependent residuals are smoothly attenuated and
+    therefore are not forced to have unit norm. Exact Stiefel orthonormality
+    cannot be guaranteed when the input expert vectors are rank deficient.
     """
+    if not torch.is_tensor(expert_outputs):
+        raise TypeError("expert_outputs 必须是 Tensor。")
     if expert_outputs.ndim != 3:
         raise ValueError(
             "expert_outputs 必须具有 [num_tokens, num_experts, hidden_dim] "
             f"形状，当前 shape={tuple(expert_outputs.shape)}。"
+        )
+    if not expert_outputs.is_floating_point():
+        raise TypeError(
+            "expert_outputs 必须是浮点 Tensor，"
+            f"当前 dtype={expert_outputs.dtype}。"
         )
 
     num_tokens, num_experts, hidden_dim = expert_outputs.shape
@@ -74,9 +101,12 @@ def _gram_schmidt_expert_outputs(
         )
     if num_experts > hidden_dim:
         raise ValueError(
-            "Stiefel 正交化要求 num_experts <= hidden_dim，"
+            "正交化要求 num_experts <= hidden_dim，"
             f"当前 num_experts={num_experts}, hidden_dim={hidden_dim}。"
         )
+
+    if not torch.is_tensor(selected_experts):
+        raise TypeError("selected_experts 必须是 Tensor。")
     if selected_experts.ndim != 1 or selected_experts.shape[0] != num_tokens:
         raise ValueError(
             "selected_experts 必须具有 [num_tokens] 形状，"
@@ -87,6 +117,20 @@ def _gram_schmidt_expert_outputs(
             "selected_experts 必须是 torch.long，"
             f"当前 dtype={selected_experts.dtype}。"
         )
+    if selected_experts.device != expert_outputs.device:
+        raise ValueError(
+            "selected_experts 与 expert_outputs 必须位于同一设备。"
+        )
+    if bool(
+        (
+            (selected_experts < 0)
+            | (selected_experts >= num_experts)
+        ).any().item()
+    ):
+        raise ValueError(
+            f"selected_experts 的取值必须位于 [0, {num_experts - 1}]。"
+        )
+
     output_dtype = expert_outputs.dtype
     work_dtype = (
         torch.float64
@@ -113,23 +157,66 @@ def _gram_schmidt_expert_outputs(
         index=order.unsqueeze(-1).expand(-1, -1, hidden_dim),
     )
 
-    eps = 1e-8 if work_dtype == torch.float32 else 1e-12
+    projection_eps = (
+        GS_PROJECTION_EPS_FP64
+        if work_dtype == torch.float64
+        else GS_PROJECTION_EPS_FP32
+    )
+
+    # Store the unnormalized residual directions and their scale-aware
+    # regularizers. Using the raw residual in the regularized projection
+    # avoids dividing by the squared norm of a nearly-zero normalized vector.
+    basis_residuals = []
+    basis_regularizers = []
     orthogonal_basis = []
 
-    for expert_position in range(num_experts):
-        residual = ordered_outputs[:, expert_position, :]
+    if return_diagnostics:
+        residual_norm_sum = torch.zeros(
+            (),
+            device=expert_outputs.device,
+            dtype=work_dtype,
+        )
+        relative_residual_norm_sum = torch.zeros_like(residual_norm_sum)
+        regularized_vector_count = torch.zeros(
+            (),
+            device=expert_outputs.device,
+            dtype=torch.long,
+        )
 
-        # Modified Gram-Schmidt with a second pass to reduce accumulated
-        # floating-point loss of orthogonality.
-        if orthogonal_basis:
-            for _ in range(2):
-                for previous_vector in orthogonal_basis:
-                    projection = torch.sum(
-                        previous_vector * residual,
+    for expert_position in range(num_experts):
+        raw_vector = ordered_outputs[:, expert_position, :]
+        residual = raw_vector
+
+        # Use a detached reference scale: the regularization level is a
+        # numerical safeguard, not an additional gradient path.
+        reference_norm = torch.linalg.vector_norm(
+            raw_vector.detach(),
+            ord=2,
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1.0)
+        regularizer = GS_RELATIVE_EPS * reference_norm
+
+        # Two-pass regularized modified Gram-Schmidt. For well-conditioned
+        # basis vectors, the regularized projection approaches the ordinary
+        # orthogonal projection. For near-zero basis vectors, its influence
+        # smoothly vanishes instead of amplifying round-off and gradients.
+        for _ in range(2):
+            for previous_residual, previous_regularizer in zip(
+                basis_residuals,
+                basis_regularizers,
+            ):
+                denominator = (
+                    previous_residual.square().sum(
                         dim=-1,
                         keepdim=True,
                     )
-                    residual = residual - projection * previous_vector
+                    + previous_regularizer.square()
+                ).clamp_min(projection_eps)
+                coefficient = (
+                    previous_residual * residual
+                ).sum(dim=-1, keepdim=True) / denominator
+                residual = residual - coefficient * previous_residual
 
         residual_norm = torch.linalg.vector_norm(
             residual,
@@ -137,14 +224,33 @@ def _gram_schmidt_expert_outputs(
             dim=-1,
             keepdim=True,
         )
-        valid = residual_norm > eps
-        normalized = residual / residual_norm.clamp_min(eps)
-        normalized = torch.where(
-            valid,
-            normalized,
-            torch.zeros_like(normalized),
+
+        # Smooth normalization: no discontinuous zeroing branch and no
+        # unbounded 1 / residual_norm derivative near rank deficiency.
+        normalized = residual / torch.sqrt(
+            residual_norm.square() + regularizer.square()
         )
+
+        basis_residuals.append(residual)
+        basis_regularizers.append(regularizer)
         orthogonal_basis.append(normalized)
+
+        if return_diagnostics:
+            detached_residual_norm = residual_norm.detach()
+            residual_norm_sum = (
+                residual_norm_sum + detached_residual_norm.sum()
+            )
+            relative_residual_norm_sum = (
+                relative_residual_norm_sum
+                + (
+                    detached_residual_norm
+                    / reference_norm
+                ).sum()
+            )
+            regularized_vector_count = (
+                regularized_vector_count
+                + (detached_residual_norm <= regularizer).sum()
+            )
 
     orthogonalized_ordered = torch.stack(orthogonal_basis, dim=1)
 
@@ -153,8 +259,20 @@ def _gram_schmidt_expert_outputs(
     orthogonalized = orthogonalized_ordered.gather(
         dim=1,
         index=inverse_order.unsqueeze(-1).expand(-1, -1, hidden_dim),
-    )
-    return orthogonalized.to(dtype=output_dtype)
+    ).to(dtype=output_dtype)
+
+    if not return_diagnostics:
+        return orthogonalized
+
+    diagnostics = {
+        "orthogonalization_residual_norm_sum": residual_norm_sum,
+        "orthogonalization_relative_residual_norm_sum": (
+            relative_residual_norm_sum
+        ),
+        "orthogonalization_regularized_vectors": regularized_vector_count,
+        "orthogonalization_vector_count": num_tokens * num_experts,
+    }
+    return orthogonalized, diagnostics
 
 
 class OMoESwitchMoE(base.SwitchMoE):
@@ -215,6 +333,11 @@ class OMoESwitchMoE(base.SwitchMoE):
                 "OMoE 输出正交化至少需要两个专家，"
                 f"当前 num_experts={self.num_experts}。"
             )
+        if self.num_experts > hidden_dim:
+            raise ValueError(
+                "OMoE 输出正交化要求 num_experts <= hidden_dim，"
+                f"当前 num_experts={self.num_experts}, hidden_dim={hidden_dim}。"
+            )
 
         # Deliberately evaluate every expert for every token. This is the
         # additional dense expert-compute cost required by this Top-1 variant.
@@ -231,10 +354,19 @@ class OMoESwitchMoE(base.SwitchMoE):
             assigned_experts,
             top1_experts,
         )
-        orthogonalized_outputs = _gram_schmidt_expert_outputs(
+        orthogonalization_result = _gram_schmidt_expert_outputs(
             expert_outputs=all_expert_outputs,
             selected_experts=selected_for_orthogonalization,
+            return_diagnostics=self.collect_router_statistics,
         )
+        if self.collect_router_statistics:
+            (
+                orthogonalized_outputs,
+                orthogonalization_diagnostics,
+            ) = orthogonalization_result
+        else:
+            orthogonalized_outputs = orthogonalization_result
+            orthogonalization_diagnostics = {}
 
         # The router still dispatches exactly one expert per accepted token.
         # The selected orthogonalized vector is multiplied by the same router
@@ -285,6 +417,7 @@ class OMoESwitchMoE(base.SwitchMoE):
                     minlength=self.num_experts,
                 ),
                 "dropped_tokens": int(dropped_mask.sum().item()),
+                **orthogonalization_diagnostics,
             }
             if capacity is not None:
                 stats["overflow_tokens_per_expert"] = (
@@ -298,16 +431,19 @@ class OMoESwitchMoE(base.SwitchMoE):
         return outputs, stats, aux_loss
 
 
-def build_omoe_switch_vit_model(cfg: Any) -> torch.nn.Module:
-    """Build the standard SwitchViT and inject OMoE behavior into MoE blocks.
+def _inject_omoe_forward(model: torch.nn.Module) -> torch.nn.Module:
+    """Replace only existing SwitchMoE forward implementations in-place.
 
-    The module tree and parameter names remain unchanged. Only the forward
-    implementation of each existing SwitchMoE instance is specialized.
+    OMoESwitchMoE adds no parameters or buffers. Module identities, parameter
+    identities, state_dict keys, and federated parameter groups therefore
+    remain unchanged.
     """
-    model = base.build_switch_vit_model(cfg)
-    converted_layers = 0
+    blocks = getattr(model, "blocks", None)
+    if blocks is None:
+        raise TypeError("OMoE 模型必须具有 blocks 属性。")
 
-    for block_index, block in enumerate(model.blocks, start=1):
+    converted_layers = 0
+    for block_index, block in enumerate(blocks, start=1):
         if not getattr(block, "use_moe", False):
             continue
 
@@ -318,10 +454,8 @@ def build_omoe_switch_vit_model(cfg: Any) -> torch.nn.Module:
                 f"当前类型：{type(moe_module).__name__}。"
             )
 
-        # The subclass adds no parameters or buffers, so state_dict keys,
-        # optimizer parameter identities, and federated parameter groups stay
-        # exactly the same as the original SwitchMoE model.
-        moe_module.__class__ = OMoESwitchMoE
+        if not isinstance(moe_module, OMoESwitchMoE):
+            moe_module.__class__ = OMoESwitchMoE
         converted_layers += 1
 
     if converted_layers == 0:
@@ -330,6 +464,12 @@ def build_omoe_switch_vit_model(cfg: Any) -> torch.nn.Module:
         )
 
     return model
+
+
+def build_omoe_switch_vit_model(cfg: Any) -> torch.nn.Module:
+    """Build SwitchViT and inject OMoE behavior into its existing MoE blocks."""
+    model = base.build_switch_vit_model(cfg)
+    return _inject_omoe_forward(model)
 
 
 class OMoEUniformExpertAggregator(Aggregator):
