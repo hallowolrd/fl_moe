@@ -121,7 +121,11 @@ def _gram_schmidt_expert_outputs(
         raise ValueError(
             "selected_experts 与 expert_outputs 必须位于同一设备。"
         )
-    if bool(
+    # The production caller receives IDs directly from torch.max in the
+    # router, so they are guaranteed to be in range. Keep the defensive
+    # value check for CPU-side direct calls without forcing a CUDA sync on
+    # every training forward.
+    if selected_experts.device.type == "cpu" and bool(
         (
             (selected_experts < 0)
             | (selected_experts >= num_experts)
