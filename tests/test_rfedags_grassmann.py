@@ -173,6 +173,58 @@ class RFedAGSGrassmannTests(unittest.TestCase):
         self.assertIsNotNone(basis_a.grad)
         self.assertTrue(torch.isfinite(basis_a.grad).all())
 
+    def test_overlap_regularizer_is_rank_normalized(self) -> None:
+        eye4 = torch.eye(4)
+        rank_one_a = eye4[:, :1]
+        rank_one_b = (rank_one_a + eye4[:, 1:2]) / (2.0 ** 0.5)
+
+        eye8 = torch.eye(8)
+        rank_two_a = eye8[:, :2]
+        rank_two_b = (rank_two_a + eye8[:, 2:4]) / (2.0 ** 0.5)
+
+        rank_one_loss, rank_one_metrics = algorithm.compute_subspace_overlap_loss(
+            {"layer": (rank_one_a, rank_one_b)},
+            rho0=0.25,
+        )
+        rank_two_loss, rank_two_metrics = algorithm.compute_subspace_overlap_loss(
+            {"layer": (rank_two_a, rank_two_b)},
+            rho0=0.25,
+        )
+
+        torch.testing.assert_close(rank_one_loss, torch.tensor(0.25))
+        torch.testing.assert_close(rank_two_loss, torch.tensor(0.25))
+        self.assertAlmostEqual(
+            rank_one_metrics["mean_normalized_overlap"],
+            rank_two_metrics["mean_normalized_overlap"],
+        )
+
+    def test_overlap_regularizer_is_layer_balanced_and_reports_active_ratio(self) -> None:
+        eye = torch.eye(8)
+        basis_a = eye[:, :2]
+        basis_b = (basis_a + eye[:, 2:4]) / (2.0 ** 0.5)
+        basis_c = eye[:, 4:6]
+
+        loss, metrics = algorithm.compute_subspace_overlap_loss(
+            {
+                "one_pair_layer": (basis_a, basis_b),
+                "three_pair_layer": (basis_a, basis_b, basis_c),
+            },
+            rho0=0.25,
+        )
+
+        # Layer losses are 0.25 and (0.25 + 0 + 0) / 3.
+        # The final loss averages the two layer means.
+        torch.testing.assert_close(loss, torch.tensor(1.0 / 6.0))
+        self.assertAlmostEqual(metrics["active_overlap_ratio"], 0.5)
+        self.assertEqual(metrics["num_active_pairs"], 2)
+        self.assertEqual(metrics["num_pairs"], 4)
+        self.assertAlmostEqual(metrics["mean_normalized_overlap"], 1.0 / 3.0)
+
+    def test_default_overlap_regularization_hyperparameters(self) -> None:
+        self.assertAlmostEqual(self.cfg.method_config.lambda_div, 5.0)
+        self.assertAlmostEqual(self.cfg.method_config.rho0, 0.24)
+        self.assertAlmostEqual(self.cfg.method_config.server_lr, 1.0)
+
     def test_method_and_runtime_config_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "rho0"):
             algorithm.validate_method_config({"rho0": 1.0})
@@ -305,6 +357,15 @@ class RFedAGSGrassmannTests(unittest.TestCase):
             payload["diagnostics"]["max_orthogonality_error"],
             algorithm.ORTHOGONALITY_TOLERANCE,
         )
+        self.assertGreaterEqual(
+            payload["diagnostics"]["avg_active_overlap_ratio"],
+            0.0,
+        )
+        self.assertLessEqual(
+            payload["diagnostics"]["avg_active_overlap_ratio"],
+            1.0,
+        )
+        self.assertEqual(payload["diagnostics"]["final_num_pairs"], 3)
 
     def test_base_local_training_hook_emits_rfedags_gradient_stream(self) -> None:
         cfg = build_cfg(local_steps=2)
@@ -394,6 +455,7 @@ class RFedAGSGrassmannTests(unittest.TestCase):
                         "diagnostics": {
                             "avg_diversity_loss": 0.2 + client_id * 0.1,
                             "avg_normalized_overlap": 0.3 + client_id * 0.1,
+                            "avg_active_overlap_ratio": 0.5 + client_id * 0.1,
                             "max_normalized_overlap": 0.4 + client_id * 0.1,
                             "avg_projection_distance": 1.0,
                             "max_orthogonality_error": 1e-6,
@@ -446,6 +508,10 @@ class RFedAGSGrassmannTests(unittest.TestCase):
         self.assertAlmostEqual(
             result.diagnostics["mean_client_diversity_loss"],
             0.25,
+        )
+        self.assertAlmostEqual(
+            result.diagnostics["mean_client_active_overlap_ratio"],
+            0.55,
         )
 
     def test_aggregator_rejects_incomplete_gradient_stream_payload(self) -> None:
