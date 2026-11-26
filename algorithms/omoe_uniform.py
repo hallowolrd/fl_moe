@@ -26,7 +26,8 @@ ALGORITHM_NAME = "omoe_uniform"
 # floor avoids an excessively large derivative when an expert output itself
 # has a very small norm. With this value, the normalization denominator is
 # never smaller than 5e-3 in FP32.
-GS_RELATIVE_EPS = 5e-3
+GS_NORMALIZATION_RELATIVE_EPS = 5e-3
+GS_PROJECTION_RELATIVE_EPS = 1e-4
 GS_PROJECTION_EPS_FP32 = 1e-12
 GS_PROJECTION_EPS_FP64 = 1e-24
 
@@ -171,7 +172,7 @@ def _gram_schmidt_expert_outputs(
     # regularizers. Using the raw residual in the regularized projection
     # avoids dividing by the squared norm of a nearly-zero normalized vector.
     basis_residuals = []
-    basis_regularizers = []
+    basis_projection_regularizers = []
     orthogonal_basis = []
 
     if return_diagnostics:
@@ -199,7 +200,12 @@ def _gram_schmidt_expert_outputs(
             dim=-1,
             keepdim=True,
         ).clamp_min(1.0)
-        regularizer = GS_RELATIVE_EPS * reference_norm
+        normalization_regularizer = (
+            GS_NORMALIZATION_RELATIVE_EPS * reference_norm
+        )
+        projection_regularizer = (
+            GS_PROJECTION_RELATIVE_EPS * reference_norm
+        )
 
         # Two-pass regularized modified Gram-Schmidt. For well-conditioned
         # basis vectors, the regularized projection approaches the ordinary
@@ -208,7 +214,7 @@ def _gram_schmidt_expert_outputs(
         for _ in range(2):
             for previous_residual, previous_regularizer in zip(
                 basis_residuals,
-                basis_regularizers,
+                basis_projection_regularizers,
             ):
                 denominator = (
                     previous_residual.square().sum(
@@ -232,11 +238,11 @@ def _gram_schmidt_expert_outputs(
         # Smooth normalization: no discontinuous zeroing branch and no
         # unbounded 1 / residual_norm derivative near rank deficiency.
         normalized = residual / torch.sqrt(
-            residual_norm.square() + regularizer.square()
+            residual_norm.square() + normalization_regularizer.square()
         )
 
         basis_residuals.append(residual)
-        basis_regularizers.append(regularizer)
+        basis_projection_regularizers.append(projection_regularizer)
         orthogonal_basis.append(normalized)
 
         if return_diagnostics:
@@ -253,7 +259,9 @@ def _gram_schmidt_expert_outputs(
             )
             regularized_vector_count = (
                 regularized_vector_count
-                + (detached_residual_norm <= regularizer).sum()
+                + (
+                    detached_residual_norm <= normalization_regularizer
+                ).sum()
             )
 
     orthogonalized_ordered = torch.stack(orthogonal_basis, dim=1)
