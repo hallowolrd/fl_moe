@@ -30,9 +30,9 @@ ORTHOGONALITY_TOLERANCE = 5e-4
 
 METHOD_CONFIG_DEFAULTS = {
     "method_config": {
-        # GrMoE reference defaults for its geometric regularizer.
-        "lambda_div": 0.01,
-        "rho0": 0.3,
+        # Scale-normalized Grassmann overlap regularization.
+        "lambda_div": 5.0,
+        "rho0": 0.24,
         # RFedAGS global step size (varpi).
         "server_lr": 1.0,
     },
@@ -341,11 +341,19 @@ def compute_subspace_overlap_loss(
     weights_by_layer: Mapping[str, Sequence[torch.Tensor]],
     rho0: float,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute the layer-wise GrMoE hinge overlap regularizer.
+    """Compute the rank-normalized, layer-balanced Grassmann hinge penalty.
 
-    The loss follows the ordered-pair sum in GrMoE. We iterate over each
-    unordered pair once and multiply its penalty by two, equivalent to
-    summing over all ordered pairs e != e' in every MoE layer.
+    For each expert pair in layer l, the normalized overlap is
+
+        s_ij = ||U_i^T U_j||_F^2 / r_l.
+
+    The loss averages the hinge penalties over expert pairs within each
+    layer, then averages those layer losses. This preserves the GrMoE hinge
+    form while making the regularizer scale independent of subspace rank,
+    expert-pair count per layer, and the number of MoE layers.
+
+    Active-overlap ratio is reported as the fraction of all expert pairs
+    whose normalized overlap is strictly greater than rho0.
     """
     rho0_value = _finite_real(rho0, "rho0")
     if not 0.0 <= rho0_value < 1.0:
@@ -353,9 +361,12 @@ def compute_subspace_overlap_loss(
     if not weights_by_layer:
         raise ValueError("weights_by_layer 不能为空。")
 
-    penalties = []
+    layer_losses = []
+    layer_mean_overlaps = []
+    layer_mean_distances = []
     normalized_overlaps = []
     projection_distances = []
+    active_pair_flags = []
 
     for layer_name in sorted(weights_by_layer):
         layer_weights = list(weights_by_layer[layer_name])
@@ -364,13 +375,16 @@ def compute_subspace_overlap_loss(
                 f"MoE 层 {layer_name!r} 至少需要两个专家才能计算重叠正则。"
             )
         reference_shape = tuple(layer_weights[0].shape)
-        if len(reference_shape) != 2 or reference_shape[0] < reference_shape[1]:
+        if (
+            len(reference_shape) != 2
+            or reference_shape[0] < reference_shape[1]
+            or reference_shape[1] <= 0
+        ):
             raise ValueError(
                 f"MoE 层 {layer_name!r} 的 fc1.weight 不满足列正交 Stiefel 形状："
                 f"{reference_shape}。"
             )
         rank = int(reference_shape[1])
-        threshold = rho0_value * rank
 
         for expert_index, weight in enumerate(layer_weights):
             if tuple(weight.shape) != reference_shape:
@@ -380,15 +394,21 @@ def compute_subspace_overlap_loss(
                     f"expected={reference_shape}。"
                 )
 
+        layer_penalties = []
+        layer_overlaps = []
+        layer_distances = []
         for left_index in range(len(layer_weights)):
             for right_index in range(left_index + 1, len(layer_weights)):
                 overlap = grassmann_overlap(
                     layer_weights[left_index],
                     layer_weights[right_index],
                 )
-                penalties.append(F.relu(overlap - threshold))
-                normalized_overlaps.append(overlap / rank)
-                projection_distances.append(
+                normalized_overlap = overlap / float(rank)
+                layer_penalties.append(
+                    F.relu(normalized_overlap - rho0_value)
+                )
+                layer_overlaps.append(normalized_overlap)
+                layer_distances.append(
                     torch.sqrt(
                         torch.clamp(
                             overlap.new_tensor(float(rank)) - overlap,
@@ -396,15 +416,36 @@ def compute_subspace_overlap_loss(
                         )
                     )
                 )
+                normalized_overlaps.append(normalized_overlap)
+                projection_distances.append(layer_distances[-1])
+                active_pair_flags.append(
+                    (normalized_overlap.detach() > rho0_value).to(
+                        dtype=torch.float32
+                    )
+                )
 
-    loss = 2.0 * torch.stack(penalties).sum()
+        layer_losses.append(torch.stack(layer_penalties).mean())
+        layer_mean_overlaps.append(torch.stack(layer_overlaps).mean())
+        layer_mean_distances.append(torch.stack(layer_distances).mean())
+
+    loss = torch.stack(layer_losses).mean()
     overlap_values = torch.stack(normalized_overlaps).detach()
     distance_values = torch.stack(projection_distances).detach()
+    active_values = torch.stack(active_pair_flags).detach()
+    num_pairs = int(active_values.numel())
+    num_active_pairs = int(active_values.sum().cpu().item())
     diagnostics = {
-        "mean_normalized_overlap": float(overlap_values.mean().cpu().item()),
+        "mean_normalized_overlap": float(
+            torch.stack(layer_mean_overlaps).mean().cpu().item()
+        ),
         "max_normalized_overlap": float(overlap_values.max().cpu().item()),
-        "mean_projection_distance": float(distance_values.mean().cpu().item()),
+        "mean_projection_distance": float(
+            torch.stack(layer_mean_distances).mean().cpu().item()
+        ),
         "min_projection_distance": float(distance_values.min().cpu().item()),
+        "active_overlap_ratio": num_active_pairs / num_pairs,
+        "num_active_pairs": num_active_pairs,
+        "num_pairs": num_pairs,
     }
     return loss, diagnostics
 
@@ -541,6 +582,7 @@ class RFedAGSGrassmannClientStrategy(base.ExpertClientTrainingStrategy):
         self._overlap_sum = 0.0
         self._max_overlap = 0.0
         self._distance_sum = 0.0
+        self._active_overlap_ratio_sum = 0.0
 
     @property
     def strategy_name(self) -> str:
@@ -600,6 +642,7 @@ class RFedAGSGrassmannClientStrategy(base.ExpertClientTrainingStrategy):
         self._overlap_sum = 0.0
         self._max_overlap = 0.0
         self._distance_sum = 0.0
+        self._active_overlap_ratio_sum = 0.0
 
     def step(self, context: base.ExpertClientBatchContext) -> None:
         if self._train_context is None or self._layout is None:
@@ -669,6 +712,7 @@ class RFedAGSGrassmannClientStrategy(base.ExpertClientTrainingStrategy):
             overlap_metrics["max_normalized_overlap"],
         )
         self._distance_sum += overlap_metrics["mean_projection_distance"]
+        self._active_overlap_ratio_sum += overlap_metrics["active_overlap_ratio"]
         self._local_step_count += 1
 
     def on_train_end(
@@ -706,6 +750,14 @@ class RFedAGSGrassmannClientStrategy(base.ExpertClientTrainingStrategy):
             "avg_normalized_overlap": self._overlap_sum / expected_steps,
             "max_normalized_overlap": self._max_overlap,
             "avg_projection_distance": self._distance_sum / expected_steps,
+            "avg_active_overlap_ratio": (
+                self._active_overlap_ratio_sum / expected_steps
+            ),
+            "final_active_overlap_ratio": final_metrics[
+                "active_overlap_ratio"
+            ],
+            "final_num_active_pairs": final_metrics["num_active_pairs"],
+            "final_num_pairs": final_metrics["num_pairs"],
             "final_avg_normalized_overlap": final_metrics[
                 "mean_normalized_overlap"
             ],
@@ -1000,6 +1052,12 @@ class RFedAGSGrassmannExpertAggregator(base.Aggregator):
             "mean_client_normalized_overlap": mean_payload_metric(
                 "avg_normalized_overlap"
             ),
+            "mean_client_active_overlap_ratio": mean_payload_metric(
+                "avg_active_overlap_ratio"
+            ),
+            "max_client_active_overlap_ratio": max_payload_metric(
+                "avg_active_overlap_ratio"
+            ),
             "max_client_normalized_overlap": max_payload_metric(
                 "max_normalized_overlap"
             ),
@@ -1058,6 +1116,9 @@ class RFedAGSGrassmannExpertAggregator(base.Aggregator):
             "post_avg_grassmann_projection_distance": metrics[
                 "mean_projection_distance"
             ],
+            "post_active_overlap_ratio": metrics["active_overlap_ratio"],
+            "post_num_active_overlap_pairs": metrics["num_active_pairs"],
+            "post_num_overlap_pairs": metrics["num_pairs"],
             "post_min_grassmann_projection_distance": metrics[
                 "min_projection_distance"
             ],
