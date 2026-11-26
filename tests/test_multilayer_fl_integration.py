@@ -346,14 +346,7 @@ class MultiLayerClientServerIntegrationTests(unittest.TestCase):
                     set(expected_moe_layer_names),
                 )
 
-        expected_non_expert_names = set(server.param_groups.non_expert)
         expected_expert_names = set(server.param_groups.expert)
-        expected_expert_parameter_names = set(
-            server.optimization_groups.expert_parameter_names
-        )
-        expected_expert_buffer_names = expected_expert_names - set(
-            dict(server.global_model.named_parameters())
-        )
         expected_all_names = set(server.param_groups.all)
 
         for update in updates:
