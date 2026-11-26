@@ -71,6 +71,32 @@ class OMoEGramSchmidtTests(unittest.TestCase):
                 )
             )
 
+    def test_nearly_dependent_but_resolvable_outputs_remain_orthogonal(self) -> None:
+        expert_outputs = torch.tensor(
+            [[
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 1e-3, 0.0, 0.0],
+                [1.0, 1e-3, 1e-3, 0.0],
+            ]]
+        )
+        selected_experts = torch.tensor([2], dtype=torch.long)
+
+        orthogonalized = omoe._gram_schmidt_expert_outputs(
+            expert_outputs,
+            selected_experts,
+        )
+        gram = torch.matmul(
+            orthogonalized,
+            orthogonalized.transpose(1, 2),
+        )
+        off_diagonal = gram - torch.diag_embed(
+            torch.diagonal(gram, dim1=1, dim2=2)
+        )
+        self.assertLess(
+            float(off_diagonal.abs().max().item()),
+            1e-3,
+        )
+
     def test_gradient_reaches_all_experts_for_well_conditioned_inputs(self) -> None:
         expert_outputs = torch.randn(
             6,
