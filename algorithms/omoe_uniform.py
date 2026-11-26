@@ -72,6 +72,11 @@ def _gram_schmidt_expert_outputs(
             "expert_outputs 的三个维度都必须大于 0，"
             f"当前 shape={tuple(expert_outputs.shape)}。"
         )
+    if num_experts > hidden_dim:
+        raise ValueError(
+            "Stiefel 正交化要求 num_experts <= hidden_dim，"
+            f"当前 num_experts={num_experts}, hidden_dim={hidden_dim}。"
+        )
     if selected_experts.ndim != 1 or selected_experts.shape[0] != num_tokens:
         raise ValueError(
             "selected_experts 必须具有 [num_tokens] 形状，"
@@ -82,13 +87,6 @@ def _gram_schmidt_expert_outputs(
             "selected_experts 必须是 torch.long，"
             f"当前 dtype={selected_experts.dtype}。"
         )
-    if bool(
-        torch.any(
-            (selected_experts < 0) | (selected_experts >= num_experts)
-        )
-    ):
-        raise ValueError("selected_experts 中包含越界的专家编号。")
-
     output_dtype = expert_outputs.dtype
     work_dtype = (
         torch.float64
