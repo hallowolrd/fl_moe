@@ -19,9 +19,9 @@ CUDA_VISIBLE_DEVICES=1 python algorithms/uniform.py \
     --num-clients 5 \
     --alpha 0.1 \
     --dirichlet-sample-balance unbalanced \
-    --rounds 50 \
-    --local-epochs 5 \
-    --batch-size 64 \
+    --rounds 100 \
+    --local-steps 200 \
+    --batch-size 128 \
     --data-augmentation true \
     --num-experts 4 \
     --transformer-layers 6 \
@@ -36,8 +36,8 @@ CUDA_VISIBLE_DEVICES=1 python algorithms/uniform.py \
     --token-dropping false \
     --optimizer sgd \
     --lr 0.01 \
-    --momentum 0.9 \
-    --weight-decay 0.0005 \
+    --momentum 0 \
+    --weight-decay 0.000 \
     --seed 0 \
     --output-dir outputs/qingcai
 ```
