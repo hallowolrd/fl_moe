@@ -1,10 +1,13 @@
 """Client-side ECAI 2024 OMoE optimization with uniform expert aggregation.
 
 The client optimizer alternates regular (R) epochs and orthogonal (O) epochs.
-During R epochs, every model parameter is updated normally and each expert's
-linear-layer inputs update a client-local OWM projector. During O epochs, only
-expert parameters are updated; each expert's optimizer-proposed linear update
-is right-projected by the average OWM projector of the other experts.
+During R epochs, every model parameter is updated normally while each expert's
+linear-layer inputs are accumulated into a client-local OWM projector. The
+projector is updated incrementally with the RLS recurrence; because it is not
+used during R epochs, this is equivalent to replaying the accumulated inputs
+before the next O step and avoids storing activation buffers. During O epochs,
+only expert parameters are updated; each expert's optimizer-proposed linear
+update is right-projected by the average OWM projector of the other experts.
 
 The OWM state is private to each federated client and persists across rounds.
 The server uses the ordinary client-uniform delta aggregation for both expert
@@ -753,8 +756,6 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
             cfg=context.cfg,
             param_names=expert_parameter_names,
         )
-        parameter_map = dict(context.model.named_parameters())
-
         rounds = int(_read_nested_config(context.cfg, "rounds", 1))
         num_clients = int(
             _read_nested_config(context.cfg, "num_clients", 1)
