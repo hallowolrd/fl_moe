@@ -86,9 +86,14 @@ def build_context(
     loader: DataLoader,
     round_id: int,
 ) -> base.ExpertClientTrainContext:
-    groups = base.build_federated_optimization_groups(
+    param_groups = base.build_param_groups(
         model=model,
         expected_num_experts=3,
+        strict=True,
+    )
+    groups = base.build_federated_optimization_groups(
+        model=model,
+        param_groups=param_groups,
         strict=True,
     )
     non_expert_optimizer = base.build_optimizer(
