@@ -218,6 +218,32 @@ class OMoEOptimizerUniformTests(unittest.TestCase):
                 }
             )
 
+    def test_runtime_config_accepts_base_confignode(self) -> None:
+        cfg = base.load_embedded_config(
+            algorithm.EMBEDDED_METHOD_CONFIG,
+            method_defaults=algorithm.METHOD_CONFIG_DEFAULTS,
+            method_validator=algorithm.validate_method_config,
+            config_overrides={
+                "dataset": "cifar10",
+                "num_clients": 1,
+                "frac": 1.0,
+                "rounds": 2,
+                "local_steps": 4,
+                "num_experts": 3,
+                "optimizer": {
+                    "type": "sgd",
+                    "lr": 0.05,
+                    "momentum": 0.0,
+                    "weight_decay": 0.0,
+                    "nesterov": False,
+                    "grad_clip": None,
+                },
+            },
+        )
+        strategy = algorithm.OMoEOptimizerClientStrategy(cfg, client_id=0)
+        self.assertEqual(strategy.settings["skip_epochs"], 5)
+        self.assertEqual(strategy.settings["alpha0"], 1.0)
+
     def test_uniform_aggregator_assigns_equal_client_weights(self) -> None:
         aggregator = algorithm.build_expert_aggregator(build_cfg())
         updates = [
