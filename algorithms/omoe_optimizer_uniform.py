@@ -130,9 +130,13 @@ def validate_method_config(config: Mapping[str, Any]) -> None:
 
 def _validate_runtime_config(cfg: Any) -> Dict[str, Any]:
     """Return validated OMoE settings from the complete runtime config."""
-    method_config = _read_nested_config(cfg, "method_config", {})
-    if not isinstance(method_config, Mapping):
-        raise ValueError("method_config 必须是 Mapping。")
+    raw_method_config = _read_nested_config(cfg, "method_config", {})
+    if hasattr(raw_method_config, "to_dict"):
+        method_config = raw_method_config.to_dict()
+    elif isinstance(raw_method_config, Mapping):
+        method_config = raw_method_config
+    else:
+        raise ValueError("method_config 必须是 Mapping 或 ConfigNode。")
     validate_method_config({"method_config": method_config})
     return {
         "skip_epochs": int(
@@ -196,11 +200,6 @@ def update_owm_projector(
             device=projector.device,
             dtype=projector.dtype,
         )
-        if not bool(torch.isfinite(vector).all().item()):
-            raise ValueError("OWM 输入向量包含 NaN 或 Inf。")
-        if not bool(torch.isfinite(projector).all().item()):
-            raise ValueError("OWM projector 包含 NaN 或 Inf。")
-
         projected_input = torch.mv(projector, vector)
         denominator = (
             torch.dot(vector, projected_input)
@@ -209,14 +208,7 @@ def update_owm_projector(
                 device=projector.device,
                 dtype=projector.dtype,
             )
-        )
-        if not bool(torch.isfinite(denominator).item()):
-            raise ValueError("OWM 更新分母包含 NaN 或 Inf。")
-        if float(denominator.item()) <= 0.0:
-            raise ValueError(
-                "OWM 更新分母必须大于 0，"
-                f"当前值：{float(denominator.item())}。"
-            )
+        ).clamp_min(torch.finfo(projector.dtype).eps)
 
         projector.sub_(
             torch.outer(projected_input, projected_input) / denominator
@@ -224,9 +216,6 @@ def update_owm_projector(
         # The exact RLS update preserves symmetry; explicitly symmetrize to
         # suppress small floating-point asymmetries accumulated over many steps.
         projector.copy_(0.5 * (projector + projector.transpose(0, 1)))
-
-        if not bool(torch.isfinite(projector).all().item()):
-            raise ValueError("OWM projector 更新后出现 NaN 或 Inf。")
     return projector
 
 
@@ -337,7 +326,6 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
 
         self._context: Optional[base.ExpertClientTrainContext] = None
         self._expert_optimizer: Optional[torch.optim.Optimizer] = None
-        self._non_expert_parameters: list[nn.Parameter] = []
 
         self._batches_per_epoch: Optional[int] = None
         self._total_planned_steps = 1
@@ -349,6 +337,7 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
         self._round_o_steps = 0
         self._round_projector_updates = 0
         self._round_projected_parameter_groups = 0
+        self._updated_projector_keys: set[ExpertLinearKey] = set()
 
     @property
     def strategy_name(self) -> str:
@@ -610,6 +599,7 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
                     alpha=self._alpha_for_current_step(),
                 )
                 self._round_projector_updates += 1
+                self._updated_projector_keys.add(projector_key)
 
             self._hooks.append(
                 linear.register_forward_pre_hook(capture_input)
@@ -705,9 +695,10 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
                     linear_delta=linear_delta,
                     projector=other_projector,
                 )
-                linear.weight.copy_(
-                    before_weight + projected_delta[:, : linear.in_features]
-                )
+                if linear.weight.requires_grad:
+                    linear.weight.copy_(
+                        before_weight + projected_delta[:, : linear.in_features]
+                    )
                 if trainable_bias:
                     linear.bias.copy_(
                         before_bias + projected_delta[:, -1]
@@ -754,10 +745,6 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
             param_names=expert_parameter_names,
         )
         parameter_map = dict(context.model.named_parameters())
-        self._non_expert_parameters = [
-            parameter_map[name]
-            for name in context.optimization_groups.non_expert_parameters
-        ]
 
         rounds = int(_read_nested_config(context.cfg, "rounds", 1))
         num_clients = int(
@@ -790,6 +777,7 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
         self._round_o_steps = 0
         self._round_projector_updates = 0
         self._round_projected_parameter_groups = 0
+        self._updated_projector_keys.clear()
         self._current_phase = self._phase_for_step(
             self._total_local_steps
         )
@@ -810,6 +798,16 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
             if self._expert_optimizer is None:
                 raise RuntimeError("专家优化器尚未初始化。")
             self._expert_optimizer.step()
+            if self._updated_projector_keys:
+                finite_flags = torch.stack(
+                    [
+                        torch.isfinite(self._projectors[key]).all()
+                        for key in self._updated_projector_keys
+                    ]
+                )
+                if not bool(finite_flags.all().item()):
+                    raise ValueError("OWM projector 更新后出现 NaN 或 Inf。")
+                self._updated_projector_keys.clear()
             self._round_r_steps += 1
         else:
             self._orthogonal_optimizer_step()
@@ -878,7 +876,6 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
 
         self._context = None
         self._expert_optimizer = None
-        self._non_expert_parameters = []
         self._linear_modules = {}
         return {"omoe_optimizer": diagnostics}
 
