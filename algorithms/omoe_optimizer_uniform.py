@@ -460,7 +460,6 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
                 f"groups={sorted(expected_layers)}。"
             )
 
-        named_parameters = dict(model.named_parameters())
         covered_parameter_names = set()
         for (moe_name, expert_id, relative_name), linear in linear_modules.items():
             expert_key = f"expert_{expert_id}"
@@ -669,6 +668,8 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
         # gradient) also projects momentum and weight-decay contributions.
         self._expert_optimizer.step()
 
+        pending_updates = []
+        finite_flags = []
         with torch.no_grad():
             for key, (before_weight, before_bias) in snapshots.items():
                 linear = self._linear_modules[key]
@@ -695,14 +696,22 @@ class OMoEOptimizerClientStrategy(base.ExpertClientTrainingStrategy):
                     linear_delta=linear_delta,
                     projector=other_projector,
                 )
+                finite_flags.append(torch.isfinite(projected_delta).all())
+                pending_updates.append(
+                    (key, before_weight, before_bias, projected_delta)
+                )
+
+            if finite_flags and not bool(torch.stack(finite_flags).all().item()):
+                raise ValueError("OMoE 正交投影后的专家更新包含 NaN 或 Inf。")
+
+            for key, before_weight, before_bias, projected_delta in pending_updates:
+                linear = self._linear_modules[key]
                 if linear.weight.requires_grad:
                     linear.weight.copy_(
                         before_weight + projected_delta[:, : linear.in_features]
                     )
-                if trainable_bias:
-                    linear.bias.copy_(
-                        before_bias + projected_delta[:, -1]
-                    )
+                if linear.bias is not None and linear.bias.requires_grad:
+                    linear.bias.copy_(before_bias + projected_delta[:, -1])
                 self._round_projected_parameter_groups += 1
 
     def on_train_start(
